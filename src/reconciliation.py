@@ -17,8 +17,22 @@ def get_account_state() -> dict:
     bal_data = client.get_balance_allowance(
         BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
     )
-    pusd_balance = float(bal_data.balance) / _MICRO_PUSD
-    allowance = float(bal_data.allowance) / _MICRO_PUSD
+    if hasattr(bal_data, "balance"):
+        raw_balance = bal_data.balance
+    elif isinstance(bal_data, dict):
+        raw_balance = bal_data.get("balance", 0)
+    else:
+        raw_balance = 0
+
+    if hasattr(bal_data, "allowance"):
+        raw_allowance = bal_data.allowance
+    elif isinstance(bal_data, dict):
+        raw_allowance = bal_data.get("allowance", 0)
+    else:
+        raw_allowance = 0
+
+    pusd_balance = float(raw_balance) / _MICRO_PUSD
+    allowance = float(raw_allowance) / _MICRO_PUSD
 
     active_positions = []
     try:
