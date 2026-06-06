@@ -18,6 +18,7 @@ class Settings:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     X_API_BEARER_TOKEN: str = os.getenv("X_API_BEARER_TOKEN", "")
     NEWS_API_KEY: str = os.getenv("NEWS_API_KEY", "")
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 
 settings = Settings()
 

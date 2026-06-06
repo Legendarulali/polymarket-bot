@@ -1,4 +1,5 @@
 import logging
+import xml.etree.ElementTree as ET
 import requests
 from config.settings import settings
 
@@ -57,6 +58,30 @@ def _fetch_x_recent(query: str) -> list[str]:
         return []
     except requests.RequestException as exc:
         logger.warning("[NewsMonitor] X API error: %s", exc)
+        return []
+
+
+def fetch_free_news(query: str) -> list[str]:
+    """Caută știri gratuit via Google News RSS, fără API key."""
+    try:
+        encoded = requests.utils.quote(query[:100])
+        url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
+        response = requests.get(
+            url,
+            timeout=_REQUEST_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+        titles = []
+        for item in root.findall(".//item")[:10]:
+            title_el = item.find("title")
+            if title_el is not None and title_el.text:
+                titles.append(title_el.text)
+        logger.debug("[NewsMonitor] Free RSS fetch: %d titluri pentru '%s'.", len(titles), query[:50])
+        return titles
+    except Exception as exc:
+        logger.warning("[NewsMonitor] Free news fetch failed: %s", exc)
         return []
 
 
