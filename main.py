@@ -204,6 +204,7 @@ def main() -> None:
                         exc,
                         exc_info=True,
                     )
+                time.sleep(3)
 
             _interruptible_sleep(_LOOP_INTERVAL)
 
