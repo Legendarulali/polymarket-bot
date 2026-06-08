@@ -16,11 +16,16 @@ from src.ai_analyser import analyse_market
 logger = logging.getLogger(__name__)
 
 RUNNING = True
-_LOOP_INTERVAL = 60  # seconds
+_LOOP_INTERVAL = 60          # secunde între iterații normale
+_LOW_BALANCE_SLEEP = 15 * 60  # 15 minute sleep când balanța e insuficientă
+_CACHE_TTL_SECONDS = 4 * 3600 # re-analizează o piață max o dată la 4 ore
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 _MIN_BALANCE_PUSD = 5.0
 _ORDER_SIZE = 1.0
 _MIN_CONFIDENCE = 0.70
+
+# Cache în memorie: {market_id: (timestamp_float, decision_dict)}
+_analysis_cache: dict[str, tuple[float, dict]] = {}
 
 
 def handle_shutdown(signum, frame):
@@ -35,7 +40,7 @@ signal.signal(signal.SIGTERM, handle_shutdown)
 
 
 def _interruptible_sleep(seconds: int) -> None:
-    """Sleep in 1-second increments so SIGTERM is honoured promptly."""
+    """Sleep în incremente de 1s astfel încât SIGTERM e onorat prompt."""
     for _ in range(seconds):
         if not RUNNING:
             break
@@ -79,6 +84,26 @@ def _current_price(market: dict, outcome: str) -> float:
     return 0.5
 
 
+def _get_cached_decision(market_id: str) -> dict | None:
+    """Returnează decizia din cache dacă există și nu a expirat, altfel None."""
+    entry = _analysis_cache.get(market_id)
+    if entry is None:
+        return None
+    timestamp, decision = entry
+    age = time.time() - timestamp
+    if age < _CACHE_TTL_SECONDS:
+        remaining_h = (_CACHE_TTL_SECONDS - age) / 3600
+        logger.info(
+            "[Agent] Cache hit pentru piața id=%s (expiră în %.1fh). Skip LLM.",
+            market_id,
+            remaining_h,
+        )
+        return decision
+    # expirat — șterge intrarea
+    del _analysis_cache[market_id]
+    return None
+
+
 def process_market(market: dict, account_state: dict) -> None:
     pusd_balance: float = account_state.get("pusd_balance", 0.0)
     active_positions: list[dict] = account_state.get("active_positions", [])
@@ -88,13 +113,25 @@ def process_market(market: dict, account_state: dict) -> None:
 
     logger.info("[Agent] Procesez piața id=%s: %s", market_id, title[:80])
 
-    # Pas 1: Culegere știri gratuite pe baza titlului pieței ca query dinamic
-    news = fetch_free_news(query=title[:100])
-    logger.info("[Agent] %d știri găsite pentru '%s'.", len(news), title[:50])
+    # Pas 1: Verificare cache — evită apeluri repetate la Groq pentru aceeași piață
+    decision = _get_cached_decision(market_id)
 
-    # Pas 2: Analiză AI via Groq
-    yes_price = _current_price(market, "YES")
-    decision = analyse_market(title, yes_price, news)
+    if decision is None:
+        # Pas 2: Culegere știri + analiză AI via Groq (doar dacă nu e în cache)
+        news = fetch_free_news(query=title[:100])
+        logger.info("[Agent] %d știri găsite pentru '%s'.", len(news), title[:50])
+
+        yes_price = _current_price(market, "YES")
+        decision = analyse_market(title, yes_price, news)
+
+        # Stochează în cache imediat după analiză reușită
+        _analysis_cache[market_id] = (time.time(), decision)
+        logger.info(
+            "[Agent] Decizie AI stocată în cache pentru piața id=%s (TTL=%dh).",
+            market_id,
+            _CACHE_TTL_SECONDS // 3600,
+        )
+
     logger.info(
         "[Agent] Decizie AI: trade=%s | outcome=%s | confidence=%.2f | reason=%s",
         decision["trade"],
@@ -184,6 +221,19 @@ def main() -> None:
     try:
         while RUNNING:
             account_state = get_account_state()
+            pusd_balance: float = account_state.get("pusd_balance", 0.0)
+
+            # Verificare balanță înainte de orice apel LLM sau API Polymarket
+            if pusd_balance < _MIN_BALANCE_PUSD:
+                logger.warning(
+                    "[Agent] Balanță insuficientă (%.4f pUSD < %.1f minim). "
+                    "Suspendez analiza pentru %d minute.",
+                    pusd_balance,
+                    _MIN_BALANCE_PUSD,
+                    _LOW_BALANCE_SLEEP // 60,
+                )
+                _interruptible_sleep(_LOW_BALANCE_SLEEP)
+                continue
 
             markets = fetch_active_markets(limit=5)
             if not markets:
