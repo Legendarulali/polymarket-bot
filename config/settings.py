@@ -19,6 +19,8 @@ class Settings:
     X_API_BEARER_TOKEN: str = os.getenv("X_API_BEARER_TOKEN", "")
     NEWS_API_KEY: str = os.getenv("NEWS_API_KEY", "")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    # 0=EOA, 1=POLY_PROXY (funder≠signer, standard Polymarket setup), 2=POLY_GNOSIS_SAFE
+    SIGNATURE_TYPE: int = int(os.getenv("SIGNATURE_TYPE", "1"))
 
 settings = Settings()
 
