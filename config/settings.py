@@ -21,6 +21,7 @@ class Settings:
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     # 0=EOA, 1=POLY_PROXY (funder≠signer, standard Polymarket setup), 2=POLY_GNOSIS_SAFE
     SIGNATURE_TYPE: int = int(os.getenv("SIGNATURE_TYPE", "1"))
+    POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
 
 settings = Settings()
 

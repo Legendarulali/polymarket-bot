@@ -12,6 +12,7 @@ from src.execution import place_limit_order
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market
+from src.allowance import ensure_collateral_approved
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,13 @@ def main() -> None:
         sys.exit(1)
 
     get_clob_client()  # warm up connection
+
+    logger.info("Verificare și setare allowance USDC pentru CLOB Exchange...")
+    try:
+        ensure_collateral_approved()
+    except Exception as exc:
+        logger.error("Allowance check eșuat (bot continuă oricum): %s", exc)
+
     logger.info(
         "Entering autonomous AI agent loop (interval=%ds). Send SIGTERM/SIGINT to stop.",
         _LOOP_INTERVAL,
