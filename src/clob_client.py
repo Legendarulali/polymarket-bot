@@ -31,18 +31,23 @@ def get_clob_client() -> ClobClient:
         signature_type=settings.SIGNATURE_TYPE,
     )
 
-    # derive_api_key() derivă credențialele local din cheia privată (fără apel HTTP).
-    # Evită erorile 400 de la /auth/api-key cauzate de creare duplicată sau nonce greșit.
-    # Fallback la create_or_derive_api_key() doar dacă derivarea locală eșuează.
+    # Încearcă înregistrarea activă pe server cu create_api_key().
+    # Dacă cheile există deja serverul va returna eroare → fallback la derive_api_key().
     try:
-        creds = client.derive_api_key()
-        logger.info("API credentials derived locally from private key (no server round-trip).")
-    except Exception as exc:
-        logger.warning(
-            "derive_api_key() failed (%s) — retrying with create_or_derive_api_key().", exc
-        )
-        creds = client.create_or_derive_api_key()
-        logger.info("API credentials obtained via create_or_derive_api_key().")
+        logger.info("[API] Încerc înregistrarea activă a API Key pe serverul Polymarket...")
+        creds = client.create_api_key()
+        logger.info("[API] Chei generate cu succes! API_KEY=%s", creds.api_key)
+    except Exception as e:
+        logger.warning("[API] Înregistrarea pe server a eșuat sau cheile există deja: %s", e)
+        try:
+            creds = client.derive_api_key()
+            logger.info("API credentials derived locally from private key (no server round-trip).")
+        except Exception as exc:
+            logger.warning(
+                "derive_api_key() failed (%s) — retrying with create_or_derive_api_key().", exc
+            )
+            creds = client.create_or_derive_api_key()
+            logger.info("API credentials obtained via create_or_derive_api_key().")
 
     client.set_api_creds(creds)
     _client = client
