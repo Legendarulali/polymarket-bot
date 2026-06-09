@@ -1,4 +1,5 @@
 import json
+import random
 import time
 import sys
 import signal
@@ -273,13 +274,14 @@ def main() -> None:
                 _interruptible_sleep(_LOW_BALANCE_SLEEP)
                 continue
 
-            markets = fetch_active_markets(limit=5)
+            markets = fetch_active_markets(limit=30)
             if not markets:
                 logger.warning("[Agent] Nicio piață activă găsită. Aștept...")
                 _interruptible_sleep(_LOOP_INTERVAL)
                 continue
 
-            logger.info("[Agent] Procesez %d piețe active.", len(markets))
+            random.shuffle(markets)
+            logger.info("[Agent] Procesez %d piețe active (ordine aleatorie).", len(markets))
             for market in markets:
                 if not RUNNING:
                     break
