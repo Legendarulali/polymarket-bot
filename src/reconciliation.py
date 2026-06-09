@@ -14,8 +14,10 @@ _ALLOWANCE_WARN_THRESHOLD = 100.0
 def get_account_state() -> dict:
     client = get_clob_client()
 
+    # signature_type=1 (POLY_1271/proxy): serverul returnează balanța proxy-ului,
+    # nu a EOA-ului. Fără acest parametru, balanța apare 0 pentru conturi proxy.
     bal_data = client.get_balance_allowance(
-        BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=1)
     )
     if hasattr(bal_data, "balance"):
         raw_balance = bal_data.balance
