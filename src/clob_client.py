@@ -20,14 +20,16 @@ def get_clob_client() -> ClobClient:
         return _client
 
     if _HAS_EXPLICIT_CREDS:
-        sig_type = 1
+        # Polymarket Google-login proxy accounts: CLOB ține ledger-ul pUSD per adresă EOA,
+        # nu per proxy contract. Maker-ul în ordine = adresa EOA derivată din PRIVATE_KEY.
+        # Nu pasăm funder (proxy contract) deoarece CLOB-ul returnează
+        # "maker address not allowed" pentru proxy contracts neînregistrate ca makers.
+        # Referință: https://github.com/Polymarket/agents/blob/main/agents/polymarket/polymarket.py
         logger.info(
-            "Initializing Polymarket CLOB V2 client with explicit API credentials | "
-            "host=%s chain_id=%d funder=%s signature_type=%d",
+            "Initializing Polymarket CLOB V2 client with explicit API credentials (EOA maker) | "
+            "host=%s chain_id=%d",
             settings.CLOB_HOST,
             settings.CHAIN_ID,
-            settings.FUNDER_ADDRESS,
-            sig_type,
         )
         api_creds = ApiCreds(
             api_key=settings.POLYMARKET_API_KEY,
@@ -39,10 +41,8 @@ def get_clob_client() -> ClobClient:
             chain_id=settings.CHAIN_ID,
             key=settings.PRIVATE_KEY,
             creds=api_creds,
-            funder=settings.FUNDER_ADDRESS,
-            signature_type=sig_type,
         )
-        logger.info("CLOB client ready (explicit creds) | API_KEY=%s", settings.POLYMARKET_API_KEY)
+        logger.info("CLOB client ready (explicit creds, EOA maker) | API_KEY=%s", settings.POLYMARKET_API_KEY)
     else:
         logger.info(
             "Initializing Polymarket CLOB V2 client (derive mode) | "
