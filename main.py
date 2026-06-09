@@ -1,3 +1,4 @@
+import json
 import time
 import sys
 import signal
@@ -63,9 +64,28 @@ def fetch_active_markets(limit: int = 5) -> list[dict]:
 
 
 def _token_for_outcome(market: dict, outcome: str) -> str | None:
+    """Extrage token_id din clobTokenIds (index 0=YES, 1=NO) returnat de Gamma API ca string JSON."""
+    raw = market.get("clobTokenIds")
+    if raw:
+        try:
+            ids: list[str] = json.loads(raw) if isinstance(raw, str) else raw
+            if outcome.upper() == "YES" and len(ids) > 0:
+                return ids[0]
+            if outcome.upper() == "NO" and len(ids) > 1:
+                return ids[1]
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("[Agent] Eroare parsare clobTokenIds: %s | raw=%r", exc, raw)
+
+    # Fallback: câmpul tokens cu obiecte {outcome, token_id}
     for token in market.get("tokens", []):
         if token.get("outcome", "").upper() == outcome.upper():
             return token.get("token_id")
+
+    logger.debug(
+        "[Agent] Token negăsit pentru outcome=%s | chei piață: %s",
+        outcome,
+        list(market.keys()),
+    )
     return None
 
 
