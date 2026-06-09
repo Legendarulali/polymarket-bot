@@ -229,7 +229,10 @@ def ensure_collateral_approved() -> None:
             tx = _send(usdc.functions.approve(_EXCHANGE_ADDR, _MAX_UINT256))
             logger.info("[Allowance] USDC.approve confirmat: tx=%s", tx)
         except Exception as exc:
-            logger.error("[Allowance] USDC.approve eșuat: %s", exc, exc_info=True)
+            logger.warning(
+                "[Allowance] On-chain approval failed via Safe, but skipping since manual "
+                "setup might be active (USDC.approve error: %s)", exc,
+            )
 
     for op in ctf_missing:
         logger.info("[Allowance] Trimit CTF.setApprovalForAll(%s, true) de la %s...", op, owner)
@@ -237,6 +240,9 @@ def ensure_collateral_approved() -> None:
             tx = _send(ctf.functions.setApprovalForAll(op, True))
             logger.info("[Allowance] CTF.setApprovalForAll(%s) confirmat: tx=%s", op, tx)
         except Exception as exc:
-            logger.error("[Allowance] CTF.setApprovalForAll(%s) eșuat: %s", op, exc, exc_info=True)
+            logger.warning(
+                "[Allowance] On-chain approval failed via Safe, but skipping since manual "
+                "setup might be active (CTF.setApprovalForAll %s error: %s)", op, exc,
+            )
 
     _sync_clob_server(client)

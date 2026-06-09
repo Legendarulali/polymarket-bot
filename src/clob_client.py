@@ -20,12 +20,13 @@ def get_clob_client() -> ClobClient:
         return _client
 
     if _HAS_EXPLICIT_CREDS:
-        # Cont proxy Polymarket (Google login): fondurile sunt în proxy contract (FUNDER_ADDRESS).
-        # signature_type=1 (POLY_1271): maker în ordine = FUNDER_ADDRESS, semnat de EOA via EIP-1271.
-        # funder trebuie pasat explicit altfel builder-ul defaultează la adresa EOA ca maker.
+        # Cont proxy Polymarket (Gnosis Safe / Magic Wallet): fondurile sunt în proxy contract.
+        # signature_type=3 (POLY_1271 / EIP-1271): maker = FUNDER_ADDRESS, semnat de EOA via EIP-1271.
+        # Valoarea 3 este confirmată în py-clob-client-v2 issues #70 și #71.
+        # signature_type=1 era greșit și producea "maker address not allowed".
         logger.info(
-            "Initializing Polymarket CLOB V2 client with explicit API credentials (proxy maker) | "
-            "host=%s chain_id=%d funder=%s",
+            "Initializing Polymarket CLOB V2 client with explicit API credentials (POLY_1271) | "
+            "host=%s chain_id=%d funder=%s signature_type=3",
             settings.CLOB_HOST,
             settings.CHAIN_ID,
             settings.FUNDER_ADDRESS,
@@ -41,9 +42,9 @@ def get_clob_client() -> ClobClient:
             key=settings.PRIVATE_KEY,
             creds=api_creds,
             funder=settings.FUNDER_ADDRESS,
-            signature_type=1,
+            signature_type=3,  # POLY_1271 / EIP-1271 — for Gnosis Safe proxy wallets
         )
-        logger.info("CLOB client ready (explicit creds, proxy maker) | API_KEY=%s funder=%s", settings.POLYMARKET_API_KEY, settings.FUNDER_ADDRESS)
+        logger.info("CLOB client ready (POLY_1271, sig_type=3) | API_KEY=%s funder=%s", settings.POLYMARKET_API_KEY, settings.FUNDER_ADDRESS)
     else:
         logger.info(
             "Initializing Polymarket CLOB V2 client (derive mode) | "
