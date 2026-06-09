@@ -1,5 +1,5 @@
 import logging
-from py_clob_client_v2 import ClobClient, ApiCreds
+from py_clob_client_v2 import ClobClient
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -31,12 +31,11 @@ def get_clob_client() -> ClobClient:
         client = ClobClient(
             host=settings.CLOB_HOST,
             chain_id=settings.CHAIN_ID,
-            key=settings.PRIVATE_KEY,
+            key=settings.POLYMARKET_API_KEY,
+            secret=settings.POLYMARKET_API_SECRET,
+            passphrase=settings.POLYMARKET_API_PASSPHRASE,
             funder=settings.FUNDER_ADDRESS,
             signature_type=sig_type,
-            api_key=settings.POLYMARKET_API_KEY,
-            api_secret=settings.POLYMARKET_API_SECRET,
-            api_passphrase=settings.POLYMARKET_API_PASSPHRASE,
         )
         logger.info("CLOB client ready (explicit creds) | API_KEY=%s", settings.POLYMARKET_API_KEY)
     else:
