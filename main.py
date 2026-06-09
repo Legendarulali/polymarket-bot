@@ -10,7 +10,7 @@ from py_clob_client_v2 import Side
 
 from config.settings import settings
 from src.reconciliation import log_reconciliation_report, get_account_state
-from src.execution import place_limit_order
+from src.execution import place_limit_order, _MIN_ORDER_VALUE, _MIN_SIZE
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market
@@ -189,18 +189,39 @@ def process_market(market: dict, account_state: dict) -> None:
         )
         return
 
+    # Verificare poziție duplicată
     if any(pos.get("token_id") == token_id for pos in active_positions):
-        logger.info("[Agent] Poziție deschisă deja pe token=%s. Ordin blocat.", token_id)
+        logger.info(
+            "[Agent] Poziție deja existentă pentru token_id %s, se evită deschiderea unei poziții duplicate.",
+            token_id,
+        )
         return
 
     # Pas 4: Plasare ordin
     price = _current_price(market, outcome)
+    if price < 0.01:
+        logger.warning("[Agent] Preț invalid (%.4f) pentru token=%s. Ordin blocat.", price, token_id)
+        return
+
+    # Estimare cost ordin și verificare balanță disponibilă
+    estimated_size = round(max(_MIN_ORDER_VALUE / price, _MIN_SIZE), 2)
+    order_total = round(estimated_size * price, 4)
+    if pusd_balance < order_total:
+        logger.warning(
+            "[Agent] Balanță insuficientă pentru ordin: %.4f pUSD disponibil < %.4f cost estimat. Ordin blocat.",
+            pusd_balance,
+            order_total,
+        )
+        return
+
     logger.warning(
-        "[TRADE] AI → BUY %s | '%s' | token=%s | price=$%.4f | confidence=%.2f",
+        "[TRADE] AI → BUY %s | '%s' | token=%s | price=$%.4f | size≈%.2f | total≈$%.2f | confidence=%.2f",
         outcome,
         title[:60],
         token_id,
         price,
+        estimated_size,
+        order_total,
         decision["confidence"],
     )
 
@@ -269,6 +290,18 @@ def main() -> None:
                     _LOW_BALANCE_SLEEP // 60,
                 )
                 _interruptible_sleep(_LOW_BALANCE_SLEEP)
+                continue
+
+            # Limită globală de expunere
+            n_open = len(account_state.get("active_positions", []))
+            if settings.MAX_ACTIVE_POSITIONS > 0 and n_open >= settings.MAX_ACTIVE_POSITIONS:
+                logger.info(
+                    "[Agent] Limită de expunere atinsă: %d/%d poziții deschise. "
+                    "Nu se deschid poziții noi. Aștept...",
+                    n_open,
+                    settings.MAX_ACTIVE_POSITIONS,
+                )
+                _interruptible_sleep(_LOOP_INTERVAL)
                 continue
 
             markets = fetch_active_markets(limit=30)

@@ -28,6 +28,8 @@ class Settings:
     POLYMARKET_API_PASSPHRASE: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
     # Balanță reală cunoscută (pUSD) — folosită când /balance-allowance returnează 0 pentru conturi proxy
     OVERRIDE_BALANCE: float = float(os.getenv("OVERRIDE_BALANCE", "0"))
+    # Număr maxim de poziții deschise simultan (0 = fără limită)
+    MAX_ACTIVE_POSITIONS: int = int(os.getenv("MAX_ACTIVE_POSITIONS", "5"))
 
 settings = Settings()
 
