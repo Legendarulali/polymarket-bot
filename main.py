@@ -25,9 +25,16 @@ _CACHE_TTL_SECONDS = 4 * 3600 # re-analizează o piață max o dată la 4 ore
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 _MIN_BALANCE_PUSD = 5.0
 _MIN_CONFIDENCE = 0.70
+_MIN_VOLUME_USD = 10_000.0       # Ignoră piețele cu volum sub $10k
+_MIN_PROBABILITY = 0.65          # Ignoră dacă probabilitatea YES e prea joasă
+_MAX_PROBABILITY = 0.90          # Ignoră dacă probabilitatea YES e prea certă
+_MAX_POSITIONS_PER_EVENT = 2     # Max poziții pentru același event_id
 
 # Cache în memorie: {market_id: (timestamp_float, decision_dict)}
 _analysis_cache: dict[str, tuple[float, dict]] = {}
+
+# Tracker pentru pozițiile per event: {event_id: count}
+_event_position_counts: dict[str, int] = {}
 
 
 def handle_shutdown(signum, frame):
@@ -134,6 +141,42 @@ def process_market(market: dict, account_state: dict) -> None:
 
     logger.info("[Agent] Procesez piața id=%s: %s", market_id, title[:80])
 
+    # --- FILTRU 1: Volum minim ---
+    volume = 0.0
+    try:
+        volume = float(market.get("volume") or market.get("volumeNum") or 0)
+    except (ValueError, TypeError):
+        pass
+    if volume < _MIN_VOLUME_USD:
+        logger.info(
+            "[FILTER] Ignor piața '%s' (Volum prea mic: $%.0f < $%.0f).",
+            title[:60], volume, _MIN_VOLUME_USD,
+        )
+        return
+
+    # --- FILTRU 2: Fereastra de probabilitate ---
+    yes_price_raw = _current_price(market, "YES")
+    if not (_MIN_PROBABILITY < yes_price_raw < _MAX_PROBABILITY):
+        logger.info(
+            "[FILTER] Ignor piața '%s' (Probabilitate YES=%.2f în afara ferestrei [%.2f, %.2f]).",
+            title[:60], yes_price_raw, _MIN_PROBABILITY, _MAX_PROBABILITY,
+        )
+        return
+
+    # --- FILTRU 3: Event clustering ---
+    event_id = market.get("eventId") or market.get("event_id") or market.get("conditionId") or ""
+    if event_id:
+        event_positions = sum(
+            1 for pos in active_positions
+            if pos.get("event_id") == event_id
+        )
+        if event_positions >= _MAX_POSITIONS_PER_EVENT:
+            logger.info(
+                "[FILTER] Ignor piața '%s' (Poziție deja existentă pentru evenimentul %s: %d/%d).",
+                title[:60], event_id, event_positions, _MAX_POSITIONS_PER_EVENT,
+            )
+            return
+
     # Pas 1: Verificare cache — evită apeluri repetate la Groq pentru aceeași piață
     decision = _get_cached_decision(market_id)
 
@@ -233,6 +276,9 @@ def process_market(market: dict, account_state: dict) -> None:
 
     if result.get("success"):
         logger.info("[Agent] Ordin plasat cu succes | order_id=%s", result.get("order_id"))
+        # Urmărește event clustering pentru viitoarele iterații
+        if event_id:
+            _event_position_counts[event_id] = _event_position_counts.get(event_id, 0) + 1
     else:
         logger.error("[Agent] Ordin respins de CLOB: %s", result.get("error"))
 

@@ -124,17 +124,15 @@ class MultiOutcomeArbStrategy(BaseStrategy):
             # --- Pas 6: Alertă de oportunitate și execuție ---
             logger.warning(
                 "[OPORTUNITATE] Suma pieței este %.4f. Se plasează ordin limită defensiv SELL "
-                "pe token=%s | price=$%.4f | size=%.1f",
+                "pe token=%s | price=$%.4f",
                 prob_sum,
                 target_token_id,
                 target_price,
-                _TEST_ORDER_SIZE,
             )
 
             result = place_limit_order(
                 token_id=target_token_id,
                 price=target_price,
-                size=_TEST_ORDER_SIZE,
                 side=Side.SELL,
             )
 
@@ -247,17 +245,15 @@ class NewsCatalystStrategy(BaseStrategy):
                 return
 
             logger.warning(
-                "[NewsStrategy] Plasare ordin %s | token=%s | price=$%.4f | size=%.1f",
+                "[NewsStrategy] Plasare ordin %s | token=%s | price=$%.4f",
                 self.side.name,
                 self.token_id,
                 ask_price,
-                self.order_size,
             )
 
             result = place_limit_order(
                 token_id=self.token_id,
                 price=ask_price,
-                size=self.order_size,
                 side=self.side,
             )
 

@@ -82,9 +82,8 @@ def _sync_clob_server(client) -> None:
 def _calldata(contract_fn) -> bytes:
     """Extrage calldata-ul ABI-encoded al unui ContractFunction fără a trimite tx."""
     dummy = "0x0000000000000000000000000000000000000001"
-    hex_data = contract_fn.build_transaction(
-        {"from": dummy, "gas": 200_000, "gasPrice": 0}
-    )["data"]
+    # gasPrice omis intenționat — web3 v6 folosește EIP-1559 defaults; gasPrice=0 cauzează erori
+    hex_data = contract_fn.build_transaction({"from": dummy, "gas": 200_000})["data"]
     return bytes.fromhex(hex_data[2:] if hex_data.startswith("0x") else hex_data)
 
 
