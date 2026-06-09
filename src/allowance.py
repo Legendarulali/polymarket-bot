@@ -78,6 +78,7 @@ def ensure_collateral_approved() -> None:
          - Dacă funder ≠ EOA (proxy wallet) → nu putem semna din bot; afișăm
            instrucțiuni clare pentru aprobare manuală din web UI.
     """
+    return
     client = get_clob_client()
 
     # Treaptă 1: metoda nativă din librărie (proxy-aware)
