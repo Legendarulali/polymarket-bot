@@ -28,13 +28,35 @@ _MIN_CONFIDENCE = 0.70
 _MIN_VOLUME_USD = 10_000.0       # Ignoră piețele cu volum sub $10k
 _MIN_PROBABILITY = 0.65          # Ignoră dacă probabilitatea YES e prea joasă
 _MAX_PROBABILITY = 0.90          # Ignoră dacă probabilitatea YES e prea certă
-_MAX_POSITIONS_PER_EVENT = 2     # Max poziții pentru același event_id
+_MAX_POSITIONS_PER_EVENT = 2     # Max poziții per event_id (piețe generale)
+_MAX_OUTRIGHT_PER_EVENT = 1      # Max poziții pe piețe de tip "outright winner"
 
 # Cache în memorie: {market_id: (timestamp_float, decision_dict)}
 _analysis_cache: dict[str, tuple[float, dict]] = {}
 
 # Tracker pentru pozițiile per event: {event_id: count}
 _event_position_counts: dict[str, int] = {}
+
+_MATCH_KEYWORDS = (" vs ", " vs. ")
+_OUTRIGHT_PHRASES = (
+    "win the 2026 fifa world cup",
+    "win the fifa world cup",
+    "win the world cup",
+    "world cup winner",
+    "outright winner",
+    "championship winner",
+    "tournament winner",
+)
+
+
+def _classify_market(title: str) -> str:
+    """Clasifică piața ca 'match', 'outright' sau 'general' după titlu."""
+    lower = title.lower()
+    if any(kw in lower for kw in _MATCH_KEYWORDS):
+        return "match"
+    if any(phrase in lower for phrase in _OUTRIGHT_PHRASES):
+        return "outright"
+    return "general"
 
 
 def handle_shutdown(signum, frame):
@@ -164,16 +186,24 @@ def process_market(market: dict, account_state: dict) -> None:
         return
 
     # --- FILTRU 3: Event clustering ---
+    # Meciurile individuale (ex: 'SUA vs Iran') nu sunt blocate de limita pe
+    # event_id, deoarece aceasta ar afecta și piețele de tip outright winner
+    # din același turneu. Fiecare tip de piață are propria limită.
     event_id = market.get("eventId") or market.get("event_id") or market.get("conditionId") or ""
-    if event_id:
+    market_type = _classify_market(title)
+
+    if market_type == "match":
+        logger.debug("[FILTER] Piață de tip meci detectată ('%s') — skip event clustering.", title[:60])
+    elif event_id:
+        limit = _MAX_OUTRIGHT_PER_EVENT if market_type == "outright" else _MAX_POSITIONS_PER_EVENT
         event_positions = sum(
             1 for pos in active_positions
             if pos.get("event_id") == event_id
         )
-        if event_positions >= _MAX_POSITIONS_PER_EVENT:
+        if event_positions >= limit:
             logger.info(
-                "[FILTER] Ignor piața '%s' (Poziție deja existentă pentru evenimentul %s: %d/%d).",
-                title[:60], event_id, event_positions, _MAX_POSITIONS_PER_EVENT,
+                "[FILTER] Ignor piața '%s' [%s] (eveniment %s: %d/%d poziții).",
+                title[:60], market_type, event_id, event_positions, limit,
             )
             return
 
