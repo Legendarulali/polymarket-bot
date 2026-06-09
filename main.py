@@ -231,6 +231,16 @@ def main() -> None:
             account_state = get_account_state()
             pusd_balance: float = account_state.get("pusd_balance", 0.0)
 
+            # Conturile proxy returnează 0 de la /balance-allowance chiar dacă au fonduri.
+            # OVERRIDE_BALANCE permite specificarea balanței reale cunoscute via env var.
+            if settings.OVERRIDE_BALANCE > 0 and pusd_balance == 0.0:
+                logger.info(
+                    "[Agent] API balanță = 0 (cont proxy) — folosesc OVERRIDE_BALANCE=%.4f pUSD.",
+                    settings.OVERRIDE_BALANCE,
+                )
+                pusd_balance = settings.OVERRIDE_BALANCE
+                account_state = {**account_state, "pusd_balance": pusd_balance}
+
             # Verificare balanță înainte de orice apel LLM sau API Polymarket
             if pusd_balance < _MIN_BALANCE_PUSD:
                 logger.warning(

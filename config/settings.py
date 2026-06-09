@@ -26,6 +26,8 @@ class Settings:
     POLYMARKET_API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
     POLYMARKET_API_SECRET: str = os.getenv("POLYMARKET_API_SECRET", "")
     POLYMARKET_API_PASSPHRASE: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+    # Balanță reală cunoscută (pUSD) — folosită când /balance-allowance returnează 0 pentru conturi proxy
+    OVERRIDE_BALANCE: float = float(os.getenv("OVERRIDE_BALANCE", "0"))
 
 settings = Settings()
 
