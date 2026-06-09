@@ -24,7 +24,6 @@ _LOW_BALANCE_SLEEP = 15 * 60  # 15 minute sleep când balanța e insuficientă
 _CACHE_TTL_SECONDS = 4 * 3600 # re-analizează o piață max o dată la 4 ore
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 _MIN_BALANCE_PUSD = 5.0
-_ORDER_SIZE = 1.0
 _MIN_CONFIDENCE = 0.70
 
 # Cache în memorie: {market_id: (timestamp_float, decision_dict)}
@@ -209,7 +208,6 @@ def process_market(market: dict, account_state: dict) -> None:
     result = place_limit_order(
         token_id=token_id,
         price=price,
-        size=_ORDER_SIZE,
         side=Side.BUY,
     )
 

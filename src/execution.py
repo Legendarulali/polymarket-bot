@@ -5,14 +5,16 @@ from src.clob_client import get_clob_client
 logger = logging.getLogger(__name__)
 
 
+_MIN_ORDER_VALUE = 5.0   # target $5 per order (satisfies Polymarket's $1 minimum)
+_MIN_SIZE        = 2.0   # absolute floor in shares (safety net)
+
+
 def place_limit_order(
     token_id: str,
     price: float,
-    size: float,
     side: Side,
 ) -> dict:
     tick_price = round(price, 2)
-    size = float(size)
 
     if not (0.01 <= tick_price <= 0.99):
         return {
@@ -20,12 +22,18 @@ def place_limit_order(
             "error": f"Price {tick_price} out of valid range [0.01, 0.99]",
         }
 
+    # Dynamic size: target $5 order value; floor at _MIN_SIZE shares
+    size = max(_MIN_ORDER_VALUE / tick_price, _MIN_SIZE)
+    size = round(size, 2)
+    total_value = size * tick_price
+
     logger.info(
-        "Placing %s limit order | token=%s | size=%.4f | price=$%.2f",
+        "Placing %s limit order | token=%s | size=%.2f | price=$%.2f | total=$%.2f",
         side.name,
         token_id,
         size,
         tick_price,
+        total_value,
     )
 
     client = get_clob_client()
@@ -48,12 +56,13 @@ def place_limit_order(
             or "unknown"
         )
         logger.info(
-            "%s order placed successfully | order_id=%s | token=%s | size=%.4f | price=$%.2f",
+            "%s order placed successfully | order_id=%s | token=%s | size=%.2f | price=$%.2f | total=$%.2f",
             side.name,
             order_id,
             token_id,
             size,
             tick_price,
+            total_value,
         )
         return {"success": True, "order_id": order_id, "raw": result}
 
