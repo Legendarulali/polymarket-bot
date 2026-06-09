@@ -196,12 +196,11 @@ def process_market(market: dict, account_state: dict) -> None:
     # Pas 4: Plasare ordin
     price = _current_price(market, outcome)
     logger.warning(
-        "[TRADE] AI → BUY %s | '%s' | token=%s | price=$%.4f | size=%.1f | confidence=%.2f",
+        "[TRADE] AI → BUY %s | '%s' | token=%s | price=$%.4f | confidence=%.2f",
         outcome,
         title[:60],
         token_id,
         price,
-        _ORDER_SIZE,
         decision["confidence"],
     )
 
