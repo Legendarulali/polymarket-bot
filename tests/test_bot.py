@@ -294,7 +294,7 @@ class TestSettings:
         if "main" not in sys.modules:
             importlib.import_module("main")
         import main
-        assert main._MIN_BALANCE_PUSD == pytest.approx(5.0)
+        assert main._MIN_BALANCE_PUSD == pytest.approx(1.0)
 
     def test_min_confidence_constant_in_main(self):
         import importlib, sys

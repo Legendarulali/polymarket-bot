@@ -10,7 +10,7 @@ _OVERPRICED_THRESHOLD = 1.03
 # Ordinul de test are size fixă până când strategia este validată în producție.
 _TEST_ORDER_SIZE = 1.0
 # Fonduri minime necesare înainte de a plasa orice ordin.
-_MIN_BALANCE_PUSD = 5.0
+_MIN_BALANCE_PUSD = 1.0
 
 
 class BaseStrategy:
@@ -165,7 +165,7 @@ class NewsCatalystStrategy(BaseStrategy):
         side: Side = Side.BUY,
         news_query: str = "",
         order_size: float = 1.0,
-        min_balance: float = 5.0,
+        min_balance: float = 1.0,
     ) -> None:
         super().__init__(client)
         if not token_id:
