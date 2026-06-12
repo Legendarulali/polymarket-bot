@@ -230,6 +230,123 @@ class TestDynamicSizeCalculation:
 
 
 # ---------------------------------------------------------------------------
+# Tests: explicit size for SELL orders (position exits)
+# ---------------------------------------------------------------------------
+
+class TestExplicitOrderSize:
+    def _call(self, price, size, side_name="SELL"):
+        from src.execution import place_limit_order
+        from py_clob_client_v2 import Side
+
+        mock_client = MagicMock()
+        mock_client.create_and_post_order.return_value = {"orderID": "x"}
+
+        side = Side.SELL if side_name == "SELL" else Side.BUY
+        with patch("src.execution.get_clob_client", return_value=mock_client):
+            result = place_limit_order(token_id="0xT", price=price, side=side, size=size)
+        return result, mock_client
+
+    def test_explicit_size_used_verbatim(self):
+        _, client = self._call(0.5, size=7.5)
+        assert client.create_and_post_order.call_args.kwargs["order_args"].size == pytest.approx(7.5)
+
+    def test_explicit_size_rounded_to_2dp(self):
+        _, client = self._call(0.5, size=7.123)
+        assert client.create_and_post_order.call_args.kwargs["order_args"].size == pytest.approx(7.12)
+
+    def test_zero_size_rejected(self):
+        result, _ = self._call(0.5, size=0.0)
+        assert result["success"] is False
+        assert "size" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests: position_manager exit logic (take-profit / stop-loss)
+# ---------------------------------------------------------------------------
+
+class TestExitConditions:
+    def _state(self, avg_price=0.50, size=10.0, token_id="0xPOS"):
+        return {
+            "pusd_balance": 5.0,
+            "active_positions": [{
+                "asset_name": "Test market",
+                "token_id": token_id,
+                "side": "BUY",
+                "size": size,
+                "avg_price": avg_price,
+            }],
+        }
+
+    def _run(self, state, bid, tp=0.0, sl=0.0, order_result=None):
+        from src import position_manager
+        from config.settings import settings
+
+        position_manager._exit_attempts.clear()
+        order_result = order_result or {"success": True, "order_id": "exit-1"}
+
+        with patch.object(settings, "TAKE_PROFIT_PCT", tp), \
+             patch.object(settings, "STOP_LOSS_PCT", sl), \
+             patch("src.position_manager._best_bid", return_value=bid), \
+             patch("src.position_manager.place_limit_order", return_value=order_result) as mock_order:
+            position_manager.check_exit_conditions(state)
+        return mock_order
+
+    def test_disabled_by_default_no_orders(self):
+        mock_order = self._run(self._state(), bid=0.99, tp=0.0, sl=0.0)
+        mock_order.assert_not_called()
+
+    def test_take_profit_triggers_sell(self):
+        # avg 0.50, bid 0.65 → +30% ≥ 20% TP
+        mock_order = self._run(self._state(avg_price=0.50), bid=0.65, tp=0.20)
+        mock_order.assert_called_once()
+        kwargs = mock_order.call_args.kwargs
+        assert kwargs["token_id"] == "0xPOS"
+        assert kwargs["price"] == pytest.approx(0.65)
+        assert kwargs["size"] == pytest.approx(10.0)
+
+    def test_take_profit_not_reached_no_order(self):
+        # avg 0.50, bid 0.55 → +10% < 20% TP
+        mock_order = self._run(self._state(avg_price=0.50), bid=0.55, tp=0.20)
+        mock_order.assert_not_called()
+
+    def test_stop_loss_triggers_sell(self):
+        # avg 0.50, bid 0.35 → -30% ≤ -20% SL
+        mock_order = self._run(self._state(avg_price=0.50), bid=0.35, sl=0.20)
+        mock_order.assert_called_once()
+
+    def test_stop_loss_not_reached_no_order(self):
+        # avg 0.50, bid 0.45 → -10% > -20% SL
+        mock_order = self._run(self._state(avg_price=0.50), bid=0.45, sl=0.20)
+        mock_order.assert_not_called()
+
+    def test_no_orderbook_data_no_order(self):
+        mock_order = self._run(self._state(), bid=None, tp=0.20, sl=0.20)
+        mock_order.assert_not_called()
+
+    def test_tiny_position_below_min_value_skipped(self):
+        # 1 share * $0.65 = $0.65 < $1 minimum
+        mock_order = self._run(self._state(avg_price=0.50, size=1.0), bid=0.65, tp=0.20)
+        mock_order.assert_not_called()
+
+    def test_cooldown_prevents_duplicate_exit(self):
+        from src import position_manager
+        from config.settings import settings
+
+        position_manager._exit_attempts.clear()
+        state = self._state(avg_price=0.50)
+
+        with patch.object(settings, "TAKE_PROFIT_PCT", 0.20), \
+             patch.object(settings, "STOP_LOSS_PCT", 0.0), \
+             patch("src.position_manager._best_bid", return_value=0.65), \
+             patch("src.position_manager.place_limit_order",
+                   return_value={"success": True, "order_id": "x"}) as mock_order:
+            position_manager.check_exit_conditions(state)
+            position_manager.check_exit_conditions(state)
+
+        assert mock_order.call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Tests: process_market state updates (balance decrement, dedup, clustering)
 # ---------------------------------------------------------------------------
 
@@ -244,7 +361,7 @@ class TestProcessMarketStateTracking:
             "events": [{"slug": event_slug}],
         }
 
-    def _run(self, market, account_state, decision=None, order_result=None):
+    def _run(self, market, account_state, decision=None, order_result=None, live_ask=None):
         import main
         main._analysis_cache.clear()
         decision = decision or {"trade": True, "outcome": "YES", "confidence": 0.9, "reason": "test"}
@@ -252,6 +369,7 @@ class TestProcessMarketStateTracking:
 
         with patch("main.fetch_free_news", return_value=[]), \
              patch("main.analyse_market", return_value=decision), \
+             patch("main._live_best_ask", return_value=live_ask), \
              patch("main.place_limit_order", return_value=order_result) as mock_order:
             main.process_market(market, account_state)
         return mock_order
@@ -310,6 +428,27 @@ class TestProcessMarketStateTracking:
         state = {"pusd_balance": 0.5, "active_positions": []}
         mock_order = self._run(self._market(), state)
         mock_order.assert_not_called()
+
+    # --- Slippage guard ---
+
+    def test_stale_price_with_high_live_ask_blocks_order(self):
+        # Gamma price 0.70, live ask 0.80 → +14% > 5% tolerance
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        mock_order = self._run(self._market(), state, live_ask=0.80)
+        mock_order.assert_not_called()
+
+    def test_lower_live_ask_improves_buy_price(self):
+        # Gamma price 0.70, live ask 0.68 → buy at 0.68 (better, fills now)
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        mock_order = self._run(self._market(), state, live_ask=0.68)
+        mock_order.assert_called_once()
+        assert mock_order.call_args.kwargs["price"] == pytest.approx(0.68)
+
+    def test_no_orderbook_data_falls_back_to_gamma_price(self):
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        mock_order = self._run(self._market(), state, live_ask=None)
+        mock_order.assert_called_once()
+        assert mock_order.call_args.kwargs["price"] == pytest.approx(0.70)
 
 
 # ---------------------------------------------------------------------------

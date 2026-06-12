@@ -15,6 +15,7 @@ from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market
 from src.allowance import ensure_collateral_approved
+from src.position_manager import check_exit_conditions
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,21 @@ def _current_price(market: dict, outcome: str) -> float:
     except (ValueError, TypeError):
         pass
     return 0.5
+
+
+def _live_best_ask(token_id: str) -> float | None:
+    """Best ask live din orderbook CLOB, sau None dacă e indisponibil."""
+    try:
+        ob = get_clob_client().get_order_book(token_id=token_id)
+        asks = ob.asks if hasattr(ob, "asks") else ob.get("asks", [])
+        if not asks:
+            return None
+        return min(
+            float(a.price if hasattr(a, "price") else a["price"]) for a in asks
+        )
+    except Exception as exc:
+        logger.warning("[Agent] Orderbook indisponibil pentru token=%s: %s", token_id, exc)
+        return None
 
 
 def _get_cached_decision(market_id: str) -> dict | None:
@@ -318,6 +334,21 @@ def process_market(market: dict, account_state: dict) -> None:
         logger.warning("[Agent] Preț invalid (%.4f) pentru token=%s. Ordin blocat.", price, token_id)
         return
 
+    # Protecție anti-slippage: prețul Gamma poate fi stale față de orderbook.
+    # Dacă ask-ul real e mult peste prețul Gamma, piața s-a mișcat împotriva
+    # noastră — skip. Dacă e sub, cumpărăm la ask (preț mai bun, fill imediat).
+    if settings.SLIPPAGE_TOLERANCE > 0:
+        best_ask = _live_best_ask(token_id)
+        if best_ask is not None:
+            if best_ask > price * (1 + settings.SLIPPAGE_TOLERANCE):
+                logger.warning(
+                    "[Agent] Slippage prea mare: ask live $%.4f > preț Gamma $%.4f "
+                    "(+%.0f%% toleranță). Ordin blocat.",
+                    best_ask, price, settings.SLIPPAGE_TOLERANCE * 100,
+                )
+                return
+            price = min(price, best_ask)
+
     # Estimare cost ordin și verificare balanță disponibilă
     estimated_size = compute_order_size(price)
     order_total = round(estimated_size * price, 4)
@@ -417,6 +448,14 @@ def main() -> None:
                 )
                 pusd_balance = settings.OVERRIDE_BALANCE
                 account_state = {**account_state, "pusd_balance": pusd_balance}
+
+            # Verifică TP/SL pe pozițiile deschise (opt-in via TAKE_PROFIT_PCT /
+            # STOP_LOSS_PCT). Rulează înainte de verificarea de balanță: vânzarea
+            # trebuie să funcționeze și când nu mai sunt fonduri de cumpărare.
+            try:
+                check_exit_conditions(account_state)
+            except Exception as exc:
+                logger.error("[Agent] Exit check eșuat: %s", exc, exc_info=True)
 
             # Verificare balanță înainte de orice apel LLM sau API Polymarket
             if pusd_balance < _MIN_BALANCE_PUSD:

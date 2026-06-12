@@ -21,7 +21,13 @@ def place_limit_order(
     price: float,
     side: Side,
     tick_size: str = _DEFAULT_TICK_SIZE,
+    size: float | None = None,
 ) -> dict:
+    """
+    Plasează un ordin limită GTC. Dacă `size` lipsește, se calculează dinamic
+    (target $5) — pentru SELL pe poziții existente trebuie dat explicit, altfel
+    s-ar vinde o cantitate calculată din preț, nu cea deținută.
+    """
     if tick_size not in _VALID_TICK_SIZES:
         logger.warning(
             "Unknown tick_size %r — falling back to %s", tick_size, _DEFAULT_TICK_SIZE
@@ -39,7 +45,9 @@ def place_limit_order(
             "error": f"Price {tick_price} out of valid range [{tick}, {max_price}]",
         }
 
-    size = compute_order_size(tick_price)
+    size = round(size, 2) if size is not None else compute_order_size(tick_price)
+    if size <= 0:
+        return {"success": False, "error": f"Invalid order size {size}"}
     total_value = size * tick_price
 
     logger.info(

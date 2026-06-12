@@ -37,6 +37,13 @@ class Settings:
     # Plafon preț gas pe Polygon (gwei). Tranzacțiile on-chain sunt amânate
     # când rețeaua depășește acest prag (0 = fără plafon).
     MAX_GAS_PRICE_GWEI: float = float(os.getenv("MAX_GAS_PRICE_GWEI", "500"))
+    # Take-profit / stop-loss ca fracție din avg_price (ex: 0.20 = ±20%).
+    # 0 = dezactivat — botul păstrează pozițiile până la rezoluția pieței.
+    TAKE_PROFIT_PCT: float = float(os.getenv("TAKE_PROFIT_PCT", "0"))
+    STOP_LOSS_PCT: float = float(os.getenv("STOP_LOSS_PCT", "0"))
+    # Toleranță față de best ask live la BUY: dacă ask-ul real depășește prețul
+    # Gamma cu mai mult de această fracție, ordinul e blocat (0 = dezactivat).
+    SLIPPAGE_TOLERANCE: float = float(os.getenv("SLIPPAGE_TOLERANCE", "0.05"))
 
 settings = Settings()
 
