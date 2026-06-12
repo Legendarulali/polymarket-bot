@@ -19,12 +19,11 @@ class Settings:
     X_API_BEARER_TOKEN: str = os.getenv("X_API_BEARER_TOKEN", "")
     NEWS_API_KEY: str = os.getenv("NEWS_API_KEY", "")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-    # Tipuri de semnătură (py-clob-client oficial): 0=EOA, 1=POLY_PROXY (Magic),
-    # 2=POLY_GNOSIS_SAFE (proxy Gnosis Safe). Valoarea 3 (POLY_1271) exista doar
-    # în fork-ul py-clob-client-v2 și se normalizează la 2 — echivalentul pentru
-    # conturile proxy Gnosis Safe în clientul oficial.
-    _RAW_SIGNATURE_TYPE: int = int(os.getenv("SIGNATURE_TYPE", "2"))
-    SIGNATURE_TYPE: int = 2 if _RAW_SIGNATURE_TYPE == 3 else _RAW_SIGNATURE_TYPE
+    # Tipuri de semnătură (py-clob-client-v2): 0=EOA, 1=POLY_PROXY (Magic),
+    # 2=POLY_GNOSIS_SAFE, 3=POLY_1271/EIP-1271 (conturi proxy — confirmat
+    # funcțional pentru acest cont). Notă: cu chei API explicite, ordinele
+    # folosesc întotdeauna 3 (vezi src/clob_client.py).
+    SIGNATURE_TYPE: int = int(os.getenv("SIGNATURE_TYPE", "3"))
     POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
     # Chei API pre-generate din Polymarket UI (opționale — dacă sunt prezente, ocolesc derivarea)
     POLYMARKET_API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
@@ -59,10 +58,3 @@ logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-
-if settings._RAW_SIGNATURE_TYPE == 3:
-    logging.getLogger(__name__).warning(
-        "SIGNATURE_TYPE=3 (POLY_1271) aparținea fork-ului py-clob-client-v2 — "
-        "normalizat automat la 2 (POLY_GNOSIS_SAFE) pentru clientul oficial. "
-        "Actualizează variabila de mediu la 2 pentru a elimina acest warning."
-    )

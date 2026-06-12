@@ -1,9 +1,9 @@
 """
 Global pytest configuration.
 Sets required env vars and mocks all packages that are not installed locally
-(py_clob_client, openai, web3, tenacity, defusedxml, httpx) so unit tests can
-import bot modules without a full production environment. When a package IS
-installed (e.g. py_clob_client in CI with full deps), the real one is used.
+(py_clob_client_v2, openai, web3, tenacity, defusedxml, httpx) so unit tests
+can import bot modules without a full production environment. When a package
+IS installed, the real one is used.
 """
 import os
 import sys
@@ -17,15 +17,14 @@ os.environ.setdefault("POLYMARKET_PRIVATE_KEY", "0x" + "a" * 64)
 os.environ.setdefault("FUNDER_ADDRESS", "0x" + "b" * 40)
 os.environ.setdefault("CLOB_HOST", "https://clob.polymarket.com")
 os.environ.setdefault("CHAIN_ID", "137")
-# Valoarea legacy 3 (POLY_1271) — testează normalizarea la 2 din settings.py
 os.environ.setdefault("SIGNATURE_TYPE", "3")
 os.environ.setdefault("POLYGON_RPC_URL", "https://polygon-rpc.com")
 
 # ---------------------------------------------------------------------------
-# Mock py_clob_client (official client) — only if not installed
+# Mock py_clob_client_v2 — only if not installed
 # ---------------------------------------------------------------------------
 try:
-    import py_clob_client  # noqa: F401
+    import py_clob_client_v2  # noqa: F401
 except ImportError:
     @dataclass
     class OrderArgs:
@@ -33,10 +32,7 @@ except ImportError:
         price: float
         size: float
         side: str
-        fee_rate_bps: int = 0
-        nonce: int = 0
         expiration: int = 0
-        taker: str = "0x0000000000000000000000000000000000000000"
 
     class OrderType:
         GTC = "GTC"
@@ -46,24 +42,19 @@ except ImportError:
         COLLATERAL = "COLLATERAL"
         CONDITIONAL = "CONDITIONAL"
 
-    _mock_client_mod = MagicMock()
-    _mock_client_mod.ClobClient = MagicMock()
+    _mock_clob = MagicMock()
+    _mock_clob.OrderArgs = OrderArgs
+    _mock_clob.OrderType = OrderType
+    _mock_clob.AssetType = AssetType
+    _mock_clob.PartialCreateOrderOptions = MagicMock(return_value=MagicMock())
+    _mock_clob.ClobClient = MagicMock()
+    _mock_clob.BalanceAllowanceParams = MagicMock(return_value=MagicMock())
 
-    _mock_types_mod = MagicMock()
-    _mock_types_mod.OrderArgs = OrderArgs
-    _mock_types_mod.OrderType = OrderType
-    _mock_types_mod.AssetType = AssetType
-    _mock_types_mod.ApiCreds = MagicMock()
-    _mock_types_mod.BalanceAllowanceParams = MagicMock(return_value=MagicMock())
-    _mock_types_mod.PartialCreateOrderOptions = MagicMock(return_value=MagicMock())
+    _mock_clob_types = MagicMock()
+    _mock_clob_types.ApiCreds = MagicMock()
 
-    _mock_pkg = MagicMock()
-    _mock_pkg.client = _mock_client_mod
-    _mock_pkg.clob_types = _mock_types_mod
-
-    sys.modules["py_clob_client"] = _mock_pkg
-    sys.modules["py_clob_client.client"] = _mock_client_mod
-    sys.modules["py_clob_client.clob_types"] = _mock_types_mod
+    sys.modules["py_clob_client_v2"] = _mock_clob
+    sys.modules["py_clob_client_v2.clob_types"] = _mock_clob_types
 
 # ---------------------------------------------------------------------------
 # Mock openai (used by ai_analyser.py)
@@ -98,6 +89,7 @@ except ImportError:
     _mock_web3_cls.HTTPProvider = MagicMock()
     _mock_web3_mod.Web3 = _mock_web3_cls
     sys.modules["web3"] = _mock_web3_mod
+    sys.modules["web3.middleware"] = MagicMock()
     sys.modules["eth_account"] = MagicMock()
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 import logging
 from enum import Enum
 
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
 
 from src.clob_client import get_clob_client
 
@@ -70,18 +70,16 @@ def place_limit_order(
 
     client = get_clob_client()
     try:
-        # Clientul oficial rezolvă singur tick size-ul autoritativ și flag-ul
-        # neg_risk de la CLOB (cu cache) — nu le forțăm din datele Gamma,
-        # care pot fi stale și ar produce respingeri de validare.
-        order = client.create_order(
-            OrderArgs(
+        result = client.create_and_post_order(
+            order_args=OrderArgs(
                 token_id=token_id,
                 price=tick_price,
                 size=size,
                 side=side.value,
-            )
+            ),
+            options=PartialCreateOrderOptions(tick_size=tick_size),
+            order_type=OrderType.GTC,
         )
-        result = client.post_order(order, OrderType.GTC)
 
         order_id = (
             result.get("orderID")
@@ -109,12 +107,6 @@ def place_limit_order(
             tick_price,
             error_msg,
         )
-        if "not allowed" in error_msg.lower() or "signature" in error_msg.lower():
-            logger.error(
-                "Hint: dacă eroarea persistă, contul poate necesita semnături "
-                "EIP-1271 (POLY_1271), pe care clientul oficial py-clob-client "
-                "nu le suportă — vezi secțiunea de rollback din README."
-            )
         return {"success": False, "error": error_msg}
 
 
@@ -123,7 +115,7 @@ def cancel_order(order_id: str) -> dict:
 
     client = get_clob_client()
     try:
-        result = client.cancel(order_id)
+        result = client.cancel_order(order_id)
 
         logger.info("Order cancelled successfully | order_id=%s", order_id)
         return {"success": True, "order_id": order_id, "raw": result}

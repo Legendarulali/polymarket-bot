@@ -1,27 +1,32 @@
 import logging
 from eth_account import Account
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
-from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-from src.clob_client import get_clob_client
+from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+from src.clob_client import get_clob_client, get_signature_type
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Polymarket Polygon mainnet
-_USDC_ADDR         = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-_CTF_ADDR          = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
-_EXCHANGE_ADDR     = Web3.to_checksum_address("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
-_NEG_RISK_EXCHANGE = Web3.to_checksum_address("0xC5d563A36AE78145C45a50134d48A1215220f80a")
-_NEG_RISK_ADAPTER  = Web3.to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
-_ZERO_ADDR         = "0x0000000000000000000000000000000000000000"
-_MAX_UINT256       = 2**256 - 1
-_USDC_DECIMALS     = 1_000_000
-# Re-aprobă USDC când allowance-ul scade sub valoarea unui ordin standard.
+# Polymarket Polygon mainnet — sistemul curent (CTF Exchange V2 + colateral pUSD).
+# Adresele sunt cele din py-clob-client-v2 config (chain 137); vechiul exchange
+# V1 (0x4bFb…) și USDC.e nu mai sunt folosite la decontarea ordinelor.
+_COLLATERAL_ADDR      = Web3.to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")  # pUSD
+_CTF_ADDR             = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+_EXCHANGE_V2          = Web3.to_checksum_address("0xE111180000d2663C0091e4f400237545B87B996B")
+_NEG_RISK_EXCHANGE_V2 = Web3.to_checksum_address("0xe2222d279d744050d28e00520010520000310F59")
+_NEG_RISK_ADAPTER     = Web3.to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+_ZERO_ADDR            = "0x0000000000000000000000000000000000000000"
+_MAX_UINT256          = 2**256 - 1
+_USDC_DECIMALS        = 1_000_000
+# Re-aprobă colateralul când allowance-ul scade sub valoarea unui ordin standard.
 _REAPPROVE_THRESHOLD_USD = 5.0
 
-# Toți operatorii care necesită aprobare CTF.setApprovalForAll
-_CTF_OPERATORS = [_EXCHANGE_ADDR, _NEG_RISK_EXCHANGE, _NEG_RISK_ADAPTER]
+# Cheltuitorii care necesită aprobare de colateral (pUSD.approve) și operatorii
+# care necesită CTF.setApprovalForAll.
+_COLLATERAL_SPENDERS = [_EXCHANGE_V2, _NEG_RISK_EXCHANGE_V2, _NEG_RISK_ADAPTER]
+_CTF_OPERATORS       = [_EXCHANGE_V2, _NEG_RISK_EXCHANGE_V2, _NEG_RISK_ADAPTER]
 
 _ERC20_ABI = [
     {
@@ -71,7 +76,7 @@ _SAFE_ABI = [
 
 
 def _sync_clob_server(client) -> None:
-    sig_type = settings.SIGNATURE_TYPE
+    sig_type = get_signature_type()
     try:
         client.update_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=sig_type)
@@ -94,11 +99,11 @@ def _checked_gas_price(w3: Web3) -> int:
 
 
 def _approval_amount() -> int:
-    """Suma de aprobat pentru USDC: plafonată via USDC_APPROVAL_USD sau nelimitată."""
+    """Suma de aprobat pentru colateral (pUSD): plafonată via USDC_APPROVAL_USD sau nelimitată."""
     if settings.USDC_APPROVAL_USD > 0:
         return int(settings.USDC_APPROVAL_USD * _USDC_DECIMALS)
     logger.warning(
-        "[Allowance] Aprobare USDC NELIMITATĂ (MAX_UINT256). Setează USDC_APPROVAL_USD "
+        "[Allowance] Aprobare colateral NELIMITATĂ (MAX_UINT256). Setează USDC_APPROVAL_USD "
         "pentru a limita expunerea în cazul compromiterii contractului de exchange."
     )
     return _MAX_UINT256
@@ -106,10 +111,9 @@ def _approval_amount() -> int:
 
 def _calldata(contract_fn) -> bytes:
     """Extrage calldata-ul ABI-encoded al unui ContractFunction fără a trimite tx."""
-    dummy = "0x0000000000000000000000000000000000000001"
-    # gasPrice omis intenționat — web3 v6 folosește EIP-1559 defaults; gasPrice=0 cauzează erori
-    hex_data = contract_fn.build_transaction({"from": dummy, "gas": 200_000})["data"]
-    return bytes.fromhex(hex_data[2:] if hex_data.startswith("0x") else hex_data)
+    # encode doar argumentele + selector, fără build_transaction: acela face
+    # RPC calls (estimare gas / EIP-1559 din ultimul block) care pot eșua.
+    return bytes.fromhex(contract_fn._encode_transaction_data()[2:])
 
 
 def _send_direct(w3: Web3, contract_fn, from_addr: str, private_key: str, gas: int = 100_000) -> str:
@@ -176,11 +180,10 @@ def _execute_via_safe(
 
 def ensure_collateral_approved() -> None:
     """
-    Verifică și activează toate aprobările necesare pentru trading pe Polymarket CLOB:
-      1. USDC.approve(CLOB_Exchange, MAX_UINT256)
-      2. CTF.setApprovalForAll(CLOB_Exchange, true)
-      3. CTF.setApprovalForAll(NegRisk_Exchange, true)
-      4. CTF.setApprovalForAll(NegRisk_Adapter, true)
+    Verifică și activează toate aprobările necesare pentru trading pe Polymarket
+    CLOB (sistemul V2 cu colateral pUSD):
+      1. pUSD.approve(spender) pentru Exchange V2, NegRisk Exchange V2, NegRisk Adapter
+      2. CTF.setApprovalForAll(operator, true) pentru aceiași trei operatori
 
     Conturi EOA: trimite tranzacțiile direct.
     Conturi proxy (funder ≠ EOA): execută prin interfața Gnosis Safe.
@@ -202,6 +205,9 @@ def ensure_collateral_approved() -> None:
     rpc = settings.POLYGON_RPC_URL
     logger.info("[Allowance] Conectare la Polygon RPC: %s", rpc)
     w3 = Web3(Web3.HTTPProvider(rpc))
+    # Polygon e lanț POA: block-urile au extraData >32 bytes și web3 refuză să
+    # le parseze fără acest middleware (eroarea "extraData is 324 bytes").
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     if not w3.is_connected():
         logger.error("[Allowance] Imposibil de conectat la RPC %s.", rpc)
         return
@@ -216,29 +222,33 @@ def ensure_collateral_approved() -> None:
         owner, "proxy/Safe" if is_proxy else "EOA direct",
     )
 
-    usdc = w3.eth.contract(address=_USDC_ADDR, abi=_ERC20_ABI)
-    ctf  = w3.eth.contract(address=_CTF_ADDR,  abi=_ERC1155_ABI)
+    pusd = w3.eth.contract(address=_COLLATERAL_ADDR, abi=_ERC20_ABI)
+    ctf  = w3.eth.contract(address=_CTF_ADDR,        abi=_ERC1155_ABI)
+    owner_cs = Web3.to_checksum_address(owner)
 
-    # Citire stare on-chain
-    usdc_allowance = usdc.functions.allowance(
-        Web3.to_checksum_address(owner), _EXCHANGE_ADDR
-    ).call() / _USDC_DECIMALS
+    def _read_missing() -> tuple[list, list]:
+        """Citește on-chain ce aprobări lipsesc (colateral pUSD + CTF)."""
+        # Cu aprobări mărginite, allowance-ul scade la fiecare fill — re-aprobă
+        # înainte să coboare sub valoarea unui ordin, nu doar când ajunge la 0.
+        collateral = [
+            sp for sp in _COLLATERAL_SPENDERS
+            if pusd.functions.allowance(owner_cs, sp).call() / _USDC_DECIMALS
+            < _REAPPROVE_THRESHOLD_USD
+        ]
+        operators = [
+            op for op in _CTF_OPERATORS
+            if not ctf.functions.isApprovedForAll(owner_cs, op).call()
+        ]
+        return collateral, operators
 
-    ctf_missing = [
-        op for op in _CTF_OPERATORS
-        if not ctf.functions.isApprovedForAll(
-            Web3.to_checksum_address(owner),
-            Web3.to_checksum_address(op),
-        ).call()
-    ]
+    collateral_missing, ctf_missing = _read_missing()
+    logger.info(
+        "[Allowance] Aprobări pUSD lipsă: %d/%d | CTF operatori lipsă: %d/%d",
+        len(collateral_missing), len(_COLLATERAL_SPENDERS),
+        len(ctf_missing), len(_CTF_OPERATORS),
+    )
 
-    logger.info("[Allowance] USDC allowance: %.2f | CTF operatori lipsă: %d", usdc_allowance, len(ctf_missing))
-
-    # Cu aprobări mărginite, allowance-ul scade la fiecare fill — re-aprobă
-    # înainte să coboare sub valoarea unui ordin, nu doar când ajunge la 0.
-    needs_usdc_approval = usdc_allowance < _REAPPROVE_THRESHOLD_USD
-
-    if not needs_usdc_approval and not ctf_missing:
+    if not collateral_missing and not ctf_missing:
         logger.info("[Allowance] Toate aprobările active. Sincronizez CLOB server...")
         _sync_clob_server(client)
         return
@@ -251,17 +261,17 @@ def ensure_collateral_approved() -> None:
             return _execute_via_safe(w3, funder, to, data, eoa, settings.PRIVATE_KEY)
         return _send_direct(w3, contract_fn, eoa, settings.PRIVATE_KEY)
 
-    if needs_usdc_approval:
-        amount = _approval_amount()
-        logger.info("[Allowance] Trimit USDC.approve(EXCHANGE, %s) de la %s...",
-                    "MAX" if amount == _MAX_UINT256 else f"{amount / _USDC_DECIMALS:.2f} USD", owner)
+    amount = _approval_amount() if collateral_missing else 0
+    for sp in collateral_missing:
+        logger.info("[Allowance] Trimit pUSD.approve(%s, %s) de la %s...",
+                    sp, "MAX" if amount == _MAX_UINT256 else f"{amount / _USDC_DECIMALS:.2f} USD", owner)
         try:
-            tx = _send(usdc.functions.approve(_EXCHANGE_ADDR, amount))
-            logger.info("[Allowance] USDC.approve confirmat: tx=%s", tx)
+            tx = _send(pusd.functions.approve(sp, amount))
+            logger.info("[Allowance] pUSD.approve(%s) confirmat: tx=%s", sp, tx)
         except Exception as exc:
             logger.warning(
-                "[Allowance] On-chain approval failed via Safe, but skipping since manual "
-                "setup might be active (USDC.approve error: %s)", exc,
+                "[Allowance] On-chain approval failed, but skipping since manual "
+                "setup might be active (pUSD.approve %s error: %s)", sp, exc,
             )
 
     for op in ctf_missing:
@@ -271,29 +281,20 @@ def ensure_collateral_approved() -> None:
             logger.info("[Allowance] CTF.setApprovalForAll(%s) confirmat: tx=%s", op, tx)
         except Exception as exc:
             logger.warning(
-                "[Allowance] On-chain approval failed via Safe, but skipping since manual "
+                "[Allowance] On-chain approval failed, but skipping since manual "
                 "setup might be active (CTF.setApprovalForAll %s error: %s)", op, exc,
             )
 
     # Verificare finală: dacă aprobările tot lipsesc după încercări, ordinele
     # vor fi respinse de CLOB în buclă — semnalează clar pentru operator.
     try:
-        final_usdc = usdc.functions.allowance(
-            Web3.to_checksum_address(owner), _EXCHANGE_ADDR
-        ).call() / _USDC_DECIMALS
-        final_ctf_missing = [
-            op for op in _CTF_OPERATORS
-            if not ctf.functions.isApprovedForAll(
-                Web3.to_checksum_address(owner),
-                Web3.to_checksum_address(op),
-            ).call()
-        ]
-        if final_usdc < _REAPPROVE_THRESHOLD_USD or final_ctf_missing:
+        final_collateral_missing, final_ctf_missing = _read_missing()
+        if final_collateral_missing or final_ctf_missing:
             logger.error(
                 "[Allowance] APROBĂRI INCOMPLETE după toate încercările: "
-                "USDC allowance=%.2f | CTF operatori lipsă: %s. "
-                "Ordinele vor fi respinse până la aprobare manuală.",
-                final_usdc,
+                "pUSD spenders lipsă: %s | CTF operatori lipsă: %s. "
+                "Ordinele pot fi respinse până la aprobare manuală din Polymarket UI.",
+                [str(sp) for sp in final_collateral_missing] or "niciunul",
                 [str(op) for op in final_ctf_missing] or "niciunul",
             )
         else:

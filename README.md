@@ -69,24 +69,21 @@ deduplicare pe token și verificare de balanță înainte de fiecare ordin.
   contractului de exchange — cu costul unor re-aprobări periodice (gas).
 - **RPC**: folosește un endpoint autentificat (Alchemy/Infura) în loc de
   `polygon-rpc.com` — un RPC public poate servi date false sau cenzura tranzacții.
-- **Clientul CLOB** este `py-clob-client` — clientul **oficial** Polymarket
-  (anterior se folosea fork-ul neoficial `py-clob-client-v2`).
+- **Clientul CLOB** este `py-clob-client-v2` — un client comunitar, **necesar
+  funcțional**: Polymarket a migrat la formatul de ordine V2 (CTF Exchange V2,
+  colateral pUSD), iar clientul oficial `py-clob-client` (≤0.34.6) este
+  respins de server cu `invalid order version` (verificat live 2026-06-12).
+  Fiind neoficial, verifică proveniența înainte de orice bump de versiune.
+- **Semnături**: ordinele folosesc `signature_type=3` (POLY_1271/EIP-1271),
+  singurul confirmat funcțional pentru conturile proxy ale acestui bot;
+  valoarea este fixată în `src/clob_client.py` când există chei API explicite.
+- **Aprobările on-chain** vizează sistemul curent: pUSD
+  (`0xC011a7E1…`) către Exchange V2 (`0xE1111800…`), NegRisk Exchange V2
+  (`0xe2222d27…`) și NegRisk Adapter — nu vechiul exchange V1/USDC.e.
 - **Decizia LLM** se bazează pe titluri de piață și știri — conținut extern
   nesigur. Promptul are gardă anti-injection, output-ul e validat strict
   (doar YES/NO, confidence clamped), iar filtrele de risc rulează independent
   de decizia AI.
-
-### Rollback migrare client CLOB
-
-Clientul oficial suportă semnături `0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE`.
-Fostul fork folosea `3` (POLY_1271/EIP-1271), normalizat acum automat la `2`.
-Pentru majoritatea conturilor proxy Polymarket (Gnosis Safe) tipul `2`
-funcționează identic. **La primul deploy după migrare, urmărește logurile**:
-dacă ordinele sunt respinse repetat cu `maker address not allowed` sau erori
-de semnătură, contul tău necesită fluxul EIP-1271, pe care clientul oficial
-nu îl implementează — în acest caz fă rollback la commit-ul dinaintea
-migrării (`git revert`) sau repune `py-clob-client-v2==1.0.1` în
-`requirements.txt` împreună cu vechiul `src/clob_client.py`.
 
 ## Teste
 

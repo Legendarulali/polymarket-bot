@@ -1,7 +1,7 @@
 import logging
 import requests
-from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-from src.clob_client import get_clob_client
+from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+from src.clob_client import get_clob_client, get_signature_type
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -15,7 +15,7 @@ def get_account_state() -> dict:
     client = get_clob_client()
 
     bal_data = client.get_balance_allowance(
-        BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=settings.SIGNATURE_TYPE)
+        BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=get_signature_type())
     )
     if hasattr(bal_data, "balance"):
         raw_balance = bal_data.balance

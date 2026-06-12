@@ -1,7 +1,9 @@
-# Client oficial Polymarket CLOB (github.com/Polymarket/py-clob-client).
-# Suportă semnături 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE (NU și EIP-1271/
-# tip 3 din fostul fork py-clob-client-v2 — vezi README, secțiunea rollback).
-py-clob-client==0.34.6
+# Client comunitar pentru noul format de ordine Polymarket (CTF Exchange V2).
+# NU folosi clientul oficial py-clob-client (<=0.34.6): CLOB-ul îi respinge
+# ordinele cu "invalid order version" — formatul V2 (cu builder/metadata și
+# semnături EIP-1271/tip 3) există doar aici. Verificat live pe 2026-06-12.
+# Fiind neoficial, verifică proveniența înainte de orice bump de versiune.
+py-clob-client-v2==1.0.1
 # requests>=2.32.4 remediază CVE-2024-35195 și CVE-2024-47081 (scurgere credențiale .netrc)
 requests==2.32.5
 python-dotenv==1.0.1
