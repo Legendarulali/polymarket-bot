@@ -7,24 +7,39 @@ logger = logging.getLogger(__name__)
 
 _MIN_ORDER_VALUE = 5.0   # target $5 per order (satisfies Polymarket's $1 minimum)
 _MIN_SIZE        = 2.0   # absolute floor in shares (safety net)
+_VALID_TICK_SIZES = ("0.1", "0.01", "0.001", "0.0001")
+_DEFAULT_TICK_SIZE = "0.01"
+
+
+def compute_order_size(price: float) -> float:
+    """Size dinamic: target $5 valoare ordin, cu floor absolut de _MIN_SIZE shares."""
+    return round(max(_MIN_ORDER_VALUE / price, _MIN_SIZE), 2)
 
 
 def place_limit_order(
     token_id: str,
     price: float,
     side: Side,
+    tick_size: str = _DEFAULT_TICK_SIZE,
 ) -> dict:
-    tick_price = round(price, 2)
+    if tick_size not in _VALID_TICK_SIZES:
+        logger.warning(
+            "Unknown tick_size %r — falling back to %s", tick_size, _DEFAULT_TICK_SIZE
+        )
+        tick_size = _DEFAULT_TICK_SIZE
 
-    if not (0.01 <= tick_price <= 0.99):
+    tick = float(tick_size)
+    decimals = len(tick_size.split(".")[1])
+    tick_price = round(price, decimals)
+    max_price = round(1 - tick, decimals)
+
+    if not (tick <= tick_price <= max_price):
         return {
             "success": False,
-            "error": f"Price {tick_price} out of valid range [0.01, 0.99]",
+            "error": f"Price {tick_price} out of valid range [{tick}, {max_price}]",
         }
 
-    # Dynamic size: target $5 order value; floor at _MIN_SIZE shares
-    size = max(_MIN_ORDER_VALUE / tick_price, _MIN_SIZE)
-    size = round(size, 2)
+    size = compute_order_size(tick_price)
     total_value = size * tick_price
 
     logger.info(
@@ -45,7 +60,7 @@ def place_limit_order(
                 size=size,
                 side=side,
             ),
-            options=PartialCreateOrderOptions(tick_size="0.01"),
+            options=PartialCreateOrderOptions(tick_size=tick_size),
             order_type=OrderType.GTC,
         )
 

@@ -52,6 +52,10 @@ def get_account_state() -> dict:
                     "side":       pos.get("side", ""),
                     "size":       float(pos["size"]),
                     "avg_price":  float(pos.get("avgPrice") or pos.get("avg_price", 0)),
+                    # eventSlug corespunde slug-ului din `events` la piețele Gamma;
+                    # fără acest câmp, filtrul de event clustering din main nu are
+                    # cu ce să compare și nu limitează nimic.
+                    "event_id":   pos.get("eventSlug") or pos.get("eventId") or pos.get("conditionId") or "",
                 })
     except requests.RequestException as exc:
         logger.warning("Could not fetch positions from Data API: %s", exc)

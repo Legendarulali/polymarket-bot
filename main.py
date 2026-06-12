@@ -10,7 +10,7 @@ from py_clob_client_v2 import Side
 
 from config.settings import settings
 from src.reconciliation import log_reconciliation_report, get_account_state
-from src.execution import place_limit_order, _MIN_ORDER_VALUE, _MIN_SIZE
+from src.execution import place_limit_order, compute_order_size
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market
@@ -33,9 +33,6 @@ _MAX_OUTRIGHT_PER_EVENT = 1      # Max poziții pe piețe de tip "outright winne
 
 # Cache în memorie: {market_id: (timestamp_float, decision_dict)}
 _analysis_cache: dict[str, tuple[float, dict]] = {}
-
-# Tracker pentru pozițiile per event: {event_id: count}
-_event_position_counts: dict[str, int] = {}
 
 _MATCH_KEYWORDS = (" vs ", " vs. ")
 _OUTRIGHT_PHRASES = (
@@ -120,12 +117,25 @@ def _token_for_outcome(market: dict, outcome: str) -> str | None:
 
 def _current_price(market: dict, outcome: str) -> float:
     """Returnează prețul YES sau NO din datele Gamma, cu fallback la 0.5."""
+    # Gamma API returnează outcomePrices ca string JSON (ex: '["0.72", "0.28"]'),
+    # la fel ca clobTokenIds — trebuie dezserializat înainte de indexare.
+    prices = market.get("outcomePrices") or []
+    if isinstance(prices, str):
+        try:
+            prices = json.loads(prices)
+        except json.JSONDecodeError:
+            logger.warning("[Agent] Eroare parsare outcomePrices: %r", prices[:80])
+            prices = []
+
     try:
-        prices = market.get("outcomePrices", [])
-        if outcome.upper() == "YES" and prices:
+        if outcome.upper() == "YES" and len(prices) > 0:
             return float(prices[0])
         if outcome.upper() == "NO" and len(prices) > 1:
             return float(prices[1])
+    except (ValueError, TypeError):
+        pass
+
+    try:
         ask = market.get("bestAsk")
         if ask is not None:
             return float(ask)
@@ -154,14 +164,46 @@ def _get_cached_decision(market_id: str) -> dict | None:
     return None
 
 
+def _extract_event_id(market: dict) -> str:
+    """
+    Identificatorul evenimentului pieței Gamma. Preferă slug-ul din `events`,
+    care corespunde câmpului `eventSlug` din pozițiile Data API — altfel
+    clustering-ul pe eveniment nu se poate corela cu pozițiile deschise.
+    """
+    events = market.get("events") or []
+    if isinstance(events, list) and events and isinstance(events[0], dict):
+        slug_or_id = events[0].get("slug") or events[0].get("id")
+        if slug_or_id:
+            return str(slug_or_id)
+    return str(
+        market.get("eventId")
+        or market.get("event_id")
+        or market.get("conditionId")
+        or ""
+    )
+
+
 def process_market(market: dict, account_state: dict) -> None:
     pusd_balance: float = account_state.get("pusd_balance", 0.0)
-    active_positions: list[dict] = account_state.get("active_positions", [])
+    active_positions: list[dict] = account_state.setdefault("active_positions", [])
 
     title = market.get("question") or market.get("title") or "Unknown market"
     market_id = market.get("id", "?")
 
     logger.info("[Agent] Procesez piața id=%s: %s", market_id, title[:80])
+
+    # Limita globală de poziții se re-verifică per piață: în aceeași iterație
+    # pot fi deschise mai multe poziții noi, iar verificarea din bucla main
+    # vede doar starea de la începutul iterației.
+    if (
+        settings.MAX_ACTIVE_POSITIONS > 0
+        and len(active_positions) >= settings.MAX_ACTIVE_POSITIONS
+    ):
+        logger.info(
+            "[FILTER] Limită de expunere atinsă (%d/%d poziții). Skip piața '%s'.",
+            len(active_positions), settings.MAX_ACTIVE_POSITIONS, title[:60],
+        )
+        return
 
     # --- FILTRU 1: Volum minim ---
     volume = 0.0
@@ -189,7 +231,7 @@ def process_market(market: dict, account_state: dict) -> None:
     # Meciurile individuale (ex: 'SUA vs Iran') nu sunt blocate de limita pe
     # event_id, deoarece aceasta ar afecta și piețele de tip outright winner
     # din același turneu. Fiecare tip de piață are propria limită.
-    event_id = market.get("eventId") or market.get("event_id") or market.get("conditionId") or ""
+    event_id = _extract_event_id(market)
     market_type = _classify_market(title)
 
     if market_type == "match":
@@ -277,7 +319,7 @@ def process_market(market: dict, account_state: dict) -> None:
         return
 
     # Estimare cost ordin și verificare balanță disponibilă
-    estimated_size = round(max(_MIN_ORDER_VALUE / price, _MIN_SIZE), 2)
+    estimated_size = compute_order_size(price)
     order_total = round(estimated_size * price, 4)
     if pusd_balance < order_total:
         logger.warning(
@@ -298,17 +340,29 @@ def process_market(market: dict, account_state: dict) -> None:
         decision["confidence"],
     )
 
+    tick_size = str(market.get("orderPriceMinTickSize") or "0.01")
+
     result = place_limit_order(
         token_id=token_id,
         price=price,
         side=Side.BUY,
+        tick_size=tick_size,
     )
 
     if result.get("success"):
         logger.info("[Agent] Ordin plasat cu succes | order_id=%s", result.get("order_id"))
-        # Urmărește event clustering pentru viitoarele iterații
-        if event_id:
-            _event_position_counts[event_id] = _event_position_counts.get(event_id, 0) + 1
+        # Actualizează starea locală imediat: altfel piețele următoare din
+        # aceeași iterație văd balanța veche (risc de overspend) și nu văd
+        # poziția nouă (dedup și event clustering ar fi ocolite).
+        account_state["pusd_balance"] = round(pusd_balance - order_total, 6)
+        active_positions.append({
+            "asset_name": title,
+            "token_id":   token_id,
+            "side":       "BUY",
+            "size":       estimated_size,
+            "avg_price":  price,
+            "event_id":   event_id,
+        })
     else:
         logger.error("[Agent] Ordin respins de CLOB: %s", result.get("error"))
 
@@ -320,6 +374,14 @@ def main() -> None:
         settings.CHAIN_ID,
         settings.FUNDER_ADDRESS,
     )
+
+    if settings.OVERRIDE_BALANCE > 0:
+        logger.warning(
+            "OVERRIDE_BALANCE=%.4f este setat — botul va presupune această balanță "
+            "când API-ul raportează 0. Dacă fondurile reale s-au epuizat, ordinele "
+            "vor fi respinse de CLOB. Dezactivează variabila când nu mai e necesară.",
+            settings.OVERRIDE_BALANCE,
+        )
 
     try:
         logger.info("Running boot reconciliation...")
