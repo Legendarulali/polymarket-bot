@@ -17,6 +17,8 @@ _NEG_RISK_ADAPTER  = Web3.to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1d
 _ZERO_ADDR         = "0x0000000000000000000000000000000000000000"
 _MAX_UINT256       = 2**256 - 1
 _USDC_DECIMALS     = 1_000_000
+# Re-aprobă USDC când allowance-ul scade sub valoarea unui ordin standard.
+_REAPPROVE_THRESHOLD_USD = 5.0
 
 # Toți operatorii care necesită aprobare CTF.setApprovalForAll
 _CTF_OPERATORS = [_EXCHANGE_ADDR, _NEG_RISK_EXCHANGE, _NEG_RISK_ADAPTER]
@@ -79,6 +81,29 @@ def _sync_clob_server(client) -> None:
         logger.warning("[Allowance] update_balance_allowance() eșuat: %s", exc)
 
 
+def _checked_gas_price(w3: Web3) -> int:
+    """Prețul curent de gas, cu refuz dacă depășește plafonul configurat."""
+    gas_price = w3.eth.gas_price
+    cap_gwei = settings.MAX_GAS_PRICE_GWEI
+    if cap_gwei > 0 and gas_price > cap_gwei * 1e9:
+        raise RuntimeError(
+            f"Gas price {gas_price / 1e9:.1f} gwei peste plafonul de "
+            f"{cap_gwei:.0f} gwei (MAX_GAS_PRICE_GWEI) — tranzacție amânată."
+        )
+    return gas_price
+
+
+def _approval_amount() -> int:
+    """Suma de aprobat pentru USDC: plafonată via USDC_APPROVAL_USD sau nelimitată."""
+    if settings.USDC_APPROVAL_USD > 0:
+        return int(settings.USDC_APPROVAL_USD * _USDC_DECIMALS)
+    logger.warning(
+        "[Allowance] Aprobare USDC NELIMITATĂ (MAX_UINT256). Setează USDC_APPROVAL_USD "
+        "pentru a limita expunerea în cazul compromiterii contractului de exchange."
+    )
+    return _MAX_UINT256
+
+
 def _calldata(contract_fn) -> bytes:
     """Extrage calldata-ul ABI-encoded al unui ContractFunction fără a trimite tx."""
     dummy = "0x0000000000000000000000000000000000000001"
@@ -93,7 +118,7 @@ def _send_direct(w3: Web3, contract_fn, from_addr: str, private_key: str, gas: i
         "from":     from_addr,
         "nonce":    w3.eth.get_transaction_count(from_addr),
         "gas":      gas,
-        "gasPrice": w3.eth.gas_price,
+        "gasPrice": _checked_gas_price(w3),
         "chainId":  137,
     })
     signed  = w3.eth.account.sign_transaction(tx, private_key=private_key)
@@ -138,7 +163,7 @@ def _execute_via_safe(
         "from":     eoa_address,
         "nonce":    w3.eth.get_transaction_count(eoa_address),
         "gas":      250_000,
-        "gasPrice": w3.eth.gas_price,
+        "gasPrice": _checked_gas_price(w3),
         "chainId":  137,
     })
     signed  = w3.eth.account.sign_transaction(tx, private_key=private_key)
@@ -209,7 +234,11 @@ def ensure_collateral_approved() -> None:
 
     logger.info("[Allowance] USDC allowance: %.2f | CTF operatori lipsă: %d", usdc_allowance, len(ctf_missing))
 
-    if usdc_allowance > 0 and not ctf_missing:
+    # Cu aprobări mărginite, allowance-ul scade la fiecare fill — re-aprobă
+    # înainte să coboare sub valoarea unui ordin, nu doar când ajunge la 0.
+    needs_usdc_approval = usdc_allowance < _REAPPROVE_THRESHOLD_USD
+
+    if not needs_usdc_approval and not ctf_missing:
         logger.info("[Allowance] Toate aprobările active. Sincronizez CLOB server...")
         _sync_clob_server(client)
         return
@@ -222,10 +251,12 @@ def ensure_collateral_approved() -> None:
             return _execute_via_safe(w3, funder, to, data, eoa, settings.PRIVATE_KEY)
         return _send_direct(w3, contract_fn, eoa, settings.PRIVATE_KEY)
 
-    if usdc_allowance == 0:
-        logger.info("[Allowance] Trimit USDC.approve(EXCHANGE, MAX) de la %s...", owner)
+    if needs_usdc_approval:
+        amount = _approval_amount()
+        logger.info("[Allowance] Trimit USDC.approve(EXCHANGE, %s) de la %s...",
+                    "MAX" if amount == _MAX_UINT256 else f"{amount / _USDC_DECIMALS:.2f} USD", owner)
         try:
-            tx = _send(usdc.functions.approve(_EXCHANGE_ADDR, _MAX_UINT256))
+            tx = _send(usdc.functions.approve(_EXCHANGE_ADDR, amount))
             logger.info("[Allowance] USDC.approve confirmat: tx=%s", tx)
         except Exception as exc:
             logger.warning(
@@ -243,5 +274,31 @@ def ensure_collateral_approved() -> None:
                 "[Allowance] On-chain approval failed via Safe, but skipping since manual "
                 "setup might be active (CTF.setApprovalForAll %s error: %s)", op, exc,
             )
+
+    # Verificare finală: dacă aprobările tot lipsesc după încercări, ordinele
+    # vor fi respinse de CLOB în buclă — semnalează clar pentru operator.
+    try:
+        final_usdc = usdc.functions.allowance(
+            Web3.to_checksum_address(owner), _EXCHANGE_ADDR
+        ).call() / _USDC_DECIMALS
+        final_ctf_missing = [
+            op for op in _CTF_OPERATORS
+            if not ctf.functions.isApprovedForAll(
+                Web3.to_checksum_address(owner),
+                Web3.to_checksum_address(op),
+            ).call()
+        ]
+        if final_usdc < _REAPPROVE_THRESHOLD_USD or final_ctf_missing:
+            logger.error(
+                "[Allowance] APROBĂRI INCOMPLETE după toate încercările: "
+                "USDC allowance=%.2f | CTF operatori lipsă: %s. "
+                "Ordinele vor fi respinse până la aprobare manuală.",
+                final_usdc,
+                [str(op) for op in final_ctf_missing] or "niciunul",
+            )
+        else:
+            logger.info("[Allowance] Verificare finală OK: toate aprobările active.")
+    except Exception as exc:
+        logger.warning("[Allowance] Verificarea finală a aprobărilor a eșuat: %s", exc)
 
     _sync_clob_server(client)

@@ -95,9 +95,18 @@ def analyse_market(market_title: str, current_price: float, news_items: list[str
         parsed = json.loads(raw)
         confidence = float(parsed.get("confidence", 0.0))
         confidence = max(0.0, min(1.0, confidence))
+        trade = bool(parsed.get("trade", False))
+        outcome = str(parsed.get("outcome", "NO")).upper()
+        # Orice valoare în afara YES/NO (inclusiv output manipulat prin
+        # prompt injection) anulează trade-ul în loc să fie propagată.
+        if outcome not in ("YES", "NO"):
+            logger.warning("[AIAnalyser] Outcome invalid de la LLM: %r — trade anulat.", outcome[:40])
+            trade = False
+            outcome = "NO"
+            confidence = 0.0
         return {
-            "trade": bool(parsed.get("trade", False)),
-            "outcome": str(parsed.get("outcome", "NO")).upper(),
+            "trade": trade,
+            "outcome": outcome,
             "confidence": confidence,
             "reason": str(parsed.get("reason", ""))[:200],
         }

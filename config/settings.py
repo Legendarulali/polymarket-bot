@@ -30,6 +30,13 @@ class Settings:
     OVERRIDE_BALANCE: float = float(os.getenv("OVERRIDE_BALANCE", "0"))
     # Număr maxim de poziții deschise simultan (0 = fără limită)
     MAX_ACTIVE_POSITIONS: int = int(os.getenv("MAX_ACTIVE_POSITIONS", "5"))
+    # Plafon USDC aprobat pentru CLOB Exchange, în USD (0 = aprobare nelimitată).
+    # Aprobarea nelimitată expune tot soldul dacă exchange-ul e compromis;
+    # o valoare mărginită necesită re-aprobare periodică (cost de gas).
+    USDC_APPROVAL_USD: float = float(os.getenv("USDC_APPROVAL_USD", "0"))
+    # Plafon preț gas pe Polygon (gwei). Tranzacțiile on-chain sunt amânate
+    # când rețeaua depășește acest prag (0 = fără plafon).
+    MAX_GAS_PRICE_GWEI: float = float(os.getenv("MAX_GAS_PRICE_GWEI", "500"))
 
 settings = Settings()
 

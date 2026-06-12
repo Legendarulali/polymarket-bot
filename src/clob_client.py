@@ -44,7 +44,7 @@ def get_clob_client() -> ClobClient:
             funder=settings.FUNDER_ADDRESS,
             signature_type=3,  # POLY_1271 / EIP-1271 — for Gnosis Safe proxy wallets
         )
-        logger.info("CLOB client ready (POLY_1271, sig_type=3) | API_KEY=%.8s… funder=%s", settings.POLYMARKET_API_KEY, settings.FUNDER_ADDRESS)
+        logger.info("CLOB client ready (POLY_1271, sig_type=3) | funder=%s", settings.FUNDER_ADDRESS)
     else:
         logger.info(
             "Initializing Polymarket CLOB V2 client (derive mode) | "

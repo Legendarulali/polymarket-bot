@@ -1,9 +1,15 @@
+# NOTĂ SECURITATE: py-clob-client-v2 este un fork neoficial al py-clob-client
+# (clientul oficial Polymarket). Această librărie primește cheia privată și
+# semnează ordine — verifică proveniența/maintainer-ul înainte de orice bump.
 py-clob-client-v2==1.0.1
-requests==2.31.0
+# requests>=2.32.4 remediază CVE-2024-35195 și CVE-2024-47081 (scurgere credențiale .netrc)
+requests==2.32.5
 python-dotenv==1.0.1
 pydantic==2.6.4
-httpx==0.27.0
+httpx==0.27.2
 openai==1.35.0
 defusedxml==0.7.1
 tenacity==8.5.0
-web3>=6.0.0
+# web3 7.x e cerut de py-clob-client-v2 (eth-account>=0.13); fără limită superioară
+# un viitor web3 8 cu breaking changes s-ar instala silențios
+web3>=7,<8

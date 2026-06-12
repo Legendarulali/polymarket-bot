@@ -1,0 +1,28 @@
+# Secrete — nu trebuie să ajungă NICIODATĂ în imaginea Docker
+.env
+.env.*
+!.env.example
+
+# Git
+.git
+.gitignore
+.github
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# Dev-only
+tests/
+.idea/
+.vscode/
+*.md
+*.log
+logs/
+Dockerfile
+.dockerignore
+railway.json
