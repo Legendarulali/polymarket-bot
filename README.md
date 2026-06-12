@@ -53,7 +53,8 @@ nu este inclus niciodată în imagine (vezi `.dockerignore`).
 | Plafon aprobare USDC on-chain | `USDC_APPROVAL_USD` | 0 (nelimitat — recomandat de setat) |
 | Plafon gas Polygon | `MAX_GAS_PRICE_GWEI` | 500 |
 | Toleranță slippage la BUY | `SLIPPAGE_TOLERANCE` | 0.05 |
-| Take-profit / stop-loss | `TAKE_PROFIT_PCT` / `STOP_LOSS_PCT` | 0 (dezactivat — hold până la rezoluție) |
+| Take-profit | `TAKE_PROFIT_PCT` | 0 (dezactivat — câștigătorii se țin până la rezoluție) |
+| Stop-loss | `STOP_LOSS_PCT` | 0.30 (−30% ≈ preț sub ~0.5 de la o intrare tipică → teză invalidată) |
 
 În plus, hardcodate în `main.py`: volum minim $10k, fereastră de probabilitate
 YES (0.65, 0.90), confidence minim 0.70, max 1–2 poziții per eveniment,
@@ -68,12 +69,24 @@ deduplicare pe token și verificare de balanță înainte de fiecare ordin.
   contractului de exchange — cu costul unor re-aprobări periodice (gas).
 - **RPC**: folosește un endpoint autentificat (Alchemy/Infura) în loc de
   `polygon-rpc.com` — un RPC public poate servi date false sau cenzura tranzacții.
-- **`py-clob-client-v2`** este un fork neoficial al clientului Polymarket și
-  primește cheia privată. Verifică proveniența înainte de orice upgrade.
+- **Clientul CLOB** este `py-clob-client` — clientul **oficial** Polymarket
+  (anterior se folosea fork-ul neoficial `py-clob-client-v2`).
 - **Decizia LLM** se bazează pe titluri de piață și știri — conținut extern
   nesigur. Promptul are gardă anti-injection, output-ul e validat strict
   (doar YES/NO, confidence clamped), iar filtrele de risc rulează independent
   de decizia AI.
+
+### Rollback migrare client CLOB
+
+Clientul oficial suportă semnături `0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE`.
+Fostul fork folosea `3` (POLY_1271/EIP-1271), normalizat acum automat la `2`.
+Pentru majoritatea conturilor proxy Polymarket (Gnosis Safe) tipul `2`
+funcționează identic. **La primul deploy după migrare, urmărește logurile**:
+dacă ordinele sunt respinse repetat cu `maker address not allowed` sau erori
+de semnătură, contul tău necesită fluxul EIP-1271, pe care clientul oficial
+nu îl implementează — în acest caz fă rollback la commit-ul dinaintea
+migrării (`git revert`) sau repune `py-clob-client-v2==1.0.1` în
+`requirements.txt` împreună cu vechiul `src/clob_client.py`.
 
 ## Teste
 

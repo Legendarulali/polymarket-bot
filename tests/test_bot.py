@@ -2,7 +2,7 @@
 Unit tests for the Polymarket trading bot.
 
 Covers pure-logic functions and mocked API interactions.
-All external dependencies (py_clob_client_v2, openai, web3, httpx, …) are
+All external dependencies (py_clob_client, openai, web3, httpx, …) are
 mocked in conftest.py so no production environment is required.
 """
 import json
@@ -131,13 +131,14 @@ class TestDynamicSizeCalculation:
 
     def _call(self, price, mock_result=None, **kwargs):
         from src.execution import place_limit_order
-        from py_clob_client_v2 import Side
+        from src.execution import Side
 
         if mock_result is None:
             mock_result = {"orderID": "test-id-123"}
 
         mock_client = MagicMock()
-        mock_client.create_and_post_order.return_value = mock_result
+        mock_client.create_order.return_value = "signed-order"
+        mock_client.post_order.return_value = mock_result
 
         with patch("src.execution.get_clob_client", return_value=mock_client):
             result = place_limit_order(token_id="0xTOKEN", price=price, side=Side.BUY, **kwargs)
@@ -146,7 +147,7 @@ class TestDynamicSizeCalculation:
 
     def _placed_size(self, price):
         _, client = self._call(price)
-        return client.create_and_post_order.call_args.kwargs["order_args"].size
+        return client.create_order.call_args.args[0].size
 
     def test_price_0_50_gives_size_10(self):
         assert self._placed_size(0.50) == pytest.approx(10.0)
@@ -167,14 +168,14 @@ class TestDynamicSizeCalculation:
 
     def test_invalid_price_zero_returns_error(self):
         from src.execution import place_limit_order
-        from py_clob_client_v2 import Side
+        from src.execution import Side
         result = place_limit_order(token_id="0xT", price=0.0, side=Side.BUY)
         assert result["success"] is False
         assert "range" in result["error"]
 
     def test_price_above_0_99_returns_error(self):
         from src.execution import place_limit_order
-        from py_clob_client_v2 import Side
+        from src.execution import Side
         result = place_limit_order(token_id="0xT", price=1.01, side=Side.BUY)
         assert result["success"] is False
 
@@ -185,10 +186,10 @@ class TestDynamicSizeCalculation:
 
     def test_api_exception_returns_failure(self):
         from src.execution import place_limit_order
-        from py_clob_client_v2 import Side
+        from src.execution import Side
 
         mock_client = MagicMock()
-        mock_client.create_and_post_order.side_effect = Exception("500 server error")
+        mock_client.post_order.side_effect = Exception("500 server error")
 
         with patch("src.execution.get_clob_client", return_value=mock_client):
             result = place_limit_order(token_id="0xT", price=0.5, side=Side.BUY)
@@ -209,11 +210,11 @@ class TestDynamicSizeCalculation:
 
     def test_default_tick_rounds_to_2_decimals(self):
         _, client = self._call(0.123)
-        assert client.create_and_post_order.call_args.kwargs["order_args"].price == pytest.approx(0.12)
+        assert client.create_order.call_args.args[0].price == pytest.approx(0.12)
 
     def test_tick_0_001_keeps_3_decimals(self):
         _, client = self._call(0.123, tick_size="0.001")
-        assert client.create_and_post_order.call_args.kwargs["order_args"].price == pytest.approx(0.123)
+        assert client.create_order.call_args.args[0].price == pytest.approx(0.123)
 
     def test_tick_0_001_allows_price_0_995(self):
         result, _ = self._call(0.995, tick_size="0.001")
@@ -226,7 +227,7 @@ class TestDynamicSizeCalculation:
 
     def test_unknown_tick_size_falls_back_to_default(self):
         _, client = self._call(0.123, tick_size="0.5")
-        assert client.create_and_post_order.call_args.kwargs["order_args"].price == pytest.approx(0.12)
+        assert client.create_order.call_args.args[0].price == pytest.approx(0.12)
 
 
 # ---------------------------------------------------------------------------
@@ -236,10 +237,11 @@ class TestDynamicSizeCalculation:
 class TestExplicitOrderSize:
     def _call(self, price, size, side_name="SELL"):
         from src.execution import place_limit_order
-        from py_clob_client_v2 import Side
+        from src.execution import Side
 
         mock_client = MagicMock()
-        mock_client.create_and_post_order.return_value = {"orderID": "x"}
+        mock_client.create_order.return_value = "signed-order"
+        mock_client.post_order.return_value = {"orderID": "x"}
 
         side = Side.SELL if side_name == "SELL" else Side.BUY
         with patch("src.execution.get_clob_client", return_value=mock_client):
@@ -248,11 +250,11 @@ class TestExplicitOrderSize:
 
     def test_explicit_size_used_verbatim(self):
         _, client = self._call(0.5, size=7.5)
-        assert client.create_and_post_order.call_args.kwargs["order_args"].size == pytest.approx(7.5)
+        assert client.create_order.call_args.args[0].size == pytest.approx(7.5)
 
     def test_explicit_size_rounded_to_2dp(self):
         _, client = self._call(0.5, size=7.123)
-        assert client.create_and_post_order.call_args.kwargs["order_args"].size == pytest.approx(7.12)
+        assert client.create_order.call_args.args[0].size == pytest.approx(7.12)
 
     def test_zero_size_rejected(self):
         result, _ = self._call(0.5, size=0.0)
@@ -291,7 +293,7 @@ class TestExitConditions:
             position_manager.check_exit_conditions(state)
         return mock_order
 
-    def test_disabled_by_default_no_orders(self):
+    def test_disabled_when_both_thresholds_zero(self):
         mock_order = self._run(self._state(), bid=0.99, tp=0.0, sl=0.0)
         mock_order.assert_not_called()
 
@@ -531,9 +533,11 @@ class TestBalanceParsing:
 # ---------------------------------------------------------------------------
 
 class TestSettings:
-    def test_signature_type_is_3(self):
+    def test_legacy_signature_type_3_normalized_to_2(self):
+        # conftest sets SIGNATURE_TYPE=3 (the py-clob-client-v2 fork value);
+        # the official client only supports 0/1/2, so settings must map 3 → 2.
         from config.settings import settings
-        assert settings.SIGNATURE_TYPE == 3
+        assert settings.SIGNATURE_TYPE == 2
 
     def test_chain_id_is_polygon(self):
         from config.settings import settings
@@ -558,6 +562,14 @@ class TestSettings:
     def test_max_gas_price_default_is_500_gwei(self):
         from config.settings import settings
         assert settings.MAX_GAS_PRICE_GWEI == pytest.approx(500.0)
+
+    def test_take_profit_disabled_by_default(self):
+        from config.settings import settings
+        assert settings.TAKE_PROFIT_PCT == pytest.approx(0.0)
+
+    def test_stop_loss_default_is_30_pct(self):
+        from config.settings import settings
+        assert settings.STOP_LOSS_PCT == pytest.approx(0.30)
 
     def test_min_balance_constant_in_main(self):
         import main

@@ -1,6 +1,6 @@
 import logging
-from py_clob_client_v2 import ClobClient
-from py_clob_client_v2.clob_types import ApiCreds
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -19,17 +19,17 @@ def get_clob_client() -> ClobClient:
     if _client is not None:
         return _client
 
+    # Tipuri de semnătură py-clob-client oficial: 0=EOA, 1=POLY_PROXY (Magic/
+    # email wallet), 2=POLY_GNOSIS_SAFE (proxy Gnosis Safe creat de Polymarket).
+    # Pentru conturi proxy: maker = FUNDER_ADDRESS, semnat de EOA.
     if _HAS_EXPLICIT_CREDS:
-        # Cont proxy Polymarket (Gnosis Safe / Magic Wallet): fondurile sunt în proxy contract.
-        # signature_type=3 (POLY_1271 / EIP-1271): maker = FUNDER_ADDRESS, semnat de EOA via EIP-1271.
-        # Valoarea 3 este confirmată în py-clob-client-v2 issues #70 și #71.
-        # signature_type=1 era greșit și producea "maker address not allowed".
         logger.info(
-            "Initializing Polymarket CLOB V2 client with explicit API credentials (POLY_1271) | "
-            "host=%s chain_id=%d funder=%s signature_type=3",
+            "Initializing Polymarket CLOB client with explicit API credentials | "
+            "host=%s chain_id=%d funder=%s signature_type=%d",
             settings.CLOB_HOST,
             settings.CHAIN_ID,
             settings.FUNDER_ADDRESS,
+            settings.SIGNATURE_TYPE,
         )
         api_creds = ApiCreds(
             api_key=settings.POLYMARKET_API_KEY,
@@ -42,12 +42,11 @@ def get_clob_client() -> ClobClient:
             key=settings.PRIVATE_KEY,
             creds=api_creds,
             funder=settings.FUNDER_ADDRESS,
-            signature_type=3,  # POLY_1271 / EIP-1271 — for Gnosis Safe proxy wallets
+            signature_type=settings.SIGNATURE_TYPE,
         )
-        logger.info("CLOB client ready (POLY_1271, sig_type=3) | funder=%s", settings.FUNDER_ADDRESS)
     else:
         logger.info(
-            "Initializing Polymarket CLOB V2 client (derive mode) | "
+            "Initializing Polymarket CLOB client (derive mode) | "
             "host=%s chain_id=%d funder=%s signature_type=%d",
             settings.CLOB_HOST,
             settings.CHAIN_ID,
@@ -65,9 +64,9 @@ def get_clob_client() -> ClobClient:
             creds = client.derive_api_key()
             logger.info("API credentials derived locally from private key.")
         except Exception as exc:
-            logger.warning("derive_api_key() failed (%s) — retrying with create_or_derive_api_key().", exc)
-            creds = client.create_or_derive_api_key()
-            logger.info("API credentials obtained via create_or_derive_api_key().")
+            logger.warning("derive_api_key() failed (%s) — retrying with create_or_derive_api_creds().", exc)
+            creds = client.create_or_derive_api_creds()
+            logger.info("API credentials obtained via create_or_derive_api_creds().")
         client.set_api_creds(creds)
 
     _client = client

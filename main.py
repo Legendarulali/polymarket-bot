@@ -6,11 +6,10 @@ import signal
 import logging
 
 import httpx
-from py_clob_client_v2 import Side
 
 from config.settings import settings
 from src.reconciliation import log_reconciliation_report, get_account_state
-from src.execution import place_limit_order, compute_order_size
+from src.execution import Side, place_limit_order, compute_order_size
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market

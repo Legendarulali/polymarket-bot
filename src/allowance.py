@@ -2,7 +2,7 @@ import logging
 from eth_account import Account
 from web3 import Web3
 
-from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 from src.clob_client import get_clob_client
 from config.settings import settings
 

@@ -1,8 +1,9 @@
 """
 Global pytest configuration.
 Sets required env vars and mocks all packages that are not installed locally
-(py_clob_client_v2, openai, web3, tenacity, defusedxml) so unit tests can
-import bot modules without a full production environment.
+(py_clob_client, openai, web3, tenacity, defusedxml, httpx) so unit tests can
+import bot modules without a full production environment. When a package IS
+installed (e.g. py_clob_client in CI with full deps), the real one is used.
 """
 import os
 import sys
@@ -16,52 +17,53 @@ os.environ.setdefault("POLYMARKET_PRIVATE_KEY", "0x" + "a" * 64)
 os.environ.setdefault("FUNDER_ADDRESS", "0x" + "b" * 40)
 os.environ.setdefault("CLOB_HOST", "https://clob.polymarket.com")
 os.environ.setdefault("CHAIN_ID", "137")
+# Valoarea legacy 3 (POLY_1271) — testează normalizarea la 2 din settings.py
 os.environ.setdefault("SIGNATURE_TYPE", "3")
 os.environ.setdefault("POLYGON_RPC_URL", "https://polygon-rpc.com")
 
 # ---------------------------------------------------------------------------
-# Mock py_clob_client_v2 — not installed locally
+# Mock py_clob_client (official client) — only if not installed
 # ---------------------------------------------------------------------------
-@dataclass
-class OrderArgs:
-    token_id: str
-    price: float
-    size: float
-    side: object
+try:
+    import py_clob_client  # noqa: F401
+except ImportError:
+    @dataclass
+    class OrderArgs:
+        token_id: str
+        price: float
+        size: float
+        side: str
+        fee_rate_bps: int = 0
+        nonce: int = 0
+        expiration: int = 0
+        taker: str = "0x0000000000000000000000000000000000000000"
 
-class _SideVal:
-    """Enum-like value with a .name attribute so execution.py can call side.name."""
-    def __init__(self, name: str):
-        self.name = name
-    def __repr__(self):
-        return f"Side.{self.name}"
-    def __eq__(self, other):
-        return isinstance(other, _SideVal) and self.name == other.name
+    class OrderType:
+        GTC = "GTC"
+        FOK = "FOK"
 
-class Side:
-    BUY = _SideVal("BUY")
-    SELL = _SideVal("SELL")
+    class AssetType:
+        COLLATERAL = "COLLATERAL"
+        CONDITIONAL = "CONDITIONAL"
 
-class OrderType:
-    GTC = "GTC"
+    _mock_client_mod = MagicMock()
+    _mock_client_mod.ClobClient = MagicMock()
 
-class AssetType:
-    COLLATERAL = "COLLATERAL"
+    _mock_types_mod = MagicMock()
+    _mock_types_mod.OrderArgs = OrderArgs
+    _mock_types_mod.OrderType = OrderType
+    _mock_types_mod.AssetType = AssetType
+    _mock_types_mod.ApiCreds = MagicMock()
+    _mock_types_mod.BalanceAllowanceParams = MagicMock(return_value=MagicMock())
+    _mock_types_mod.PartialCreateOrderOptions = MagicMock(return_value=MagicMock())
 
-_mock_clob = MagicMock()
-_mock_clob.OrderArgs = OrderArgs
-_mock_clob.Side = Side
-_mock_clob.OrderType = OrderType
-_mock_clob.AssetType = AssetType
-_mock_clob.PartialCreateOrderOptions = MagicMock(return_value=MagicMock())
-_mock_clob.ClobClient = MagicMock()
-_mock_clob.BalanceAllowanceParams = MagicMock(return_value=MagicMock())
+    _mock_pkg = MagicMock()
+    _mock_pkg.client = _mock_client_mod
+    _mock_pkg.clob_types = _mock_types_mod
 
-_mock_clob_types = MagicMock()
-_mock_clob_types.ApiCreds = MagicMock()
-
-sys.modules["py_clob_client_v2"] = _mock_clob
-sys.modules["py_clob_client_v2.clob_types"] = _mock_clob_types
+    sys.modules["py_clob_client"] = _mock_pkg
+    sys.modules["py_clob_client.client"] = _mock_client_mod
+    sys.modules["py_clob_client.clob_types"] = _mock_types_mod
 
 # ---------------------------------------------------------------------------
 # Mock openai (used by ai_analyser.py)

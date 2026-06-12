@@ -1,11 +1,9 @@
 import logging
 import time
 
-from py_clob_client_v2 import Side
-
 from config.settings import settings
 from src.clob_client import get_clob_client
-from src.execution import place_limit_order
+from src.execution import Side, place_limit_order
 
 logger = logging.getLogger(__name__)
 
