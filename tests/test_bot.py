@@ -2,49 +2,16 @@
 Unit tests for the Polymarket trading bot.
 
 Covers pure-logic functions and mocked API interactions.
-All external dependencies (py_clob_client_v2, openai, web3, …) are
+All external dependencies (py_clob_client_v2, openai, web3, httpx, …) are
 mocked in conftest.py so no production environment is required.
 """
 import json
 import pytest
 from unittest.mock import MagicMock, patch
 
-
-# ---------------------------------------------------------------------------
-# Pure helper functions copied from main.py (no external deps needed)
-# These are tested in isolation to guarantee their logic is correct.
-# ---------------------------------------------------------------------------
-
-def _token_for_outcome(market: dict, outcome: str):
-    raw = market.get("clobTokenIds")
-    if raw:
-        try:
-            ids = json.loads(raw) if isinstance(raw, str) else raw
-            if outcome.upper() == "YES" and len(ids) > 0:
-                return ids[0]
-            if outcome.upper() == "NO" and len(ids) > 1:
-                return ids[1]
-        except (json.JSONDecodeError, TypeError):
-            pass
-    for token in market.get("tokens", []):
-        if token.get("outcome", "").upper() == outcome.upper():
-            return token.get("token_id")
-    return None
-
-
-def _current_price(market: dict, outcome: str) -> float:
-    try:
-        prices = market.get("outcomePrices", [])
-        if outcome.upper() == "YES" and prices:
-            return float(prices[0])
-        if outcome.upper() == "NO" and len(prices) > 1:
-            return float(prices[1])
-        ask = market.get("bestAsk")
-        if ask is not None:
-            return float(ask)
-    except (ValueError, TypeError):
-        pass
-    return 0.5
+# Helpers are imported from main so tests exercise the real production code
+# (conftest.py mocks all heavy dependencies before this import).
+from main import _token_for_outcome, _current_price, _extract_event_id
 
 
 # ---------------------------------------------------------------------------
@@ -97,11 +64,24 @@ class TestTokenForOutcome:
 # ---------------------------------------------------------------------------
 
 class TestCurrentPrice:
-    def test_yes_from_outcome_prices(self):
+    def test_yes_from_outcome_prices_list(self):
         assert _current_price({"outcomePrices": ["0.72", "0.28"]}, "YES") == pytest.approx(0.72)
 
-    def test_no_from_outcome_prices(self):
+    def test_no_from_outcome_prices_list(self):
         assert _current_price({"outcomePrices": ["0.72", "0.28"]}, "NO") == pytest.approx(0.28)
+
+    def test_yes_from_json_string(self):
+        # Gamma API returns outcomePrices as a JSON-encoded string
+        assert _current_price({"outcomePrices": '["0.72", "0.28"]'}, "YES") == pytest.approx(0.72)
+
+    def test_no_from_json_string(self):
+        assert _current_price({"outcomePrices": '["0.72", "0.28"]'}, "NO") == pytest.approx(0.28)
+
+    def test_malformed_json_string_falls_back_to_best_ask(self):
+        assert _current_price({"outcomePrices": "not-json", "bestAsk": "0.61"}, "YES") == pytest.approx(0.61)
+
+    def test_malformed_json_string_falls_back_to_0_5(self):
+        assert _current_price({"outcomePrices": "not-json"}, "YES") == pytest.approx(0.5)
 
     def test_fallback_to_best_ask(self):
         assert _current_price({"bestAsk": "0.55"}, "YES") == pytest.approx(0.55)
@@ -115,18 +95,41 @@ class TestCurrentPrice:
     def test_invalid_price_string_falls_back(self):
         assert _current_price({"outcomePrices": ["invalid"]}, "YES") == pytest.approx(0.5)
 
+    def test_invalid_price_string_falls_back_to_best_ask(self):
+        assert _current_price({"outcomePrices": ["invalid"], "bestAsk": "0.4"}, "YES") == pytest.approx(0.4)
+
     def test_no_outcome_prices_only_one_element_falls_back(self):
         assert _current_price({"outcomePrices": ["0.6"]}, "NO") == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------
-# Tests: dynamic size calculation in execution.py
+# Tests: _extract_event_id
+# ---------------------------------------------------------------------------
+
+class TestExtractEventId:
+    def test_prefers_events_slug(self):
+        market = {"events": [{"slug": "world-cup-2026", "id": "123"}], "conditionId": "0xC"}
+        assert _extract_event_id(market) == "world-cup-2026"
+
+    def test_falls_back_to_events_id(self):
+        market = {"events": [{"id": "123"}], "conditionId": "0xC"}
+        assert _extract_event_id(market) == "123"
+
+    def test_falls_back_to_condition_id(self):
+        assert _extract_event_id({"conditionId": "0xC"}) == "0xC"
+
+    def test_empty_when_nothing_available(self):
+        assert _extract_event_id({}) == ""
+
+
+# ---------------------------------------------------------------------------
+# Tests: dynamic size calculation and tick size in execution.py
 # ---------------------------------------------------------------------------
 
 class TestDynamicSizeCalculation:
     """place_limit_order computes size = max($5/price, 2.0) rounded to 2dp."""
 
-    def _call(self, price, mock_result=None):
+    def _call(self, price, mock_result=None, **kwargs):
         from src.execution import place_limit_order
         from py_clob_client_v2 import Side
 
@@ -137,7 +140,7 @@ class TestDynamicSizeCalculation:
         mock_client.create_and_post_order.return_value = mock_result
 
         with patch("src.execution.get_clob_client", return_value=mock_client):
-            result = place_limit_order(token_id="0xTOKEN", price=price, side=Side.BUY)
+            result = place_limit_order(token_id="0xTOKEN", price=price, side=Side.BUY, **kwargs)
 
         return result, mock_client
 
@@ -159,9 +162,6 @@ class TestDynamicSizeCalculation:
         assert self._placed_size(0.99) >= 2.0
 
     def test_floor_of_2_when_formula_lower(self):
-        # If price were somehow very high (hypothetical), floor kicks in.
-        # price=0.99: 5/0.99≈5.05 > 2.0, so floor not active here.
-        # We test floor with price close to 1 and confirm size >= 2.0
         size = self._placed_size(0.98)
         assert size >= 2.0
 
@@ -199,6 +199,117 @@ class TestDynamicSizeCalculation:
     def test_size_is_rounded_to_2_decimal_places(self):
         size = self._placed_size(0.33)  # 5/0.33 = 15.1515...
         assert size == round(size, 2)
+
+    def test_compute_order_size_matches_placed_size(self):
+        from src.execution import compute_order_size
+        assert compute_order_size(0.50) == pytest.approx(10.0)
+        assert compute_order_size(0.25) == pytest.approx(20.0)
+
+    # --- Tick size handling ---
+
+    def test_default_tick_rounds_to_2_decimals(self):
+        _, client = self._call(0.123)
+        assert client.create_and_post_order.call_args.kwargs["order_args"].price == pytest.approx(0.12)
+
+    def test_tick_0_001_keeps_3_decimals(self):
+        _, client = self._call(0.123, tick_size="0.001")
+        assert client.create_and_post_order.call_args.kwargs["order_args"].price == pytest.approx(0.123)
+
+    def test_tick_0_001_allows_price_0_995(self):
+        result, _ = self._call(0.995, tick_size="0.001")
+        assert result["success"] is True
+
+    def test_default_tick_rejects_price_0_995(self):
+        # round(0.995, 2) → 0.99 (valid); but 0.999 rounds to 1.0 → rejected
+        result, _ = self._call(0.999)
+        assert result["success"] is False
+
+    def test_unknown_tick_size_falls_back_to_default(self):
+        _, client = self._call(0.123, tick_size="0.5")
+        assert client.create_and_post_order.call_args.kwargs["order_args"].price == pytest.approx(0.12)
+
+
+# ---------------------------------------------------------------------------
+# Tests: process_market state updates (balance decrement, dedup, clustering)
+# ---------------------------------------------------------------------------
+
+class TestProcessMarketStateTracking:
+    def _market(self, market_id="m1", token_ids=("0xYES", "0xNO"), event_slug="ev-1"):
+        return {
+            "id": market_id,
+            "question": "Will team X win the final?",
+            "volume": "50000",
+            "outcomePrices": json.dumps(["0.70", "0.30"]),
+            "clobTokenIds": json.dumps(list(token_ids)),
+            "events": [{"slug": event_slug}],
+        }
+
+    def _run(self, market, account_state, decision=None, order_result=None):
+        import main
+        main._analysis_cache.clear()
+        decision = decision or {"trade": True, "outcome": "YES", "confidence": 0.9, "reason": "test"}
+        order_result = order_result or {"success": True, "order_id": "oid-1"}
+
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main.analyse_market", return_value=decision), \
+             patch("main.place_limit_order", return_value=order_result) as mock_order:
+            main.process_market(market, account_state)
+        return mock_order
+
+    def test_successful_order_decrements_balance(self):
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        self._run(self._market(), state)
+        # size = 5/0.7 ≈ 7.14, total ≈ 5.0
+        assert state["pusd_balance"] < 20.0
+
+    def test_successful_order_appends_position(self):
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        self._run(self._market(), state)
+        assert len(state["active_positions"]) == 1
+        assert state["active_positions"][0]["token_id"] == "0xYES"
+        assert state["active_positions"][0]["event_id"] == "ev-1"
+
+    def test_failed_order_does_not_change_state(self):
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        self._run(self._market(), state, order_result={"success": False, "error": "rejected"})
+        assert state["pusd_balance"] == pytest.approx(20.0)
+        assert state["active_positions"] == []
+
+    def test_duplicate_token_skipped(self):
+        state = {
+            "pusd_balance": 20.0,
+            "active_positions": [{"token_id": "0xYES", "event_id": "other"}],
+        }
+        mock_order = self._run(self._market(), state)
+        mock_order.assert_not_called()
+
+    def test_max_active_positions_blocks_new_orders(self):
+        from config.settings import settings
+        positions = [{"token_id": f"0x{i}", "event_id": ""} for i in range(settings.MAX_ACTIVE_POSITIONS)]
+        state = {"pusd_balance": 20.0, "active_positions": positions}
+        mock_order = self._run(self._market(), state)
+        mock_order.assert_not_called()
+
+    def test_low_volume_market_skipped(self):
+        market = self._market()
+        market["volume"] = "500"
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        mock_order = self._run(market, state)
+        mock_order.assert_not_called()
+
+    def test_probability_window_enforced_with_json_string_prices(self):
+        # YES=0.95 is outside the (0.65, 0.90) window — and must be read
+        # correctly from the JSON string, not silently default to 0.5.
+        market = self._market()
+        market["outcomePrices"] = json.dumps(["0.95", "0.05"])
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        mock_order = self._run(market, state)
+        mock_order.assert_not_called()
+
+    def test_insufficient_balance_blocks_order(self):
+        state = {"pusd_balance": 0.5, "active_positions": []}
+        mock_order = self._run(self._market(), state)
+        mock_order.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +361,18 @@ class TestBalanceParsing:
         assert state["active_positions"][0]["size"] == pytest.approx(3.5)
         assert state["active_positions"][0]["token_id"] == "0xTOK"
 
+    def test_position_includes_event_id_from_event_slug(self):
+        positions = [{"asset": "0xTOK", "size": "1.0", "side": "BUY",
+                      "avgPrice": "0.6", "eventSlug": "world-cup-2026"}]
+        state = self._get_state({"balance": 0, "allowance": 0}, positions=positions)
+        assert state["active_positions"][0]["event_id"] == "world-cup-2026"
+
+    def test_position_event_id_falls_back_to_condition_id(self):
+        positions = [{"asset": "0xTOK", "size": "1.0", "side": "BUY",
+                      "avgPrice": "0.6", "conditionId": "0xCOND"}]
+        state = self._get_state({"balance": 0, "allowance": 0}, positions=positions)
+        assert state["active_positions"][0]["event_id"] == "0xCOND"
+
     def test_zero_size_position_excluded(self):
         positions = [{"asset": "0xTOK", "size": "0", "side": "BUY", "avgPrice": "0.6"}]
         state = self._get_state({"balance": 0, "allowance": 0}, positions=positions)
@@ -289,16 +412,18 @@ class TestSettings:
         from config.settings import settings
         assert settings.MAX_ACTIVE_POSITIONS == 5
 
+    def test_usdc_approval_defaults_to_unlimited(self):
+        from config.settings import settings
+        assert settings.USDC_APPROVAL_USD == pytest.approx(0.0)
+
+    def test_max_gas_price_default_is_500_gwei(self):
+        from config.settings import settings
+        assert settings.MAX_GAS_PRICE_GWEI == pytest.approx(500.0)
+
     def test_min_balance_constant_in_main(self):
-        import importlib, sys
-        if "main" not in sys.modules:
-            importlib.import_module("main")
         import main
         assert main._MIN_BALANCE_PUSD == pytest.approx(1.0)
 
     def test_min_confidence_constant_in_main(self):
-        import importlib, sys
-        if "main" not in sys.modules:
-            importlib.import_module("main")
         import main
         assert main._MIN_CONFIDENCE == pytest.approx(0.70)

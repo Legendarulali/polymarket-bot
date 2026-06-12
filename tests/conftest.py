@@ -99,6 +99,14 @@ except ImportError:
     sys.modules["eth_account"] = MagicMock()
 
 # ---------------------------------------------------------------------------
+# Mock httpx (used by main.py)
+# ---------------------------------------------------------------------------
+try:
+    import httpx  # noqa: F401
+except ImportError:
+    sys.modules["httpx"] = MagicMock()
+
+# ---------------------------------------------------------------------------
 # Mock defusedxml (used by news_monitor.py)
 # ---------------------------------------------------------------------------
 try:
