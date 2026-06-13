@@ -576,3 +576,154 @@ class TestSettings:
     def test_min_confidence_constant_in_main(self):
         import main
         assert main._MIN_CONFIDENCE == pytest.approx(0.70)
+
+    def test_discord_webhook_defaults_empty(self):
+        from config.settings import settings
+        assert settings.DISCORD_WEBHOOK_URL == ""
+
+    def test_pnl_report_interval_default_is_1h(self):
+        from config.settings import settings
+        assert settings.PNL_REPORT_INTERVAL_HOURS == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Tests: position P/L enrichment from the Data API
+# ---------------------------------------------------------------------------
+
+class TestPositionPnLParsing:
+    def _get_state(self, positions):
+        from src.reconciliation import get_account_state
+
+        mock_client = MagicMock()
+        mock_client.get_balance_allowance.return_value = {"balance": 0, "allowance": 0}
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = positions
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("src.reconciliation.get_clob_client", return_value=mock_client), \
+             patch("src.reconciliation.requests.get", return_value=mock_resp):
+            return get_account_state()
+
+    def test_pnl_fields_from_data_api(self):
+        positions = [{
+            "asset": "0xTOK", "size": "10", "side": "BUY", "avgPrice": "0.50",
+            "curPrice": "0.65", "currentValue": "6.5", "initialValue": "5.0",
+            "cashPnl": "1.5", "percentPnl": "30", "realizedPnl": "0",
+        }]
+        pos = self._get_state(positions)["active_positions"][0]
+        assert pos["cur_price"] == pytest.approx(0.65)
+        assert pos["current_value"] == pytest.approx(6.5)
+        assert pos["cash_pnl"] == pytest.approx(1.5)
+        assert pos["percent_pnl"] == pytest.approx(30.0)
+
+    def test_pnl_falls_back_to_local_computation(self):
+        # No P/L fields from API → compute from price × size
+        positions = [{"asset": "0xTOK", "size": "10", "side": "BUY",
+                      "avgPrice": "0.50", "curPrice": "0.60"}]
+        pos = self._get_state(positions)["active_positions"][0]
+        assert pos["current_value"] == pytest.approx(6.0)   # 0.60 * 10
+        assert pos["initial_value"] == pytest.approx(5.0)   # 0.50 * 10
+        assert pos["cash_pnl"] == pytest.approx(1.0)        # 6.0 - 5.0
+
+    def test_cash_pnl_zero_is_respected_not_recomputed(self):
+        # cashPnl explicitly 0 must NOT trigger the fallback (falsy-zero bug guard)
+        positions = [{"asset": "0xTOK", "size": "10", "side": "BUY",
+                      "avgPrice": "0.50", "currentValue": "9.0", "cashPnl": "0"}]
+        pos = self._get_state(positions)["active_positions"][0]
+        assert pos["cash_pnl"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Tests: portfolio summary aggregation
+# ---------------------------------------------------------------------------
+
+class TestPortfolioSummary:
+    def test_aggregates_cash_and_positions(self):
+        from src.reconciliation import compute_portfolio_summary
+        state = {
+            "pusd_balance": 3.0,
+            "active_positions": [
+                {"current_value": 6.5, "initial_value": 5.0, "cash_pnl": 1.5},
+                {"current_value": 2.0, "initial_value": 3.0, "cash_pnl": -1.0},
+            ],
+        }
+        s = compute_portfolio_summary(state)
+        assert s["cash"] == pytest.approx(3.0)
+        assert s["positions_value"] == pytest.approx(8.5)
+        assert s["total_value"] == pytest.approx(11.5)
+        assert s["unrealized_pnl"] == pytest.approx(0.5)
+        assert s["cost_basis"] == pytest.approx(8.0)
+        assert s["n_positions"] == 2
+
+    def test_empty_portfolio(self):
+        from src.reconciliation import compute_portfolio_summary
+        s = compute_portfolio_summary({"pusd_balance": 5.0, "active_positions": []})
+        assert s["total_value"] == pytest.approx(5.0)
+        assert s["unrealized_pnl"] == pytest.approx(0.0)
+        assert s["n_positions"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: Discord notifications
+# ---------------------------------------------------------------------------
+
+class TestNotifications:
+    def _patch(self, webhook="https://discord.test/webhook"):
+        from config.settings import settings
+        return patch.object(settings, "DISCORD_WEBHOOK_URL", webhook)
+
+    def test_no_webhook_is_noop(self):
+        from src import notifications
+        with self._patch(webhook=""), \
+             patch("src.notifications.requests.post") as mock_post:
+            notifications.notify_trade("BUY", "Market", 0.8, 6.0, 5.0)
+            notifications.notify_portfolio({"total_value": 10.0})
+        mock_post.assert_not_called()
+
+    def test_buy_notification_payload(self):
+        from src import notifications
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_trade(
+                "BUY", "Will X win?", 0.81, 6.17, 5.0,
+                confidence=0.85, reason="strong news",
+            )
+        mock_post.assert_called_once()
+        embed = mock_post.call_args.kwargs["json"]["embeds"][0]
+        assert "BUY" in embed["title"]
+        assert embed["color"] == 0x2ECC71  # green
+        names = [f["name"] for f in embed["fields"]]
+        assert "Preț" in names and "Total" in names and "Confidence" in names
+
+    def test_sell_notification_is_red(self):
+        from src import notifications
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_trade("SELL", "Market", 0.4, 10.0, 4.0, reason="stop-loss (-30%)")
+        embed = mock_post.call_args.kwargs["json"]["embeds"][0]
+        assert "SELL" in embed["title"]
+        assert embed["color"] == 0xE74C3C  # red
+
+    def test_portfolio_notification_includes_deltas(self):
+        from src import notifications
+        summary = {
+            "total_value": 12.0, "cash": 2.0, "positions_value": 10.0,
+            "unrealized_pnl": 1.0, "cost_basis": 9.0, "n_positions": 2,
+            "positions": [{"asset_name": "Market A", "current_value": 6.0, "cash_pnl": 1.5}],
+        }
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_portfolio(summary, prev_total=11.0, session_start_total=10.0)
+        embed = mock_post.call_args.kwargs["json"]["embeds"][0]
+        names = [f["name"] for f in embed["fields"]]
+        assert "Δ ultima oră" in names
+        assert "Δ de la pornire" in names
+        assert "Top poziții" in names
+
+    def test_network_error_is_swallowed(self):
+        from src import notifications
+        with self._patch(), \
+             patch("src.notifications.requests.post", side_effect=Exception("boom")):
+            # Must not raise — trading should never break on a Discord failure
+            notifications.notify_trade("BUY", "Market", 0.8, 6.0, 5.0)

@@ -8,13 +8,14 @@ import logging
 import httpx
 
 from config.settings import settings
-from src.reconciliation import log_reconciliation_report, get_account_state
+from src.reconciliation import log_reconciliation_report, get_account_state, compute_portfolio_summary
 from src.execution import Side, place_limit_order, compute_order_size
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market
 from src.allowance import ensure_collateral_approved
 from src.position_manager import check_exit_conditions
+from src.notifications import notify_trade, notify_portfolio
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,11 @@ _MAX_OUTRIGHT_PER_EVENT = 1      # Max poziții pe piețe de tip "outright winne
 
 # Cache în memorie: {market_id: (timestamp_float, decision_dict)}
 _analysis_cache: dict[str, tuple[float, dict]] = {}
+
+# Stare raport orar P/L pe Discord (ts=0 → primul raport e trimis imediat la pornire)
+_last_pnl_report_ts: float = 0.0
+_last_report_value: float | None = None
+_session_start_value: float | None = None
 
 _MATCH_KEYWORDS = (" vs ", " vs. ")
 _OUTRIGHT_PHRASES = (
@@ -196,6 +202,36 @@ def _extract_event_id(market: dict) -> str:
         or market.get("conditionId")
         or ""
     )
+
+
+def _maybe_send_pnl_report(account_state: dict) -> None:
+    """Trimite raportul de portofoliu pe Discord la fiecare PNL_REPORT_INTERVAL_HOURS."""
+    global _last_pnl_report_ts, _last_report_value, _session_start_value
+
+    interval_h = settings.PNL_REPORT_INTERVAL_HOURS
+    if interval_h <= 0 or not settings.DISCORD_WEBHOOK_URL:
+        return
+    now = time.time()
+    if now - _last_pnl_report_ts < interval_h * 3600:
+        return
+
+    summary = compute_portfolio_summary(account_state)
+    if _session_start_value is None:
+        _session_start_value = summary["total_value"]
+
+    logger.info(
+        "[P/L] Raport portofoliu: total=$%.2f | cash=$%.2f | poziții=$%.2f | "
+        "P/L nerealizat=$%.2f | %d poziții",
+        summary["total_value"], summary["cash"], summary["positions_value"],
+        summary["unrealized_pnl"], summary["n_positions"],
+    )
+    notify_portfolio(
+        summary,
+        prev_total=_last_report_value,
+        session_start_total=_session_start_value,
+    )
+    _last_report_value = summary["total_value"]
+    _last_pnl_report_ts = now
 
 
 def process_market(market: dict, account_state: dict) -> None:
@@ -386,13 +422,26 @@ def process_market(market: dict, account_state: dict) -> None:
         # poziția nouă (dedup și event clustering ar fi ocolite).
         account_state["pusd_balance"] = round(pusd_balance - order_total, 6)
         active_positions.append({
-            "asset_name": title,
-            "token_id":   token_id,
-            "side":       "BUY",
-            "size":       estimated_size,
-            "avg_price":  price,
-            "event_id":   event_id,
+            "asset_name":    title,
+            "token_id":      token_id,
+            "side":          "BUY",
+            "size":          estimated_size,
+            "avg_price":     price,
+            "current_value": order_total,
+            "initial_value": order_total,
+            "cash_pnl":      0.0,
+            "event_id":      event_id,
         })
+        notify_trade(
+            "BUY",
+            title,
+            price=price,
+            size=estimated_size,
+            total=order_total,
+            confidence=decision.get("confidence"),
+            reason=decision.get("reason"),
+            order_id=result.get("order_id"),
+        )
     else:
         logger.error("[Agent] Ordin respins de CLOB: %s", result.get("error"))
 
@@ -447,6 +496,14 @@ def main() -> None:
                 )
                 pusd_balance = settings.OVERRIDE_BALANCE
                 account_state = {**account_state, "pusd_balance": pusd_balance}
+
+            # Raport orar P/L pe Discord. Rulează înaintea verificării de balanță
+            # ca să continue și când fondurile sunt insuficiente (bucla doarme
+            # 15 min în acel caz, dar raportul tot iese la timp).
+            try:
+                _maybe_send_pnl_report(account_state)
+            except Exception as exc:
+                logger.error("[Agent] Raport P/L eșuat: %s", exc, exc_info=True)
 
             # Verifică TP/SL pe pozițiile deschise (opt-in via TAKE_PROFIT_PCT /
             # STOP_LOSS_PCT). Rulează înainte de verificarea de balanță: vânzarea

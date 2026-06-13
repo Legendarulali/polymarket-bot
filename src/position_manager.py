@@ -4,6 +4,7 @@ import time
 from config.settings import settings
 from src.clob_client import get_clob_client
 from src.execution import Side, place_limit_order
+from src.notifications import notify_trade
 
 logger = logging.getLogger(__name__)
 
@@ -91,5 +92,14 @@ def check_exit_conditions(account_state: dict) -> None:
 
         if result.get("success"):
             logger.info("[Exit] Ordin SELL plasat | order_id=%s", result.get("order_id"))
+            notify_trade(
+                "SELL",
+                str(pos.get("asset_name", "")) or token_id,
+                price=bid,
+                size=size,
+                total=bid * size,
+                reason=reason,
+                order_id=result.get("order_id"),
+            )
         else:
             logger.error("[Exit] Ordin SELL respins: %s", result.get("error"))

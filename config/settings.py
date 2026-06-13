@@ -51,6 +51,10 @@ class Settings:
     # Toleranță față de best ask live la BUY: dacă ask-ul real depășește prețul
     # Gamma cu mai mult de această fracție, ordinul e blocat (0 = dezactivat).
     SLIPPAGE_TOLERANCE: float = float(os.getenv("SLIPPAGE_TOLERANCE", "0.05"))
+    # Discord webhook pentru notificări buy/sell și raport orar P/L (gol = dezactivat).
+    DISCORD_WEBHOOK_URL: str = os.getenv("DISCORD_WEBHOOK_URL", "")
+    # Interval raport portofoliu pe Discord, în ore (0 = dezactivat raportul orar).
+    PNL_REPORT_INTERVAL_HOURS: float = float(os.getenv("PNL_REPORT_INTERVAL_HOURS", "1"))
 
 settings = Settings()
 

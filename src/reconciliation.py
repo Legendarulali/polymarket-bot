@@ -11,6 +11,18 @@ _MICRO_PUSD = 1e6
 _ALLOWANCE_WARN_THRESHOLD = 100.0
 
 
+def _f(pos: dict, *keys: str, default: float = 0.0) -> float:
+    """Primul câmp prezent (non-None) dintre `keys`, convertit la float."""
+    for key in keys:
+        val = pos.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                continue
+    return default
+
+
 def get_account_state() -> dict:
     client = get_clob_client()
 
@@ -46,16 +58,33 @@ def get_account_state() -> dict:
 
         for pos in positions_raw:
             if float(pos.get("size", 0)) > 0:
+                size = float(pos["size"])
+                avg_price = _f(pos, "avgPrice", "avg_price")
+                cur_price = _f(pos, "curPrice", "cur_price")
+                # Data API returnează deja P/L calculat (exact ca în portofoliul
+                # Polymarket); fallback la calcul local din preț × size dacă lipsesc.
+                current_value = _f(pos, "currentValue", "current_value",
+                                   default=(cur_price * size if cur_price else avg_price * size))
+                initial_value = _f(pos, "initialValue", "initial_value",
+                                   default=avg_price * size)
+                cash_pnl = _f(pos, "cashPnl", "cash_pnl",
+                              default=current_value - initial_value)
                 active_positions.append({
-                    "asset_name": pos.get("title") or pos.get("asset_name", ""),
-                    "token_id":   pos.get("asset") or pos.get("token_id", ""),
-                    "side":       pos.get("side", ""),
-                    "size":       float(pos["size"]),
-                    "avg_price":  float(pos.get("avgPrice") or pos.get("avg_price", 0)),
+                    "asset_name":    pos.get("title") or pos.get("asset_name", ""),
+                    "token_id":      pos.get("asset") or pos.get("token_id", ""),
+                    "side":          pos.get("side", ""),
+                    "size":          size,
+                    "avg_price":     avg_price,
+                    "cur_price":     cur_price,
+                    "current_value": current_value,
+                    "initial_value": initial_value,
+                    "cash_pnl":      cash_pnl,
+                    "percent_pnl":   _f(pos, "percentPnl", "percent_pnl"),
+                    "realized_pnl":  _f(pos, "realizedPnl", "realized_pnl"),
                     # eventSlug corespunde slug-ului din `events` la piețele Gamma;
                     # fără acest câmp, filtrul de event clustering din main nu are
                     # cu ce să compare și nu limitează nimic.
-                    "event_id":   pos.get("eventSlug") or pos.get("eventId") or pos.get("conditionId") or "",
+                    "event_id":      pos.get("eventSlug") or pos.get("eventId") or pos.get("conditionId") or "",
                 })
     except requests.RequestException as exc:
         logger.warning("Could not fetch positions from Data API: %s", exc)
@@ -64,6 +93,28 @@ def get_account_state() -> dict:
         "pusd_balance":     pusd_balance,
         "allowance":        allowance,
         "active_positions": active_positions,
+    }
+
+
+def compute_portfolio_summary(state: dict) -> dict:
+    """
+    Agregă starea contului într-un sumar de portofoliu (ca graficul P/L din
+    Polymarket): valoare totală = cash + valoarea curentă a pozițiilor, plus
+    P/L nerealizat (suma cashPnl pe pozițiile deschise).
+    """
+    cash = float(state.get("pusd_balance", 0.0))
+    positions = state.get("active_positions", [])
+    positions_value = sum(p.get("current_value", 0.0) for p in positions)
+    unrealized_pnl = sum(p.get("cash_pnl", 0.0) for p in positions)
+    cost_basis = sum(p.get("initial_value", 0.0) for p in positions)
+    return {
+        "cash":            cash,
+        "positions_value": positions_value,
+        "total_value":     cash + positions_value,
+        "unrealized_pnl":  unrealized_pnl,
+        "cost_basis":      cost_basis,
+        "n_positions":     len(positions),
+        "positions":       positions,
     }
 
 

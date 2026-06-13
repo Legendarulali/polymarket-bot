@@ -22,10 +22,11 @@ main.py                  bucla principală: fetch piețe → filtre → AI → o
     ├── clob_client.py        client Polymarket CLOB (EOA sau proxy Gnosis Safe)
     ├── execution.py          plasare/anulare ordine limită (tick size, sizing)
     ├── position_manager.py   exit pe take-profit / stop-loss (opt-in)
-    ├── reconciliation.py     balanță + poziții deschise (Data API)
+    ├── reconciliation.py     balanță + poziții + P/L (Data API), sumar portofoliu
     ├── allowance.py          aprobări on-chain USDC/CTF (direct sau via Safe)
     ├── ai_analyser.py        decizie de trading via Groq LLM
-    └── news_monitor.py       agregare știri (RSS / NewsAPI / X)
+    ├── news_monitor.py       agregare știri (RSS / NewsAPI / X)
+    └── notifications.py      alerte Discord (buy/sell) + raport orar P/L
 ```
 
 ## Setup
@@ -59,6 +60,25 @@ nu este inclus niciodată în imagine (vezi `.dockerignore`).
 În plus, hardcodate în `main.py`: volum minim $10k, fereastră de probabilitate
 YES (0.65, 0.90), confidence minim 0.70, max 1–2 poziții per eveniment,
 deduplicare pe token și verificare de balanță înainte de fiecare ordin.
+
+## Notificări Discord
+
+Botul poate trimite pe un canal de Discord, prin webhook:
+
+- **Alertă la fiecare BUY / SELL** — piață, preț, size, total, confidence (la BUY)
+  sau motivul exit-ului (take-profit / stop-loss, la SELL).
+- **Raport periodic de portofoliu** (implicit la fiecare oră, ca graficul P/L din
+  portofoliul Polymarket): valoare totală (cash + poziții), P/L nerealizat,
+  variația față de ora trecută și față de pornirea botului, plus top poziții.
+
+| Setare | Variabilă | Default |
+|---|---|---|
+| Webhook Discord | `DISCORD_WEBHOOK_URL` | gol (notificări dezactivate) |
+| Interval raport P/L (ore) | `PNL_REPORT_INTERVAL_HOURS` | 1 |
+
+Webhook-ul se creează din Discord: **Server Settings → Integrations → Webhooks →
+New Webhook → Copy Webhook URL**. Notificările sunt complet opționale și izolate:
+orice eroare de rețea către Discord e prinsă și logată, fără a afecta trading-ul.
 
 ## Note de securitate
 
