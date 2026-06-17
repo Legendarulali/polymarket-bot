@@ -158,8 +158,7 @@ def notify_positions(positions: list) -> None:
 
     Fiecare linie: titlu | outcome | sumă investită | P/L curent. Listă goală →
     „Nicio poziție deschisă". Plafonat la _DESC_LIMIT caractere (truncat cu „…și încă N").
-    Notă: `outcome` apare doar dacă e prezent în dict-ul poziției (Data API nu îl
-    expune prin reconciliation.py); altfel se afișează „—".
+    `outcome` vine din reconciliation (câmpul Data API); „—" e doar fallback dacă lipsește.
     """
     if not _enabled():
         return

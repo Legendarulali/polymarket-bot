@@ -72,6 +72,9 @@ def get_account_state() -> dict:
                 active_positions.append({
                     "asset_name":    pos.get("title") or pos.get("asset_name", ""),
                     "token_id":      pos.get("asset") or pos.get("token_id", ""),
+                    # Outcome-ul (YES/NO sau numele opțiunii) din Data API, propagat
+                    # până în notify_positions pentru raportarea inventarului.
+                    "outcome":       pos.get("outcome") or pos.get("outcome_name") or "",
                     "side":          pos.get("side", ""),
                     "size":          size,
                     "avg_price":     avg_price,

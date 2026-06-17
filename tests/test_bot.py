@@ -635,6 +635,27 @@ class TestPositionPnLParsing:
         pos = self._get_state(positions)["active_positions"][0]
         assert pos["cash_pnl"] == pytest.approx(0.0)
 
+    def test_outcome_extracted_from_data_api(self):
+        positions = [{"asset": "0xTOK", "size": "10", "side": "BUY",
+                      "avgPrice": "0.50", "outcome": "YES"}]
+        pos = self._get_state(positions)["active_positions"][0]
+        assert pos["outcome"] == "YES"
+
+    def test_outcome_propagates_to_positions_notification(self):
+        # End-to-end: Data API outcome="YES" → reconciliation → notify_positions embed.
+        from src import notifications
+        from config.settings import settings
+        positions = [{"asset": "0xTOK", "size": "10", "side": "BUY",
+                      "avgPrice": "0.50", "outcome": "YES", "title": "USA vs Iran"}]
+        state = self._get_state(positions)
+        assert state["active_positions"][0]["outcome"] == "YES"
+        with patch.object(settings, "DISCORD_WEBHOOK_URL", "https://discord.test/hook"), \
+             patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_positions(state["active_positions"])
+        desc = mock_post.call_args.kwargs["json"]["embeds"][0]["description"]
+        assert "YES" in desc
+
 
 # ---------------------------------------------------------------------------
 # Tests: portfolio summary aggregation
