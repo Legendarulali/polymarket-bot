@@ -16,7 +16,7 @@ from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market
 from src.allowance import ensure_collateral_approved
 from src.position_manager import check_exit_conditions
-from src.notifications import notify_trade, notify_portfolio
+from src.notifications import notify_trade, notify_portfolio, notify_markets
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +25,32 @@ _LOOP_INTERVAL = 60          # secunde între iterații normale
 _LOW_BALANCE_SLEEP = 15 * 60  # 15 minute sleep când balanța e insuficientă
 _CACHE_TTL_SECONDS = 4 * 3600 # cooldown: re-analizează o piață cel mult o dată la 4h (persistat în history.json)
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+_GAMMA_PAGE_SIZE = 100                                           # piețe per pagină la paginare Gamma
+_MARKET_SCAN_LIMIT = int(os.getenv("MARKET_SCAN_LIMIT", "200"))  # plafon piețe scanate per buclă
+# Deep-scan opțional pe tag-uri Gamma specifice (ex: fotbal / FIFA World Cup).
+# Gol = dezactivat. Necesită tag_id-urile NUMERICE reale (vezi .env.example).
+_GAMMA_TAG_IDS = [t.strip() for t in os.getenv("GAMMA_TAG_IDS", "").split(",") if t.strip()]
+_INTER_ANALYSIS_DELAY = 3                                        # secunde throttle între analize LLM
 _MIN_BALANCE_PUSD = 1.0
 _MIN_CONFIDENCE = 0.70
 _MIN_VOLUME_USD = 10_000.0       # Ignoră piețele cu volum sub $10k
 _MIN_PROBABILITY = 0.65          # Ignoră dacă probabilitatea YES e prea joasă
 _MAX_PROBABILITY = 0.90          # Ignoră dacă probabilitatea YES e prea certă
+# Meciurile head-to-head sunt mult mai competitive (probabilități medii), deci
+# au o fereastră de probabilitate lărgită față de restul piețelor.
+_MATCH_MIN_PROBABILITY = 0.45
+_MATCH_MAX_PROBABILITY = 0.95
 _MAX_POSITIONS_PER_EVENT = 2     # Max poziții per event_id (piețe generale)
 _MAX_OUTRIGHT_PER_EVENT = 1      # Max poziții pe piețe de tip "outright winner"
 
 # Istoric persistent al piețelor analizate: {market_id: timestamp_float}.
 # Încărcat din _HISTORY_FILE la pornire; folosit pentru a filtra piețele
 # analizate în ultimele _CACHE_TTL_SECONDS înainte de procesare.
-_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.json")
+# Calea poate fi suprascrisă cu HISTORY_FILE (ex: un volum montat pe Railway,
+# unde /app e efemer și root-only); altfel, history.json lângă main.py.
+_HISTORY_FILE = os.getenv("HISTORY_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "history.json"
+)
 _analyzed_history: dict[str, float] = {}
 
 # Stare raport orar P/L pe Discord (ts=0 → primul raport e trimis imediat la pornire)
@@ -44,7 +58,8 @@ _last_pnl_report_ts: float = 0.0
 _last_report_value: float | None = None
 _session_start_value: float | None = None
 
-_MATCH_KEYWORDS = (" vs ", " vs. ")
+_MATCH_KEYWORDS = (" vs ", " vs. ", "match winner")
+_MATCH_SLUG_PATTERNS = ("-vs-", "match-winner")
 _OUTRIGHT_PHRASES = (
     "win the 2026 fifa world cup",
     "win the fifa world cup",
@@ -56,10 +71,15 @@ _OUTRIGHT_PHRASES = (
 )
 
 
-def _classify_market(title: str) -> str:
-    """Clasifică piața ca 'match', 'outright' sau 'general' după titlu."""
+def _classify_market(title: str, slug: str = "") -> str:
+    """Clasifică piața ca 'match', 'outright' sau 'general' după titlu și slug.
+
+    Slug-ul prinde meciurile head-to-head al căror titlu nu conține ' vs '
+    explicit, dar al căror slug are forma 'team1-vs-team2[-match-winner]'.
+    """
     lower = title.lower()
-    if any(kw in lower for kw in _MATCH_KEYWORDS):
+    slug_lower = (slug or "").lower()
+    if any(kw in lower for kw in _MATCH_KEYWORDS) or any(p in slug_lower for p in _MATCH_SLUG_PATTERNS):
         return "match"
     if any(phrase in lower for phrase in _OUTRIGHT_PHRASES):
         return "outright"
@@ -85,18 +105,61 @@ def _interruptible_sleep(seconds: int) -> None:
         time.sleep(1)
 
 
-def fetch_active_markets(limit: int = 5) -> list[dict]:
-    try:
-        response = httpx.get(
-            _GAMMA_MARKETS_URL,
-            params={"active": "true", "closed": "false", "limit": limit},
-            timeout=10,
-        )
-        if response.status_code == 200:
-            return response.json()
-    except Exception as exc:
-        logger.warning("[Agent] Could not fetch active markets: %s", exc)
-    return []
+def _collect_active_markets(extra_params: dict, limit: int, seen_ids: set, out: list) -> None:
+    """Paginează Gamma /markets (offset) și adaugă în `out` piețe noi (deduplicate după id),
+    până la `limit` piețe adăugate din acest pas. Oprește la prima eroare sau pagină goală."""
+    offset = 0
+    added = 0
+    while added < limit:
+        page_size = min(_GAMMA_PAGE_SIZE, limit - added)
+        try:
+            response = httpx.get(
+                _GAMMA_MARKETS_URL,
+                params={"active": "true", "closed": "false",
+                        "limit": page_size, "offset": offset, **extra_params},
+                timeout=10,
+            )
+            if response.status_code != 200:
+                logger.warning("[Agent] Gamma a răspuns %s (offset=%d, params=%s).",
+                               response.status_code, offset, extra_params or "base")
+                return
+            page = response.json()
+        except Exception as exc:
+            logger.warning("[Agent] Could not fetch markets (offset=%d, params=%s): %s",
+                           offset, extra_params or "base", exc)
+            return
+
+        if not page:
+            return  # nu mai sunt pagini
+
+        for m in page:
+            mid = str(m.get("id", ""))
+            if mid and mid not in seen_ids:
+                seen_ids.add(mid)
+                out.append(m)
+                added += 1
+
+        if len(page) < page_size:
+            return  # ultima pagină (mai puține rezultate decât am cerut)
+        offset += page_size
+
+
+def fetch_active_markets(limit: int = _MARKET_SCAN_LIMIT) -> list[dict]:
+    """Preia piețe active din Gamma, paginat (offset) și deduplicat după id.
+
+    Paginarea aduce și meciurile individuale (head-to-head), care altfel sunt
+    îngropate sub piețele mari de tip outright în primele ~30 de rezultate.
+    Opțional, face un deep-scan suplimentar pe tag-urile din GAMMA_TAG_IDS
+    (ex: fotbal / FIFA World Cup), ca meciurile de azi să nu fie ratate.
+    """
+    seen_ids: set = set()
+    markets: list[dict] = []
+    _collect_active_markets({}, limit, seen_ids, markets)
+    for tag_id in _GAMMA_TAG_IDS:
+        _collect_active_markets({"tag_id": tag_id}, _GAMMA_PAGE_SIZE, seen_ids, markets)
+    logger.info("[Agent] Gamma: %d piețe active preluate (paginat, %d tag-uri deep-scan).",
+                len(markets), len(_GAMMA_TAG_IDS))
+    return markets
 
 
 def _token_for_outcome(market: dict, outcome: str) -> str | None:
@@ -211,9 +274,16 @@ def _load_history() -> None:
 
 
 def _save_history() -> None:
-    """Persistă istoricul piețelor analizate în history.json (scriere atomică)."""
+    """Persistă istoricul piețelor analizate în history.json (scriere atomică).
+
+    Creează directorul părinte dacă lipsește; erorile de permisiuni/IO sunt
+    prinse și logate, fără a opri botul (history e best-effort).
+    """
     tmp = f"{_HISTORY_FILE}.tmp"
     try:
+        parent = os.path.dirname(_HISTORY_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(_analyzed_history, fh)
         os.replace(tmp, _HISTORY_FILE)
@@ -317,12 +387,20 @@ def process_market(market: dict, account_state: dict) -> None:
         )
         return
 
-    # --- FILTRU 2: Fereastra de probabilitate ---
+    # Clasificarea (slug-ul ajută la meciurile head-to-head 'team1-vs-team2')
+    # determină atât fereastra de probabilitate, cât și event clustering-ul.
+    market_type = _classify_market(title, market.get("slug", ""))
+
+    # --- FILTRU 2: Fereastra de probabilitate (lărgită pentru meciuri) ---
+    # Meciurile sunt mult mai competitive, deci fereastra e relaxată la
+    # [0.45, 0.95] față de [0.65, 0.90] pentru restul piețelor.
     yes_price_raw = _current_price(market, "YES")
-    if not (_MIN_PROBABILITY < yes_price_raw < _MAX_PROBABILITY):
+    prob_min = _MATCH_MIN_PROBABILITY if market_type == "match" else _MIN_PROBABILITY
+    prob_max = _MATCH_MAX_PROBABILITY if market_type == "match" else _MAX_PROBABILITY
+    if not (prob_min < yes_price_raw < prob_max):
         logger.info(
-            "[FILTER] Ignor piața '%s' (Probabilitate YES=%.2f în afara ferestrei [%.2f, %.2f]).",
-            title[:60], yes_price_raw, _MIN_PROBABILITY, _MAX_PROBABILITY,
+            "[FILTER] Ignor piața '%s' [%s] (Probabilitate YES=%.2f în afara ferestrei [%.2f, %.2f]).",
+            title[:60], market_type, yes_price_raw, prob_min, prob_max,
         )
         return
 
@@ -331,7 +409,6 @@ def process_market(market: dict, account_state: dict) -> None:
     # event_id, deoarece aceasta ar afecta și piețele de tip outright winner
     # din același turneu. Fiecare tip de piață are propria limită.
     event_id = _extract_event_id(market)
-    market_type = _classify_market(title)
 
     if market_type == "match":
         logger.debug("[FILTER] Piață de tip meci detectată ('%s') — skip event clustering.", title[:60])
@@ -484,6 +561,7 @@ def process_market(market: dict, account_state: dict) -> None:
             price=price,
             size=estimated_size,
             total=order_total,
+            outcome=outcome,
             confidence=decision.get("confidence"),
             reason=decision.get("reason"),
             order_id=result.get("order_id"),
@@ -585,7 +663,7 @@ def main() -> None:
                 _interruptible_sleep(_LOOP_INTERVAL)
                 continue
 
-            markets = fetch_active_markets(limit=30)
+            markets = fetch_active_markets()
             if not markets:
                 logger.warning("[Agent] Nicio piață activă găsită. Aștept...")
                 _interruptible_sleep(_LOOP_INTERVAL)
@@ -611,6 +689,7 @@ def main() -> None:
             for market in markets:
                 if not RUNNING:
                     break
+                hist_before = len(_analyzed_history)
                 try:
                     process_market(market, account_state)
                 except Exception as exc:
@@ -620,7 +699,16 @@ def main() -> None:
                         exc,
                         exc_info=True,
                     )
-                time.sleep(3)
+                # Throttle DOAR după o analiză reală (process_market a înregistrat
+                # piața în history → a făcut apel LLM). Piețele filtrate ieftin nu
+                # dorm, altfel scanarea paginată ar pierde minute pe nimic.
+                if len(_analyzed_history) > hist_before:
+                    _interruptible_sleep(_INTER_ANALYSIS_DELAY)
+
+            # După scanare: lista piețelor procesate, ca mesaj Discord separat de
+            # raportul de portofoliu (păstrează contextul curat). Toggle din config.
+            if settings.NOTIFY_MARKETS:
+                notify_markets(markets)
 
             _interruptible_sleep(_LOOP_INTERVAL)
 

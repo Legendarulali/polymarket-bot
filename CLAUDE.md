@@ -31,13 +31,14 @@ Env-driven via `config/settings.py` (loads `.env`). It **raises at import time**
 - `GROQ_API_KEY` — without it `analyse_market` returns `trade=False`, so the bot never trades.
 - **Proxy accounts:** `POLYMARKET_API_KEY` / `_SECRET` / `_PASSPHRASE` switch to explicit-creds mode + `signature_type=3`. `/balance-allowance` returns 0 for proxies → set `OVERRIDE_BALANCE` to the real pUSD balance to unblock trading.
 - **Risk knobs** (hardcoded thresholds live at the top of `main.py`): `MAX_ACTIVE_POSITIONS` (5), `SLIPPAGE_TOLERANCE` (0.05), `TAKE_PROFIT_PCT` (0 = off), `STOP_LOSS_PCT` (0.30), `USDC_APPROVAL_USD`, `MAX_GAS_PRICE_GWEI`.
-- **Discord:** `DISCORD_WEBHOOK_URL` (empty = off), `PNL_REPORT_INTERVAL_HOURS` (1).
+- **Discord:** `DISCORD_WEBHOOK_URL` (empty = off), `PNL_REPORT_INTERVAL_HOURS` (1), `NOTIFY_MARKETS` (true — post the processed-markets list each scan; sends every loop, so disable if too chatty).
+- **Scanning:** `MARKET_SCAN_LIMIT` (200, markets paginated per loop), `GAMMA_TAG_IDS` (optional CSV of numeric Gamma tag ids for a soccer/World-Cup deep-scan; off by default — needs the real tag id verified against the live API), `HISTORY_FILE` (override the `history.json` path, e.g. a Railway volume since `/app` is ephemeral + root-only).
 
 ## Architecture
 
-`main.py` orchestrates; everything in `src/` is a focused helper. Startup: boot reconciliation → warm CLOB client → ensure on-chain approvals → loop. **Each loop iteration:** `get_account_state` → balance/exposure gates → maybe send the hourly P/L report → fetch 30 markets → drop those already in the persistent history → shuffle → `process_market` each → `check_exit_conditions`.
+`main.py` orchestrates; everything in `src/` is a focused helper. Startup: boot reconciliation → warm CLOB client → ensure on-chain approvals → loop. **Each loop iteration:** `get_account_state` → balance/exposure gates → maybe send the hourly P/L report → fetch markets (paginated up to `MARKET_SCAN_LIMIT`, deduped by id) → drop those already in the persistent history → shuffle → `process_market` each (throttled only after a real LLM call) → `check_exit_conditions`.
 
-**`process_market` pipeline** (constants at the top of `main.py`): volume ≥ $10k → YES price ∈ (0.65, 0.90) → per-event cap via `_extract_event_id` → news → `analyse_market` → record to `history.json` → `confidence ≥ 0.70` → balance / duplicate-token / slippage checks → `place_limit_order` → `notify_trade`.
+**`process_market` pipeline** (constants at the top of `main.py`): volume ≥ $10k → YES price in the probability window (0.65–0.90; **relaxed to 0.45–0.95 for `match`-type markets**, classified by `_classify_market` from title/slug) → per-event cap via `_extract_event_id` → news → `analyse_market` → record to `history.json` → `confidence ≥ 0.70` → balance / duplicate-token / slippage checks → `place_limit_order` → `notify_trade`.
 
 **Module map:**
 - `config/settings.py` — `Settings` singleton + root logging config.
@@ -48,7 +49,7 @@ Env-driven via `config/settings.py` (loads `.env`). It **raises at import time**
 - `src/allowance.py` — one-time on-chain approvals (pUSD + CTF) targeting the **V2** exchanges; EOA sends tx directly, proxy routes through `Safe.execTransaction`.
 - `src/ai_analyser.py` — Groq via the OpenAI-compatible SDK (`llama-3.1-8b-instant`) → strict JSON decision. Prompt-injection hardened (untrusted title/news wrapped + sanitized); tenacity retries 4×.
 - `src/news_monitor.py` — `fetch_free_news` (Google News RSS, no key, used by the loop) vs `fetch_latest_breaking_news` (NewsAPI + X).
-- `src/notifications.py` — Discord webhooks. **No-op without a webhook and never raises**, so it's safe to call inline from trading paths.
+- `src/notifications.py` — Discord webhooks, three message types: `notify_trade` (BUY/SELL, with outcome), `notify_portfolio` (hourly P/L summary), `notify_markets` (post-scan list of processed markets, truncated to 10 + "…și încă N", ≤2000 chars). All **no-op without a webhook and never raise**, so they're safe to call inline from trading paths.
 
 ## Cross-cutting concepts
 

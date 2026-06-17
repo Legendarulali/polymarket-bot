@@ -23,6 +23,10 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 COPY . .
 
+# După COPY, /app e deținut de root, deci userul non-root nu poate scrie
+# history.json[.tmp] → [Errno 13] Permission denied. Dă-i botuser proprietatea.
+RUN chown -R botuser:botuser /app
+
 USER botuser
 
 CMD ["python", "main.py"]

@@ -16,7 +16,11 @@ logger = logging.getLogger(__name__)
 _TIMEOUT = 10
 _GREEN = 0x2ECC71
 _RED = 0xE74C3C
+_BLUE = 0x3498DB
 _FOOTER = {"text": "Polymarket AI Bot"}
+_MARKETS_PREVIEW = 10      # câte piețe se afișează înainte de truncare
+_MARKETS_TITLE_CAP = 100   # lungime maximă per titlu în listă
+_DESC_LIMIT = 2000         # plafon caractere pentru descriere (limita webhook-urilor)
 
 
 def _enabled() -> bool:
@@ -62,6 +66,7 @@ def notify_trade(
     size: float,
     total: float,
     *,
+    outcome: str | None = None,
     confidence: float | None = None,
     reason: str | None = None,
     order_id: str | None = None,
@@ -74,7 +79,10 @@ def notify_trade(
     emoji = "🟢" if is_buy else "🔴"
     color = _GREEN if is_buy else _RED
 
-    fields = [
+    fields = []
+    if outcome:
+        fields.append({"name": "Outcome", "value": str(outcome)[:64], "inline": True})
+    fields += [
         {"name": "Preț", "value": f"${price:.4f}", "inline": True},
         {"name": "Size", "value": f"{size:.2f}", "inline": True},
         {"name": "Total", "value": _money(total), "inline": True},
@@ -154,6 +162,43 @@ def notify_portfolio(
         "title": "📊 Raport portofoliu",
         "color": color,
         "fields": fields,
+        "timestamp": _now_iso(),
+        "footer": _FOOTER,
+    }
+    _post(embed)
+
+
+def notify_markets(markets: list, *, total: int | None = None) -> None:
+    """Listă a piețelor active procesate, trimisă separat de raportul de portofoliu.
+
+    Afișează primele _MARKETS_PREVIEW piețe; dacă sunt mai multe, adaugă
+    „…și încă N piețe". Descrierea e plafonată la _DESC_LIMIT caractere (limita
+    webhook-urilor). Acceptă fie dict-uri de piață (cu 'question'/'title'), fie
+    string-uri. Ca toate notificările: no-op fără webhook și nu ridică excepții.
+    """
+    if not _enabled():
+        return
+
+    titles = [
+        (str(m.get("question") or m.get("title") or "?") if isinstance(m, dict) else str(m))
+        for m in markets
+    ]
+    count = total if total is not None else len(titles)
+
+    shown = titles[:_MARKETS_PREVIEW]
+    lines = [f"{i}. {t[:_MARKETS_TITLE_CAP]}" for i, t in enumerate(shown, 1)]
+    remaining = count - len(shown)
+    if remaining > 0:
+        lines.append(f"…și încă {remaining} piețe")
+
+    description = "\n".join(lines) or "Nicio piață activă."
+    if len(description) > _DESC_LIMIT:
+        description = description[:_DESC_LIMIT - 1] + "…"
+
+    embed = {
+        "title": f"📋 Piețe active procesate ({count})",
+        "description": description,
+        "color": _BLUE,
         "timestamp": _now_iso(),
         "footer": _FOOTER,
     }

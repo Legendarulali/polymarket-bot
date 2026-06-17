@@ -795,3 +795,188 @@ class TestAnalyzedHistory:
         hist_file.write_text("{not valid json", encoding="utf-8")
         main._load_history()
         assert main._analyzed_history == {}
+
+
+# ---------------------------------------------------------------------------
+# Tests: match-market classification (title + slug)
+# ---------------------------------------------------------------------------
+
+class TestClassifyMarket:
+    def test_match_by_title_vs(self):
+        import main
+        assert main._classify_market("USA vs Iran", "") == "match"
+
+    def test_match_by_slug_vs(self):
+        import main
+        assert main._classify_market("Group stage result", "usa-vs-iran-2026") == "match"
+
+    def test_match_by_match_winner_phrase(self):
+        import main
+        assert main._classify_market("Brazil Match Winner", "") == "match"
+
+    def test_outright_still_detected(self):
+        import main
+        assert main._classify_market("Win the 2026 FIFA World Cup", "argentina-to-win") == "outright"
+
+    def test_general_default(self):
+        import main
+        assert main._classify_market("Will it rain in NYC?", "rain-nyc") == "general"
+
+
+# ---------------------------------------------------------------------------
+# Tests: probability window — relaxed for match markets, strict otherwise
+# ---------------------------------------------------------------------------
+
+class TestMatchProbabilityWindow:
+    def _market(self, question, prices):
+        return {
+            "id": "mx", "question": question, "volume": "50000",
+            "outcomePrices": json.dumps(prices),
+            "clobTokenIds": json.dumps(["0xYES", "0xNO"]),
+            "events": [{"slug": "ev"}],
+        }
+
+    def _run(self, market):
+        import main
+        decision = {"trade": True, "outcome": "YES", "confidence": 0.9, "reason": "t"}
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main.analyse_market", return_value=decision), \
+             patch("main._record_analyzed"), \
+             patch("main._live_best_ask", return_value=None), \
+             patch("main.place_limit_order",
+                   return_value={"success": True, "order_id": "o"}) as mock_order:
+            main.process_market(market, state)
+        return mock_order
+
+    def test_match_midrange_probability_allowed(self):
+        # 0.50 is outside the strict (0.65, 0.90) window but inside the match window
+        self._run(self._market("USA vs Iran", ["0.50", "0.50"])).assert_called_once()
+
+    def test_general_midrange_probability_blocked(self):
+        self._run(self._market("Will the team win the final?", ["0.50", "0.50"])).assert_not_called()
+
+    def test_match_extreme_probability_still_blocked(self):
+        # 0.97 is outside even the relaxed (0.45, 0.95) match window
+        self._run(self._market("USA vs Iran", ["0.97", "0.03"])).assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: fetch_active_markets pagination + dedup
+# ---------------------------------------------------------------------------
+
+class TestFetchActiveMarkets:
+    def _resp(self, payload, status=200):
+        r = MagicMock()
+        r.status_code = status
+        r.json.return_value = payload
+        return r
+
+    def test_paginates_and_dedupes(self, monkeypatch):
+        import main
+        page1 = [{"id": str(i)} for i in range(100)]       # ids 0..99
+        page2 = [{"id": str(i)} for i in range(99, 149)]   # ids 99..148: 99 overlaps, 50 < page_size → stop
+        responses = [self._resp(page1), self._resp(page2)]
+        calls = {"n": 0}
+
+        def fake_get(url, params=None, timeout=None):
+            i = calls["n"]
+            calls["n"] += 1
+            return responses[i] if i < len(responses) else self._resp([])
+
+        monkeypatch.setattr(main.httpx, "get", fake_get)
+        out = main.fetch_active_markets(limit=200)
+        ids = [m["id"] for m in out]
+        assert len(out) == 149                  # 100 + 49 new (one duplicate dropped)
+        assert len(ids) == len(set(ids))        # all unique
+
+    def test_stops_on_non_200(self, monkeypatch):
+        import main
+        monkeypatch.setattr(main.httpx, "get", lambda *a, **k: self._resp([], status=500))
+        assert main.fetch_active_markets(limit=50) == []
+
+    def test_stops_on_exception(self, monkeypatch):
+        import main
+
+        def boom(*a, **k):
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr(main.httpx, "get", boom)
+        assert main.fetch_active_markets(limit=50) == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: markets-list webhook + trade outcome field
+# ---------------------------------------------------------------------------
+
+class TestMarketsNotification:
+    def _patch(self, webhook="https://discord.test/webhook"):
+        from config.settings import settings
+        return patch.object(settings, "DISCORD_WEBHOOK_URL", webhook)
+
+    def _desc(self, mock_post):
+        return mock_post.call_args.kwargs["json"]["embeds"][0]["description"]
+
+    def test_no_webhook_is_noop(self):
+        from src import notifications
+        with self._patch(webhook=""), patch("src.notifications.requests.post") as mock_post:
+            notifications.notify_markets([{"question": "m"}])
+        mock_post.assert_not_called()
+
+    def test_lists_market_titles(self):
+        from src import notifications
+        markets = [{"question": "USA vs Iran"}, {"title": "Brazil vs Spain"}]
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_markets(markets)
+        desc = self._desc(mock_post)
+        assert "USA vs Iran" in desc and "Brazil vs Spain" in desc
+
+    def test_truncates_over_10(self):
+        from src import notifications
+        markets = [{"question": f"Market {i}"} for i in range(25)]
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_markets(markets)
+        desc = self._desc(mock_post)
+        assert "și încă 15 piețe" in desc
+        assert desc.count("\n") == 10  # 10 market lines + the "…și încă" line
+
+    def test_respects_2000_char_limit(self):
+        from src import notifications
+        markets = [{"question": "X" * 400} for _ in range(50)]
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_markets(markets)
+        assert len(self._desc(mock_post)) <= 2000
+
+    def test_accepts_plain_strings(self):
+        from src import notifications
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_markets(["Market A", "Market B"])
+        assert "Market A" in self._desc(mock_post)
+
+    def test_network_error_is_swallowed(self):
+        from src import notifications
+        with self._patch(), \
+             patch("src.notifications.requests.post", side_effect=Exception("boom")):
+            # Must not raise — a Discord failure must never break the bot loop.
+            notifications.notify_markets([{"question": "m"}])
+
+    def test_trade_includes_outcome_field(self):
+        from src import notifications
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_trade("BUY", "USA vs Iran", 0.5, 10.0, 5.0, outcome="YES")
+        embed = mock_post.call_args.kwargs["json"]["embeds"][0]
+        vals = {f["name"]: f["value"] for f in embed["fields"]}
+        assert vals.get("Outcome") == "YES"
+
+    def test_trade_without_outcome_has_no_outcome_field(self):
+        from src import notifications
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_trade("BUY", "Market", 0.5, 10.0, 5.0)
+        names = [f["name"] for f in mock_post.call_args.kwargs["json"]["embeds"][0]["fields"]]
+        assert "Outcome" not in names
