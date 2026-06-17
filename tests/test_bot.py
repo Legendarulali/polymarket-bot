@@ -707,21 +707,22 @@ class TestNotifications:
         assert "SELL" in embed["title"]
         assert embed["color"] == 0xE74C3C  # red
 
-    def test_portfolio_notification_includes_deltas(self):
+    def test_portfolio_shows_financial_stats_without_position_list(self):
         from src import notifications
-        summary = {
+        stats = {
             "total_value": 12.0, "cash": 2.0, "positions_value": 10.0,
             "unrealized_pnl": 1.0, "cost_basis": 9.0, "n_positions": 2,
             "positions": [{"asset_name": "Market A", "current_value": 6.0, "cash_pnl": 1.5}],
         }
         with self._patch(), patch("src.notifications.requests.post") as mock_post:
             mock_post.return_value = MagicMock(status_code=204)
-            notifications.notify_portfolio(summary, prev_total=11.0, session_start_total=10.0)
+            notifications.notify_portfolio(stats, prev_total=11.0, session_start_total=10.0)
         embed = mock_post.call_args.kwargs["json"]["embeds"][0]
+        assert "Status Portofoliu" in embed["title"]
         names = [f["name"] for f in embed["fields"]]
-        assert "Δ ultima oră" in names
-        assert "Δ de la pornire" in names
-        assert "Top poziții" in names
+        assert "P/L ultima oră" in names
+        assert "P/L de la pornire" in names
+        assert "Top poziții" not in names   # positions moved to notify_positions
 
     def test_network_error_is_swallowed(self):
         from src import notifications
@@ -822,6 +823,19 @@ class TestClassifyMarket:
         import main
         assert main._classify_market("Will it rain in NYC?", "rain-nyc") == "general"
 
+    def test_world_cup_winner_is_outright(self):
+        import main
+        assert main._classify_market("Will Brazil win the 2026 FIFA World Cup?", "") == "outright"
+
+    def test_world_cup_match_winner_is_match(self):
+        import main
+        assert main._classify_market("World Cup Match Winner: USA vs Iran", "wc-usa-vs-iran") == "match"
+
+    def test_world_cup_match_vs_takes_precedence_over_outright(self):
+        import main
+        # 'vs' present → must classify as match, not outright (precedence)
+        assert main._classify_market("2026 World Cup: France vs Croatia", "") == "match"
+
 
 # ---------------------------------------------------------------------------
 # Tests: probability window — relaxed for match markets, strict otherwise
@@ -859,6 +873,14 @@ class TestMatchProbabilityWindow:
     def test_match_extreme_probability_still_blocked(self):
         # 0.97 is outside even the relaxed (0.45, 0.95) match window
         self._run(self._market("USA vs Iran", ["0.97", "0.03"])).assert_not_called()
+
+    def test_volume_filter_increments_scan_stats(self):
+        import main
+        main._scan_stats.clear()
+        m = self._market("X vs Y", ["0.50", "0.50"])
+        m["volume"] = "100"   # below MIN_VOLUME_USD → filtered before any LLM call
+        main.process_market(m, {"pusd_balance": 20.0, "active_positions": []})
+        assert main._scan_stats["volum mic"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -903,6 +925,23 @@ class TestFetchActiveMarkets:
 
         monkeypatch.setattr(main.httpx, "get", boom)
         assert main.fetch_active_markets(limit=50) == []
+
+    def test_order_param_falls_back_on_non_200(self, monkeypatch):
+        import main
+        monkeypatch.setattr(main, "_GAMMA_ORDER", "volumeNum")
+        seen = []
+
+        def fake_get(url, params=None, timeout=None):
+            seen.append(dict(params))
+            if "order" in params:
+                return self._resp(None, status=500)   # ordered request rejected
+            return self._resp([{"id": "1"}])           # unordered works
+
+        monkeypatch.setattr(main.httpx, "get", fake_get)
+        out = main.fetch_active_markets(limit=5)
+        assert any("order" in p for p in seen)         # tried with order first
+        assert any("order" not in p for p in seen)     # then retried without it
+        assert [m["id"] for m in out] == ["1"]
 
 
 # ---------------------------------------------------------------------------
@@ -980,3 +1019,77 @@ class TestMarketsNotification:
             notifications.notify_trade("BUY", "Market", 0.5, 10.0, 5.0)
         names = [f["name"] for f in mock_post.call_args.kwargs["json"]["embeds"][0]["fields"]]
         assert "Outcome" not in names
+
+
+# ---------------------------------------------------------------------------
+# Tests: positions inventory webhook (Mesaj 2) + change-detection signature
+# ---------------------------------------------------------------------------
+
+class TestPositionsNotification:
+    def _patch(self, webhook="https://discord.test/webhook"):
+        from config.settings import settings
+        return patch.object(settings, "DISCORD_WEBHOOK_URL", webhook)
+
+    def _embed(self, mock_post):
+        return mock_post.call_args.kwargs["json"]["embeds"][0]
+
+    def test_empty_positions_message(self):
+        from src import notifications
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_positions([])
+        embed = self._embed(mock_post)
+        assert "Poziții Active" in embed["title"]
+        assert "Nicio poziție deschisă" in embed["description"]
+
+    def test_lists_position_fields(self):
+        from src import notifications
+        positions = [{"asset_name": "USA vs Iran", "outcome": "YES",
+                      "initial_value": 5.0, "cash_pnl": 1.25, "current_value": 6.25}]
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_positions(positions)
+        desc = self._embed(mock_post)["description"]
+        assert "USA vs Iran" in desc and "YES" in desc
+        assert "$5.00" in desc       # sumă investită
+        assert "+$1.25" in desc      # P/L curent
+
+    def test_missing_outcome_falls_back(self):
+        from src import notifications
+        positions = [{"asset_name": "Market", "initial_value": 5.0, "cash_pnl": 0.0}]
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_positions(positions)
+        assert "—" in self._embed(mock_post)["description"]
+
+    def test_no_webhook_is_noop(self):
+        from src import notifications
+        with self._patch(webhook=""), patch("src.notifications.requests.post") as mock_post:
+            notifications.notify_positions([{"asset_name": "x"}])
+        mock_post.assert_not_called()
+
+    def test_truncates_over_preview(self):
+        from src import notifications
+        positions = [{"asset_name": f"M{i}", "outcome": "YES", "initial_value": 1.0,
+                      "cash_pnl": 0.0, "current_value": float(i)} for i in range(25)]
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_positions(positions)
+        assert "și încă 15 poziții" in self._embed(mock_post)["description"]
+
+
+class TestPositionsSignature:
+    def test_order_independent(self):
+        import main
+        a = [{"token_id": "t1", "size": 5.0}, {"token_id": "t2", "size": 3.0}]
+        b = [{"token_id": "t2", "size": 3.0}, {"token_id": "t1", "size": 5.0}]
+        assert main._positions_signature(a) == main._positions_signature(b)
+
+    def test_size_change_changes_signature(self):
+        import main
+        assert main._positions_signature([{"token_id": "t1", "size": 5.0}]) != \
+               main._positions_signature([{"token_id": "t1", "size": 6.0}])
+
+    def test_empty_is_stable(self):
+        import main
+        assert main._positions_signature([]) == ""

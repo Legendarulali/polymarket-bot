@@ -5,6 +5,7 @@ import time
 import sys
 import signal
 import logging
+from collections import Counter
 
 import httpx
 
@@ -16,7 +17,7 @@ from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market
 from src.allowance import ensure_collateral_approved
 from src.position_manager import check_exit_conditions
-from src.notifications import notify_trade, notify_portfolio, notify_markets
+from src.notifications import notify_trade, notify_portfolio, notify_positions, notify_markets
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +28,18 @@ _CACHE_TTL_SECONDS = 4 * 3600 # cooldown: re-analizează o piață cel mult o da
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 _GAMMA_PAGE_SIZE = 100                                           # piețe per pagină la paginare Gamma
 _MARKET_SCAN_LIMIT = int(os.getenv("MARKET_SCAN_LIMIT", "200"))  # plafon piețe scanate per buclă
+# Sortare Gamma (câmp + direcție). Gol = ordinea implicită a API-ului. Ex:
+# GAMMA_ORDER=volumeNum (lichide întâi) sau GAMMA_ORDER=startDate (cele mai noi —
+# utile pentru meciurile create azi). Dacă valoarea e respinsă, se reia fără sortare.
+_GAMMA_ORDER = os.getenv("GAMMA_ORDER", "").strip()
+_GAMMA_ASCENDING = os.getenv("GAMMA_ASCENDING", "false").strip()
 # Deep-scan opțional pe tag-uri Gamma specifice (ex: fotbal / FIFA World Cup).
 # Gol = dezactivat. Necesită tag_id-urile NUMERICE reale (vezi .env.example).
 _GAMMA_TAG_IDS = [t.strip() for t in os.getenv("GAMMA_TAG_IDS", "").split(",") if t.strip()]
 _INTER_ANALYSIS_DELAY = 3                                        # secunde throttle între analize LLM
 _MIN_BALANCE_PUSD = 1.0
 _MIN_CONFIDENCE = 0.70
-_MIN_VOLUME_USD = 10_000.0       # Ignoră piețele cu volum sub $10k
+_MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "10000"))  # Ignoră piețele sub acest volum ($)
 _MIN_PROBABILITY = 0.65          # Ignoră dacă probabilitatea YES e prea joasă
 _MAX_PROBABILITY = 0.90          # Ignoră dacă probabilitatea YES e prea certă
 # Meciurile head-to-head sunt mult mai competitive (probabilități medii), deci
@@ -57,6 +63,13 @@ _analyzed_history: dict[str, float] = {}
 _last_pnl_report_ts: float = 0.0
 _last_report_value: float | None = None
 _session_start_value: float | None = None
+# Semnătura ultimei liste de poziții trimise — lista se retrimite doar la schimbarea
+# inventarului (poziții deschise/închise/redimensionate), ca să nu facă spam.
+_last_positions_sig: str | None = None
+
+# Statistici de filtrare per scanare (motiv → câte piețe). Resetat la fiecare buclă;
+# logate ca sumar după scanare pentru a vedea de ce sunt „ignorate" piețele.
+_scan_stats: Counter = Counter()
 
 _MATCH_KEYWORDS = (" vs ", " vs. ", "match winner")
 _MATCH_SLUG_PATTERNS = ("-vs-", "match-winner")
@@ -69,20 +82,29 @@ _OUTRIGHT_PHRASES = (
     "championship winner",
     "tournament winner",
 )
+_TYPE_LABELS = {"match": "Meci", "outright": "Outright", "general": "General"}
 
 
 def _classify_market(title: str, slug: str = "") -> str:
     """Clasifică piața ca 'match', 'outright' sau 'general' după titlu și slug.
 
-    Slug-ul prinde meciurile head-to-head al căror titlu nu conține ' vs '
-    explicit, dar al căror slug are forma 'team1-vs-team2[-match-winner]'.
+    Ordinea contează: meciul (head-to-head) are PRECEDENȚĂ față de outright, ca
+    un titlu de tip 'World Cup Match Winner: USA vs Iran' să fie clasificat MECI,
+    nu câștigător de turneu. 'Win the World Cup' (fără vs / match winner) rămâne
+    outright. Slug-ul prinde meciurile al căror titlu nu are ' vs ' explicit.
     """
     lower = title.lower()
     slug_lower = (slug or "").lower()
+
+    # 1) Meci individual (head-to-head / 'Match Winner') — verificat PRIMUL.
     if any(kw in lower for kw in _MATCH_KEYWORDS) or any(p in slug_lower for p in _MATCH_SLUG_PATTERNS):
         return "match"
+
+    # 2) Outright / câștigător turneu (ex: 'Win the 2026 FIFA World Cup').
     if any(phrase in lower for phrase in _OUTRIGHT_PHRASES):
         return "outright"
+
+    # 3) Restul (politice, generale).
     return "general"
 
 
@@ -105,32 +127,39 @@ def _interruptible_sleep(seconds: int) -> None:
         time.sleep(1)
 
 
+def _fetch_markets_page(params: dict) -> list | None:
+    """Un singur GET la Gamma /markets. Lista (poate fi goală) sau None la eroare/non-200."""
+    try:
+        response = httpx.get(_GAMMA_MARKETS_URL, params=params, timeout=10)
+        if response.status_code != 200:
+            logger.warning("[Agent] Gamma a răspuns %s (params=%s).", response.status_code, params)
+            return None
+        return response.json()
+    except Exception as exc:
+        logger.warning("[Agent] Could not fetch markets (params=%s): %s", params, exc)
+        return None
+
+
 def _collect_active_markets(extra_params: dict, limit: int, seen_ids: set, out: list) -> None:
     """Paginează Gamma /markets (offset) și adaugă în `out` piețe noi (deduplicate după id),
-    până la `limit` piețe adăugate din acest pas. Oprește la prima eroare sau pagină goală."""
+    până la `limit` piețe adăugate din acest pas. Oprește la prima eroare sau pagină goală.
+
+    Dacă GAMMA_ORDER e setat dar respins de API (non-200), reia pagina FĂRĂ sortare,
+    astfel încât o valoare de `order` greșită să nu golească complet scanarea.
+    """
+    order_params = {"order": _GAMMA_ORDER, "ascending": _GAMMA_ASCENDING} if _GAMMA_ORDER else {}
     offset = 0
     added = 0
     while added < limit:
         page_size = min(_GAMMA_PAGE_SIZE, limit - added)
-        try:
-            response = httpx.get(
-                _GAMMA_MARKETS_URL,
-                params={"active": "true", "closed": "false",
-                        "limit": page_size, "offset": offset, **extra_params},
-                timeout=10,
-            )
-            if response.status_code != 200:
-                logger.warning("[Agent] Gamma a răspuns %s (offset=%d, params=%s).",
-                               response.status_code, offset, extra_params or "base")
-                return
-            page = response.json()
-        except Exception as exc:
-            logger.warning("[Agent] Could not fetch markets (offset=%d, params=%s): %s",
-                           offset, extra_params or "base", exc)
-            return
-
+        base = {"active": "true", "closed": "false",
+                "limit": page_size, "offset": offset, **extra_params}
+        page = _fetch_markets_page({**base, **order_params})
+        if page is None and order_params:
+            logger.warning("[Agent] Reîncerc fără 'order=%s' (posibil nesuportat de Gamma).", _GAMMA_ORDER)
+            page = _fetch_markets_page(base)
         if not page:
-            return  # nu mai sunt pagini
+            return  # eroare sau nu mai sunt pagini
 
         for m in page:
             mid = str(m.get("id", ""))
@@ -322,9 +351,17 @@ def _extract_event_id(market: dict) -> str:
     )
 
 
+def _positions_signature(positions: list) -> str:
+    """Semnătură stabilă a inventarului (token_id + size), pentru detecția de modificări."""
+    return "|".join(sorted(
+        f"{p.get('token_id', '')}:{round(float(p.get('size', 0) or 0), 2)}" for p in positions
+    ))
+
+
 def _maybe_send_pnl_report(account_state: dict) -> None:
-    """Trimite raportul de portofoliu pe Discord la fiecare PNL_REPORT_INTERVAL_HOURS."""
-    global _last_pnl_report_ts, _last_report_value, _session_start_value
+    """Notificările de portofoliu pe Discord, la fiecare PNL_REPORT_INTERVAL_HOURS:
+    1) statusul financiar (mereu), 2) lista de poziții (doar dacă inventarul s-a schimbat)."""
+    global _last_pnl_report_ts, _last_report_value, _session_start_value, _last_positions_sig
 
     interval_h = settings.PNL_REPORT_INTERVAL_HOURS
     if interval_h <= 0 or not settings.DISCORD_WEBHOOK_URL:
@@ -343,11 +380,20 @@ def _maybe_send_pnl_report(account_state: dict) -> None:
         summary["total_value"], summary["cash"], summary["positions_value"],
         summary["unrealized_pnl"], summary["n_positions"],
     )
+    # 1) Status financiar (mereu, la interval).
     notify_portfolio(
         summary,
         prev_total=_last_report_value,
         session_start_total=_session_start_value,
     )
+
+    # 2) Lista de poziții — doar dacă inventarul s-a schimbat (anti-spam).
+    positions = summary.get("positions", [])
+    sig = _positions_signature(positions)
+    if sig != _last_positions_sig:
+        notify_positions(positions)
+        _last_positions_sig = sig
+
     _last_report_value = summary["total_value"]
     _last_pnl_report_ts = now
 
@@ -358,8 +404,10 @@ def process_market(market: dict, account_state: dict) -> None:
 
     title = market.get("question") or market.get("title") or "Unknown market"
     market_id = market.get("id", "?")
+    market_type = _classify_market(title, market.get("slug", ""))
+    type_label = _TYPE_LABELS.get(market_type, market_type)
 
-    logger.info("[Agent] Procesez piața id=%s: %s", market_id, title[:80])
+    logger.info("[Agent] Procesez piața id=%s [Tip: %s]: %s", market_id, type_label, title[:80])
 
     # Limita globală de poziții se re-verifică per piață: în aceeași iterație
     # pot fi deschise mai multe poziții noi, iar verificarea din bucla main
@@ -368,6 +416,7 @@ def process_market(market: dict, account_state: dict) -> None:
         settings.MAX_ACTIVE_POSITIONS > 0
         and len(active_positions) >= settings.MAX_ACTIVE_POSITIONS
     ):
+        _scan_stats["expunere maximă"] += 1
         logger.info(
             "[FILTER] Limită de expunere atinsă (%d/%d poziții). Skip piața '%s'.",
             len(active_positions), settings.MAX_ACTIVE_POSITIONS, title[:60],
@@ -381,15 +430,12 @@ def process_market(market: dict, account_state: dict) -> None:
     except (ValueError, TypeError):
         pass
     if volume < _MIN_VOLUME_USD:
+        _scan_stats["volum mic"] += 1
         logger.info(
-            "[FILTER] Ignor piața '%s' (Volum prea mic: $%.0f < $%.0f).",
-            title[:60], volume, _MIN_VOLUME_USD,
+            "[FILTER] Ignor piața '%s' [%s] (Volum prea mic: $%.0f < $%.0f).",
+            title[:60], type_label, volume, _MIN_VOLUME_USD,
         )
         return
-
-    # Clasificarea (slug-ul ajută la meciurile head-to-head 'team1-vs-team2')
-    # determină atât fereastra de probabilitate, cât și event clustering-ul.
-    market_type = _classify_market(title, market.get("slug", ""))
 
     # --- FILTRU 2: Fereastra de probabilitate (lărgită pentru meciuri) ---
     # Meciurile sunt mult mai competitive, deci fereastra e relaxată la
@@ -398,9 +444,10 @@ def process_market(market: dict, account_state: dict) -> None:
     prob_min = _MATCH_MIN_PROBABILITY if market_type == "match" else _MIN_PROBABILITY
     prob_max = _MATCH_MAX_PROBABILITY if market_type == "match" else _MAX_PROBABILITY
     if not (prob_min < yes_price_raw < prob_max):
+        _scan_stats["probabilitate în afara ferestrei"] += 1
         logger.info(
             "[FILTER] Ignor piața '%s' [%s] (Probabilitate YES=%.2f în afara ferestrei [%.2f, %.2f]).",
-            title[:60], market_type, yes_price_raw, prob_min, prob_max,
+            title[:60], type_label, yes_price_raw, prob_min, prob_max,
         )
         return
 
@@ -419,9 +466,10 @@ def process_market(market: dict, account_state: dict) -> None:
             if pos.get("event_id") == event_id
         )
         if event_positions >= limit:
+            _scan_stats["event clustering"] += 1
             logger.info(
                 "[FILTER] Ignor piața '%s' [%s] (eveniment %s: %d/%d poziții).",
-                title[:60], market_type, event_id, event_positions, limit,
+                title[:60], type_label, event_id, event_positions, limit,
             )
             return
 
@@ -436,6 +484,7 @@ def process_market(market: dict, account_state: dict) -> None:
 
     # Înregistrează piața ca analizată și persistă imediat (cooldown=_CACHE_TTL_SECONDS).
     _record_analyzed(str(market_id))
+    _scan_stats["analizate (LLM)"] += 1
     logger.info(
         "[Agent] Piață id=%s marcată ca analizată în history.json (cooldown=%dh).",
         market_id,
@@ -547,6 +596,7 @@ def process_market(market: dict, account_state: dict) -> None:
         active_positions.append({
             "asset_name":    title,
             "token_id":      token_id,
+            "outcome":       outcome,
             "side":          "BUY",
             "size":          estimated_size,
             "avg_price":     price,
@@ -686,6 +736,7 @@ def main() -> None:
 
             random.shuffle(markets)
             logger.info("[Agent] Procesez %d piețe active (ordine aleatorie).", len(markets))
+            _scan_stats.clear()
             for market in markets:
                 if not RUNNING:
                     break
@@ -704,6 +755,11 @@ def main() -> None:
                 # dorm, altfel scanarea paginată ar pierde minute pe nimic.
                 if len(_analyzed_history) > hist_before:
                     _interruptible_sleep(_INTER_ANALYSIS_DELAY)
+
+            # Sumar de filtrare: ce a oprit piețele. Cheia pentru a vedea DE CE
+            # „ignoră" botul tot — ex: {'volum mic': 195, 'analizate (LLM)': 3}.
+            logger.info("[Scan] Rezultat filtrare pe %d piețe: %s",
+                        len(markets), dict(_scan_stats) or "nimic procesat")
 
             # După scanare: lista piețelor procesate, ca mesaj Discord separat de
             # raportul de portofoliu (păstrează contextul curat). Toggle din config.

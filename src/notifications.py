@@ -105,67 +105,100 @@ def notify_trade(
 
 
 def notify_portfolio(
-    summary: dict,
+    stats: dict,
     *,
     prev_total: float | None = None,
     session_start_total: float | None = None,
 ) -> None:
-    """Raport orar de portofoliu: valoare totală, P/L și deltele față de ora trecută / pornire."""
+    """Mesaj 1 — Status financiar: valoare totală, cash, poziții și P/L nerealizat
+    (total, ultima oră, de la pornire). Lista de poziții se trimite separat prin
+    `notify_positions`; aici sunt DOAR cifrele financiare. `stats` = sumarul din
+    compute_portfolio_summary.
+    """
     if not _enabled():
         return
 
-    total = summary.get("total_value", 0.0)
-    cash = summary.get("cash", 0.0)
-    positions_value = summary.get("positions_value", 0.0)
-    unrealized = summary.get("unrealized_pnl", 0.0)
-    cost_basis = summary.get("cost_basis", 0.0)
+    total = stats.get("total_value", 0.0)
+    cash = stats.get("cash", 0.0)
+    positions_value = stats.get("positions_value", 0.0)
+    unrealized = stats.get("unrealized_pnl", 0.0)
+    cost_basis = stats.get("cost_basis", 0.0)
     unreal_pct = (unrealized / cost_basis * 100) if cost_basis else 0.0
-
-    color = _GREEN if unrealized >= 0 else _RED
 
     fields = [
         {"name": "💰 Valoare totală", "value": _money(total), "inline": True},
         {"name": "💵 Cash", "value": _money(cash), "inline": True},
         {"name": "📈 În poziții", "value": _money(positions_value), "inline": True},
-        {"name": "P/L nerealizat", "value": f"{_signed_money(unrealized)} ({_signed_pct(unreal_pct)})", "inline": True},
-        {"name": "Poziții deschise", "value": str(summary.get("n_positions", 0)), "inline": True},
+        {"name": "P/L nerealizat (total)",
+         "value": f"{_signed_money(unrealized)} ({_signed_pct(unreal_pct)})", "inline": True},
     ]
-
     if prev_total is not None:
-        fields.append({"name": "Δ ultima oră", "value": _signed_money(total - prev_total), "inline": True})
+        fields.append({"name": "P/L ultima oră", "value": _signed_money(total - prev_total), "inline": True})
     if session_start_total is not None:
         sdelta = total - session_start_total
         spct = (sdelta / session_start_total * 100) if session_start_total else 0.0
         fields.append({
-            "name": "Δ de la pornire",
+            "name": "P/L de la pornire",
             "value": f"{_signed_money(sdelta)} ({_signed_pct(spct)})",
             "inline": True,
         })
 
-    # Top poziții după valoarea curentă, cu P/L individual.
-    positions = sorted(
-        summary.get("positions", []),
-        key=lambda p: p.get("current_value", 0.0),
-        reverse=True,
-    )[:5]
-    if positions:
-        lines = []
-        for p in positions:
-            name = (p.get("asset_name") or "?")[:45]
-            cv = p.get("current_value", 0.0)
-            cp = p.get("cash_pnl", 0.0)
-            mark = "🟢" if cp >= 0 else "🔴"
-            lines.append(f"{mark} {name} — {_money(cv)} ({_signed_money(cp)})")
-        fields.append({"name": "Top poziții", "value": "\n".join(lines)[:1024], "inline": False})
-
     embed = {
-        "title": "📊 Raport portofoliu",
-        "color": color,
+        "title": "💰 Status Portofoliu",
+        "color": _GREEN if unrealized >= 0 else _RED,
         "fields": fields,
         "timestamp": _now_iso(),
         "footer": _FOOTER,
     }
     _post(embed)
+
+
+def notify_positions(positions: list) -> None:
+    """Mesaj 2 — Inventarul pozițiilor deschise, embed separat de statusul financiar.
+
+    Fiecare linie: titlu | outcome | sumă investită | P/L curent. Listă goală →
+    „Nicio poziție deschisă". Plafonat la _DESC_LIMIT caractere (truncat cu „…și încă N").
+    Notă: `outcome` apare doar dacă e prezent în dict-ul poziției (Data API nu îl
+    expune prin reconciliation.py); altfel se afișează „—".
+    """
+    if not _enabled():
+        return
+
+    if not positions:
+        _post({
+            "title": "📦 Poziții Active",
+            "description": "Nicio poziție deschisă.",
+            "color": _BLUE,
+            "timestamp": _now_iso(),
+            "footer": _FOOTER,
+        })
+        return
+
+    ordered = sorted(positions, key=lambda p: p.get("current_value", 0.0), reverse=True)
+    shown = ordered[:_MARKETS_PREVIEW]
+    lines = []
+    for p in shown:
+        name = str(p.get("asset_name") or "?")[:60]
+        outcome = str(p.get("outcome") or "—")
+        invested = _money(float(p.get("initial_value", 0.0) or 0.0))
+        pnl = float(p.get("cash_pnl", 0.0) or 0.0)
+        mark = "🟢" if pnl >= 0 else "🔴"
+        lines.append(f"{mark} {name} | {outcome} | {invested} | {_signed_money(pnl)}")
+    remaining = len(ordered) - len(shown)
+    if remaining > 0:
+        lines.append(f"…și încă {remaining} poziții")
+
+    description = "\n".join(lines)
+    if len(description) > _DESC_LIMIT:
+        description = description[:_DESC_LIMIT - 1] + "…"
+
+    _post({
+        "title": f"📦 Poziții Active ({len(ordered)})",
+        "description": description,
+        "color": _BLUE,
+        "timestamp": _now_iso(),
+        "footer": _FOOTER,
+    })
 
 
 def notify_markets(markets: list, *, total: int | None = None) -> None:
