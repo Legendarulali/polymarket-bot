@@ -1,5 +1,6 @@
 """
-Notificări Discord prin webhook: alerte buy/sell și raport orar de portofoliu.
+Notificări Discord prin webhook: alerte buy/sell și raportul periodic de
+portofoliu (status financiar + inventar poziții).
 
 Modulul e proiectat să nu pice niciodată trading-ul: dacă webhook-ul nu e
 configurat funcțiile sunt no-op, iar orice eroare de rețea e prinsă și logată.
@@ -18,8 +19,7 @@ _GREEN = 0x2ECC71
 _RED = 0xE74C3C
 _BLUE = 0x3498DB
 _FOOTER = {"text": "Polymarket AI Bot"}
-_MARKETS_PREVIEW = 10      # câte piețe se afișează înainte de truncare
-_MARKETS_TITLE_CAP = 100   # lungime maximă per titlu în listă
+_POSITIONS_PREVIEW = 10    # câte poziții se afișează înainte de truncare
 _DESC_LIMIT = 2000         # plafon caractere pentru descriere (limita webhook-urilor)
 
 
@@ -144,7 +144,7 @@ def notify_portfolio(
         })
 
     embed = {
-        "title": "💰 Status Portofoliu",
+        "title": "💵 Status Financiar",
         "color": _GREEN if unrealized >= 0 else _RED,
         "fields": fields,
         "timestamp": _now_iso(),
@@ -156,9 +156,10 @@ def notify_portfolio(
 def notify_positions(positions: list) -> None:
     """Mesaj 2 — Inventarul pozițiilor deschise, embed separat de statusul financiar.
 
-    Fiecare linie: titlu | outcome | sumă investită | P/L curent. Listă goală →
-    „Nicio poziție deschisă". Plafonat la _DESC_LIMIT caractere (truncat cu „…și încă N").
-    `outcome` vine din reconciliation (câmpul Data API); „—" e doar fallback dacă lipsește.
+    Listă numerotată; fiecare linie: titlu | outcome | sumă investită | P/L curent.
+    Listă goală → „Niciuna." (i.e. „📦 Poziții Active: Niciuna."). Plafonat la
+    _DESC_LIMIT caractere (truncat cu „…și încă N"). `outcome` vine din reconciliation
+    (câmpul Data API); „—" e doar fallback dacă lipsește.
     """
     if not _enabled():
         return
@@ -166,7 +167,7 @@ def notify_positions(positions: list) -> None:
     if not positions:
         _post({
             "title": "📦 Poziții Active",
-            "description": "Nicio poziție deschisă.",
+            "description": "Niciuna.",
             "color": _BLUE,
             "timestamp": _now_iso(),
             "footer": _FOOTER,
@@ -174,15 +175,15 @@ def notify_positions(positions: list) -> None:
         return
 
     ordered = sorted(positions, key=lambda p: p.get("current_value", 0.0), reverse=True)
-    shown = ordered[:_MARKETS_PREVIEW]
+    shown = ordered[:_POSITIONS_PREVIEW]
     lines = []
-    for p in shown:
+    for i, p in enumerate(shown, 1):
         name = str(p.get("asset_name") or "?")[:60]
         outcome = str(p.get("outcome") or "—")
         invested = _money(float(p.get("initial_value", 0.0) or 0.0))
         pnl = float(p.get("cash_pnl", 0.0) or 0.0)
         mark = "🟢" if pnl >= 0 else "🔴"
-        lines.append(f"{mark} {name} | {outcome} | {invested} | {_signed_money(pnl)}")
+        lines.append(f"{i}. {mark} {name} | {outcome} | {invested} | {_signed_money(pnl)}")
     remaining = len(ordered) - len(shown)
     if remaining > 0:
         lines.append(f"…și încă {remaining} poziții")
@@ -198,40 +199,3 @@ def notify_positions(positions: list) -> None:
         "timestamp": _now_iso(),
         "footer": _FOOTER,
     })
-
-
-def notify_markets(markets: list, *, total: int | None = None) -> None:
-    """Listă a piețelor active procesate, trimisă separat de raportul de portofoliu.
-
-    Afișează primele _MARKETS_PREVIEW piețe; dacă sunt mai multe, adaugă
-    „…și încă N piețe". Descrierea e plafonată la _DESC_LIMIT caractere (limita
-    webhook-urilor). Acceptă fie dict-uri de piață (cu 'question'/'title'), fie
-    string-uri. Ca toate notificările: no-op fără webhook și nu ridică excepții.
-    """
-    if not _enabled():
-        return
-
-    titles = [
-        (str(m.get("question") or m.get("title") or "?") if isinstance(m, dict) else str(m))
-        for m in markets
-    ]
-    count = total if total is not None else len(titles)
-
-    shown = titles[:_MARKETS_PREVIEW]
-    lines = [f"{i}. {t[:_MARKETS_TITLE_CAP]}" for i, t in enumerate(shown, 1)]
-    remaining = count - len(shown)
-    if remaining > 0:
-        lines.append(f"…și încă {remaining} piețe")
-
-    description = "\n".join(lines) or "Nicio piață activă."
-    if len(description) > _DESC_LIMIT:
-        description = description[:_DESC_LIMIT - 1] + "…"
-
-    embed = {
-        "title": f"📋 Piețe active procesate ({count})",
-        "description": description,
-        "color": _BLUE,
-        "timestamp": _now_iso(),
-        "footer": _FOOTER,
-    }
-    _post(embed)

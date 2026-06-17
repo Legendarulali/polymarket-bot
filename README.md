@@ -57,9 +57,14 @@ nu este inclus niciodată în imagine (vezi `.dockerignore`).
 | Take-profit | `TAKE_PROFIT_PCT` | 0 (dezactivat — câștigătorii se țin până la rezoluție) |
 | Stop-loss | `STOP_LOSS_PCT` | 0.30 (−30% ≈ preț sub ~0.5 de la o intrare tipică → teză invalidată) |
 
-În plus, hardcodate în `main.py`: volum minim $10k, fereastră de probabilitate
-YES (0.65, 0.90), confidence minim 0.70, max 1–2 poziții per eveniment,
-deduplicare pe token și verificare de balanță înainte de fiecare ordin.
+În plus, configurabile din mediu (cu default-uri în `main.py`): volum minim $10k
+(`MIN_VOLUME_USD`), o fereastră de probabilitate YES **unică** `[0.45, 0.95]`
+(`PROBABILITY_MIN`/`PROBABILITY_MAX`, aceeași pentru meci/outright/general — îl ține
+concentrat pe meciurile competitive și ignoră zgomotul de probabilitate mică; decizia
+reală o ia LLM-ul + pragul de confidence 0.70), max 1–2 poziții per eveniment,
+deduplicare pe token și verificare
+de balanță înainte de fiecare ordin. Meciurile (head-to-head) sunt prioritizate la
+începutul fiecărei scanări.
 
 ## Notificări Discord
 
@@ -67,9 +72,14 @@ Botul poate trimite pe un canal de Discord, prin webhook:
 
 - **Alertă la fiecare BUY / SELL** — piață, preț, size, total, confidence (la BUY)
   sau motivul exit-ului (take-profit / stop-loss, la SELL).
-- **Raport periodic de portofoliu** (implicit la fiecare oră, ca graficul P/L din
-  portofoliul Polymarket): valoare totală (cash + poziții), P/L nerealizat,
-  variația față de ora trecută și față de pornirea botului, plus top poziții.
+- **Raport periodic** (implicit la fiecare oră), trimis ca **2 mesaje grupate**:
+  1. **💵 Status Financiar** — valoare totală (cash + poziții), cash, P/L nerealizat
+     și variația față de ora trecută / pornirea botului.
+  2. **📦 Poziții Active** — inventarul pozițiilor deschise, numerotat (piață ·
+     outcome · sumă investită · P/L), sau „Niciuna." dacă nu există poziții.
+
+Lista piețelor scanate **nu** se trimite pe Discord — rămâne strict în consolă/loguri,
+ca fluxul de Discord să conțină doar tranzacțiile și rapoartele periodice.
 
 | Setare | Variabilă | Default |
 |---|---|---|

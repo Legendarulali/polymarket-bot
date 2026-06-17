@@ -17,7 +17,7 @@ from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market
 from src.allowance import ensure_collateral_approved
 from src.position_manager import check_exit_conditions
-from src.notifications import notify_trade, notify_portfolio, notify_positions, notify_markets
+from src.notifications import notify_trade, notify_portfolio, notify_positions
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +40,13 @@ _INTER_ANALYSIS_DELAY = 3                                        # secunde throt
 _MIN_BALANCE_PUSD = 1.0
 _MIN_CONFIDENCE = 0.70
 _MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "10000"))  # Ignoră piețele sub acest volum ($)
-_MIN_PROBABILITY = 0.65          # Ignoră dacă probabilitatea YES e prea joasă
-_MAX_PROBABILITY = 0.90          # Ignoră dacă probabilitatea YES e prea certă
-# Meciurile head-to-head sunt mult mai competitive (probabilități medii), deci
-# au o fereastră de probabilitate lărgită față de restul piețelor.
-_MATCH_MIN_PROBABILITY = 0.45
-_MATCH_MAX_PROBABILITY = 0.95
+# Fereastră de probabilitate YES UNICĂ pentru toate tipurile de piață (meci,
+# outright, general): [0.45, 0.95]. Ține botul concentrat pe meciurile
+# competitive (probabilități medii-mari) și ignoră „zgomotul" de probabilitate
+# foarte mică, lăsând decizia reală pe seama LLM-ului + pragului de confidence.
+# Configurabilă din mediu (PROBABILITY_MIN / PROBABILITY_MAX).
+_MIN_PROBABILITY = float(os.getenv("PROBABILITY_MIN", "0.45"))  # Ignoră probabilitățile YES prea mici (zgomot)
+_MAX_PROBABILITY = float(os.getenv("PROBABILITY_MAX", "0.95"))  # Ignoră dacă probabilitatea YES e quasi-certă
 _MAX_POSITIONS_PER_EVENT = 2     # Max poziții per event_id (piețe generale)
 _MAX_OUTRIGHT_PER_EVENT = 1      # Max poziții pe piețe de tip "outright winner"
 
@@ -63,9 +64,6 @@ _analyzed_history: dict[str, float] = {}
 _last_pnl_report_ts: float = 0.0
 _last_report_value: float | None = None
 _session_start_value: float | None = None
-# Semnătura ultimei liste de poziții trimise — lista se retrimite doar la schimbarea
-# inventarului (poziții deschise/închise/redimensionate), ca să nu facă spam.
-_last_positions_sig: str | None = None
 
 # Statistici de filtrare per scanare (motiv → câte piețe). Resetat la fiecare buclă;
 # logate ca sumar după scanare pentru a vedea de ce sunt „ignorate" piețele.
@@ -106,6 +104,14 @@ def _classify_market(title: str, slug: str = "") -> str:
 
     # 3) Restul (politice, generale).
     return "general"
+
+
+def _is_match_market(market: dict) -> bool:
+    """True dacă piața e de tip meci (head-to-head). Folosit pentru a prioritiza
+    meciurile (adesea iminente) la începutul cozii de scanare."""
+    return _classify_market(
+        market.get("question") or market.get("title") or "", market.get("slug", "")
+    ) == "match"
 
 
 def handle_shutdown(signum, frame):
@@ -351,17 +357,13 @@ def _extract_event_id(market: dict) -> str:
     )
 
 
-def _positions_signature(positions: list) -> str:
-    """Semnătură stabilă a inventarului (token_id + size), pentru detecția de modificări."""
-    return "|".join(sorted(
-        f"{p.get('token_id', '')}:{round(float(p.get('size', 0) or 0), 2)}" for p in positions
-    ))
-
-
 def _maybe_send_pnl_report(account_state: dict) -> None:
-    """Notificările de portofoliu pe Discord, la fiecare PNL_REPORT_INTERVAL_HOURS:
-    1) statusul financiar (mereu), 2) lista de poziții (doar dacă inventarul s-a schimbat)."""
-    global _last_pnl_report_ts, _last_report_value, _session_start_value, _last_positions_sig
+    """Raportul periodic de portofoliu pe Discord, în 2 mesaje grupate, trimise
+    o singură dată la fiecare PNL_REPORT_INTERVAL_HOURS (NU la fiecare buclă):
+      1) status financiar (cash, P/L, valoare totală),
+      2) inventarul pozițiilor deschise (sau „Niciuna").
+    Ambele se trimit la fiecare interval, ca raportarea să fie predictibilă."""
+    global _last_pnl_report_ts, _last_report_value, _session_start_value
 
     interval_h = settings.PNL_REPORT_INTERVAL_HOURS
     if interval_h <= 0 or not settings.DISCORD_WEBHOOK_URL:
@@ -380,19 +382,14 @@ def _maybe_send_pnl_report(account_state: dict) -> None:
         summary["total_value"], summary["cash"], summary["positions_value"],
         summary["unrealized_pnl"], summary["n_positions"],
     )
-    # 1) Status financiar (mereu, la interval).
+    # Mesaj 1: status financiar.
     notify_portfolio(
         summary,
         prev_total=_last_report_value,
         session_start_total=_session_start_value,
     )
-
-    # 2) Lista de poziții — doar dacă inventarul s-a schimbat (anti-spam).
-    positions = summary.get("positions", [])
-    sig = _positions_signature(positions)
-    if sig != _last_positions_sig:
-        notify_positions(positions)
-        _last_positions_sig = sig
+    # Mesaj 2: inventarul pozițiilor deschise (sau „Niciuna").
+    notify_positions(summary.get("positions", []))
 
     _last_report_value = summary["total_value"]
     _last_pnl_report_ts = now
@@ -437,17 +434,16 @@ def process_market(market: dict, account_state: dict) -> None:
         )
         return
 
-    # --- FILTRU 2: Fereastra de probabilitate (lărgită pentru meciuri) ---
-    # Meciurile sunt mult mai competitive, deci fereastra e relaxată la
-    # [0.45, 0.95] față de [0.65, 0.90] pentru restul piețelor.
+    # --- FILTRU 2: Fereastra de probabilitate (unică pentru toate tipurile) ---
+    # Fereastră [0.45, 0.95]: concentrează botul pe meciurile competitive și
+    # ignoră zgomotul de probabilitate foarte mică. Decizia reală rămâne la
+    # LLM + pragul de confidence.
     yes_price_raw = _current_price(market, "YES")
-    prob_min = _MATCH_MIN_PROBABILITY if market_type == "match" else _MIN_PROBABILITY
-    prob_max = _MATCH_MAX_PROBABILITY if market_type == "match" else _MAX_PROBABILITY
-    if not (prob_min < yes_price_raw < prob_max):
+    if not (_MIN_PROBABILITY < yes_price_raw < _MAX_PROBABILITY):
         _scan_stats["probabilitate în afara ferestrei"] += 1
         logger.info(
             "[FILTER] Ignor piața '%s' [%s] (Probabilitate YES=%.2f în afara ferestrei [%.2f, %.2f]).",
-            title[:60], type_label, yes_price_raw, prob_min, prob_max,
+            title[:60], type_label, yes_price_raw, _MIN_PROBABILITY, _MAX_PROBABILITY,
         )
         return
 
@@ -734,8 +730,17 @@ def main() -> None:
                 _interruptible_sleep(_LOOP_INTERVAL)
                 continue
 
+            # Amestecă, apoi prioritizează meciurile (head-to-head, adesea iminente):
+            # un sort STABIL le aduce în față, păstrând ordinea aleatorie în interiorul
+            # fiecărui grup. Astfel meciurile sunt analizate înaintea limitelor de
+            # poziții/balanță sau a throttle-ului care s-ar putea atinge în timpul scanării.
             random.shuffle(markets)
-            logger.info("[Agent] Procesez %d piețe active (ordine aleatorie).", len(markets))
+            markets.sort(key=lambda m: not _is_match_market(m))
+            n_matches = sum(1 for m in markets if _is_match_market(m))
+            logger.info(
+                "[Agent] Procesez %d piețe active (%d meciuri prioritizate la început).",
+                len(markets), n_matches,
+            )
             _scan_stats.clear()
             for market in markets:
                 if not RUNNING:
@@ -758,13 +763,11 @@ def main() -> None:
 
             # Sumar de filtrare: ce a oprit piețele. Cheia pentru a vedea DE CE
             # „ignoră" botul tot — ex: {'volum mic': 195, 'analizate (LLM)': 3}.
+            # Lista piețelor scanate rămâne STRICT în consolă/loguri (vezi logurile
+            # „[Agent] Procesez piața ..." de mai sus) — pe Discord nu se trimite
+            # nimic per buclă, doar raportul periodic din _maybe_send_pnl_report.
             logger.info("[Scan] Rezultat filtrare pe %d piețe: %s",
                         len(markets), dict(_scan_stats) or "nimic procesat")
-
-            # După scanare: lista piețelor procesate, ca mesaj Discord separat de
-            # raportul de portofoliu (păstrează contextul curat). Toggle din config.
-            if settings.NOTIFY_MARKETS:
-                notify_markets(markets)
 
             _interruptible_sleep(_LOOP_INTERVAL)
 

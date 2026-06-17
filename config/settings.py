@@ -55,9 +55,6 @@ class Settings:
     DISCORD_WEBHOOK_URL: str = os.getenv("DISCORD_WEBHOOK_URL", "")
     # Interval raport portofoliu pe Discord, în ore (0 = dezactivat raportul orar).
     PNL_REPORT_INTERVAL_HOURS: float = float(os.getenv("PNL_REPORT_INTERVAL_HOURS", "1"))
-    # Trimite pe Discord lista piețelor procesate după fiecare scanare (separat de
-    # raportul de portofoliu). Necesită și DISCORD_WEBHOOK_URL setat.
-    NOTIFY_MARKETS: bool = os.getenv("NOTIFY_MARKETS", "true").strip().lower() in ("1", "true", "yes", "on")
 
 settings = Settings()
 
