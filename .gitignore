@@ -42,6 +42,9 @@ ENV/
 *.log
 logs/
 
+# Bot state (istoric persistent al piețelor analizate)
+history.json*
+
 # OS
 .DS_Store
 Thumbs.db

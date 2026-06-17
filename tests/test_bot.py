@@ -363,12 +363,14 @@ class TestProcessMarketStateTracking:
 
     def _run(self, market, account_state, decision=None, order_result=None, live_ask=None):
         import main
-        main._analysis_cache.clear()
         decision = decision or {"trade": True, "outcome": "YES", "confidence": 0.9, "reason": "test"}
         order_result = order_result or {"success": True, "order_id": "oid-1"}
 
+        # _record_analyzed is patched out so process_market does not touch history.json;
+        # history persistence is covered separately by TestAnalyzedHistory.
         with patch("main.fetch_free_news", return_value=[]), \
              patch("main.analyse_market", return_value=decision), \
+             patch("main._record_analyzed"), \
              patch("main._live_best_ask", return_value=live_ask), \
              patch("main.place_limit_order", return_value=order_result) as mock_order:
             main.process_market(market, account_state)
@@ -727,3 +729,69 @@ class TestNotifications:
              patch("src.notifications.requests.post", side_effect=Exception("boom")):
             # Must not raise — trading should never break on a Discord failure
             notifications.notify_trade("BUY", "Market", 0.8, 6.0, 5.0)
+
+
+# ---------------------------------------------------------------------------
+# Tests: persistent analyzed-markets history (history.json)
+# ---------------------------------------------------------------------------
+
+class TestAnalyzedHistory:
+    """_load_history / _save_history / _record_analyzed / _is_recently_analyzed."""
+
+    def _fresh_main(self, monkeypatch, tmp_path):
+        import importlib, sys
+        if "main" not in sys.modules:
+            importlib.import_module("main")
+        import main
+        hist_file = tmp_path / "history.json"
+        monkeypatch.setattr(main, "_HISTORY_FILE", str(hist_file))
+        monkeypatch.setattr(main, "_analyzed_history", {})
+        return main, hist_file
+
+    def test_record_then_recently_analyzed(self, monkeypatch, tmp_path):
+        main, hist_file = self._fresh_main(monkeypatch, tmp_path)
+        assert main._is_recently_analyzed("m1") is False
+        main._record_analyzed("m1")
+        assert main._is_recently_analyzed("m1") is True
+        assert hist_file.exists()  # persisted to disk
+
+    def test_save_load_roundtrip_survives_restart(self, monkeypatch, tmp_path):
+        main, _ = self._fresh_main(monkeypatch, tmp_path)
+        main._record_analyzed("m1")
+        main._record_analyzed("m2")
+        monkeypatch.setattr(main, "_analyzed_history", {})  # simulate process restart
+        main._load_history()
+        assert main._is_recently_analyzed("m1") is True
+        assert main._is_recently_analyzed("m2") is True
+
+    def test_expired_entries_pruned_on_load(self, monkeypatch, tmp_path):
+        import json, time
+        main, hist_file = self._fresh_main(monkeypatch, tmp_path)
+        now = time.time()
+        hist_file.write_text(json.dumps({
+            "old": now - main._CACHE_TTL_SECONDS - 10,
+            "fresh": now,
+        }), encoding="utf-8")
+        main._load_history()
+        assert main._is_recently_analyzed("fresh") is True
+        assert main._is_recently_analyzed("old") is False
+        assert "old" not in main._analyzed_history
+
+    def test_list_format_supported(self, monkeypatch, tmp_path):
+        import json
+        main, hist_file = self._fresh_main(monkeypatch, tmp_path)
+        hist_file.write_text(json.dumps(["a", "b"]), encoding="utf-8")
+        main._load_history()
+        assert main._is_recently_analyzed("a") is True
+        assert main._is_recently_analyzed("b") is True
+
+    def test_missing_file_starts_empty(self, monkeypatch, tmp_path):
+        main, _ = self._fresh_main(monkeypatch, tmp_path)
+        main._load_history()
+        assert main._analyzed_history == {}
+
+    def test_corrupt_file_starts_empty(self, monkeypatch, tmp_path):
+        main, hist_file = self._fresh_main(monkeypatch, tmp_path)
+        hist_file.write_text("{not valid json", encoding="utf-8")
+        main._load_history()
+        assert main._analyzed_history == {}

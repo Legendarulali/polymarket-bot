@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import time
 import sys
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 RUNNING = True
 _LOOP_INTERVAL = 60          # secunde între iterații normale
 _LOW_BALANCE_SLEEP = 15 * 60  # 15 minute sleep când balanța e insuficientă
-_CACHE_TTL_SECONDS = 4 * 3600 # re-analizează o piață max o dată la 4 ore
+_CACHE_TTL_SECONDS = 4 * 3600 # cooldown: re-analizează o piață cel mult o dată la 4h (persistat în history.json)
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 _MIN_BALANCE_PUSD = 1.0
 _MIN_CONFIDENCE = 0.70
@@ -32,8 +33,11 @@ _MAX_PROBABILITY = 0.90          # Ignoră dacă probabilitatea YES e prea cert�
 _MAX_POSITIONS_PER_EVENT = 2     # Max poziții per event_id (piețe generale)
 _MAX_OUTRIGHT_PER_EVENT = 1      # Max poziții pe piețe de tip "outright winner"
 
-# Cache în memorie: {market_id: (timestamp_float, decision_dict)}
-_analysis_cache: dict[str, tuple[float, dict]] = {}
+# Istoric persistent al piețelor analizate: {market_id: timestamp_float}.
+# Încărcat din _HISTORY_FILE la pornire; folosit pentru a filtra piețele
+# analizate în ultimele _CACHE_TTL_SECONDS înainte de procesare.
+_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.json")
+_analyzed_history: dict[str, float] = {}
 
 # Stare raport orar P/L pe Discord (ts=0 → primul raport e trimis imediat la pornire)
 _last_pnl_report_ts: float = 0.0
@@ -165,24 +169,68 @@ def _live_best_ask(token_id: str) -> float | None:
         return None
 
 
-def _get_cached_decision(market_id: str) -> dict | None:
-    """Returnează decizia din cache dacă există și nu a expirat, altfel None."""
-    entry = _analysis_cache.get(market_id)
-    if entry is None:
-        return None
-    timestamp, decision = entry
-    age = time.time() - timestamp
-    if age < _CACHE_TTL_SECONDS:
-        remaining_h = (_CACHE_TTL_SECONDS - age) / 3600
-        logger.info(
-            "[Agent] Cache hit pentru piața id=%s (expiră în %.1fh). Skip LLM.",
-            market_id,
-            remaining_h,
-        )
-        return decision
-    # expirat — șterge intrarea
-    del _analysis_cache[market_id]
-    return None
+def _load_history() -> None:
+    """Încarcă istoricul piețelor analizate din history.json (prima instrucțiune la rulare).
+
+    Intrările mai vechi decât _CACHE_TTL_SECONDS sunt eliminate la încărcare, pentru
+    a limita creșterea fișierului. Acceptă atât formatul {id: timestamp} cât și o
+    listă simplă de ID-uri (considerate analizate „acum").
+    """
+    global _analyzed_history
+    now = time.time()
+    try:
+        with open(_HISTORY_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        _analyzed_history = {}
+        logger.info("[History] %s inexistent — pornesc cu istoric gol.", _HISTORY_FILE)
+        return
+    except (json.JSONDecodeError, OSError) as exc:
+        _analyzed_history = {}
+        logger.warning("[History] Nu am putut citi %s (%s) — pornesc cu istoric gol.", _HISTORY_FILE, exc)
+        return
+
+    parsed: dict[str, float] = {}
+    if isinstance(raw, dict):
+        for mid, ts in raw.items():
+            try:
+                parsed[str(mid)] = float(ts)
+            except (ValueError, TypeError):
+                continue
+    elif isinstance(raw, list):
+        parsed = {str(mid): now for mid in raw}
+
+    _analyzed_history = {mid: ts for mid, ts in parsed.items() if now - ts < _CACHE_TTL_SECONDS}
+    expired = len(parsed) - len(_analyzed_history)
+    logger.info(
+        "[History] Încărcate %d piețe analizate recent din %s (%d expirate, ignorate).",
+        len(_analyzed_history), _HISTORY_FILE, expired,
+    )
+    if expired:
+        _save_history()  # rescrie fișierul curățat de intrările expirate
+
+
+def _save_history() -> None:
+    """Persistă istoricul piețelor analizate în history.json (scriere atomică)."""
+    tmp = f"{_HISTORY_FILE}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(_analyzed_history, fh)
+        os.replace(tmp, _HISTORY_FILE)
+    except OSError as exc:
+        logger.warning("[History] Nu am putut salva %s: %s", _HISTORY_FILE, exc)
+
+
+def _is_recently_analyzed(market_id: str) -> bool:
+    """True dacă piața a fost analizată în ultimele _CACHE_TTL_SECONDS (cooldown activ)."""
+    ts = _analyzed_history.get(market_id)
+    return ts is not None and (time.time() - ts) < _CACHE_TTL_SECONDS
+
+
+def _record_analyzed(market_id: str) -> None:
+    """Marchează o piață ca analizată acum și persistă imediat istoricul."""
+    _analyzed_history[market_id] = time.time()
+    _save_history()
 
 
 def _extract_event_id(market: dict) -> str:
@@ -300,24 +348,22 @@ def process_market(market: dict, account_state: dict) -> None:
             )
             return
 
-    # Pas 1: Verificare cache — evită apeluri repetate la Groq pentru aceeași piață
-    decision = _get_cached_decision(market_id)
+    # Pas 1: Culegere știri + analiză AI via Groq.
+    # Piețele analizate recent sunt deja filtrate din lista de intrare (history.json),
+    # deci aici ajung doar piețe care chiar trebuie (re)analizate.
+    news = fetch_free_news(query=title[:100])
+    logger.info("[Agent] %d știri găsite pentru '%s'.", len(news), title[:50])
 
-    if decision is None:
-        # Pas 2: Culegere știri + analiză AI via Groq (doar dacă nu e în cache)
-        news = fetch_free_news(query=title[:100])
-        logger.info("[Agent] %d știri găsite pentru '%s'.", len(news), title[:50])
+    yes_price = _current_price(market, "YES")
+    decision = analyse_market(title, yes_price, news)
 
-        yes_price = _current_price(market, "YES")
-        decision = analyse_market(title, yes_price, news)
-
-        # Stochează în cache imediat după analiză reușită
-        _analysis_cache[market_id] = (time.time(), decision)
-        logger.info(
-            "[Agent] Decizie AI stocată în cache pentru piața id=%s (TTL=%dh).",
-            market_id,
-            _CACHE_TTL_SECONDS // 3600,
-        )
+    # Înregistrează piața ca analizată și persistă imediat (cooldown=_CACHE_TTL_SECONDS).
+    _record_analyzed(str(market_id))
+    logger.info(
+        "[Agent] Piață id=%s marcată ca analizată în history.json (cooldown=%dh).",
+        market_id,
+        _CACHE_TTL_SECONDS // 3600,
+    )
 
     logger.info(
         "[Agent] Decizie AI: trade=%s | outcome=%s | confidence=%.2f | reason=%s",
@@ -447,6 +493,8 @@ def process_market(market: dict, account_state: dict) -> None:
 
 
 def main() -> None:
+    _load_history()  # prima instrucțiune la rulare: încarcă history.json (piețe deja analizate)
+
     logger.info(
         "Polymarket AI Agent starting | host=%s | chain_id=%d | funder=%s",
         settings.CLOB_HOST,
@@ -540,6 +588,21 @@ def main() -> None:
             markets = fetch_active_markets(limit=30)
             if not markets:
                 logger.warning("[Agent] Nicio piață activă găsită. Aștept...")
+                _interruptible_sleep(_LOOP_INTERVAL)
+                continue
+
+            # Filtrare pe baza istoricului persistent (history.json) ÎNAINTE de procesare:
+            # ignoră piețele analizate în ultimele _CACHE_TTL_SECONDS (cooldown).
+            total_fetched = len(markets)
+            markets = [m for m in markets if not _is_recently_analyzed(str(m.get("id", "?")))]
+            skipped = total_fetched - len(markets)
+            if skipped:
+                logger.info(
+                    "[History] %d/%d piețe deja analizate recent — filtrate. Rămân %d.",
+                    skipped, total_fetched, len(markets),
+                )
+            if not markets:
+                logger.info("[Agent] Toate piețele active au fost analizate recent. Aștept...")
                 _interruptible_sleep(_LOOP_INTERVAL)
                 continue
 
