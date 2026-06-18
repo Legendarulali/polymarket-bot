@@ -28,7 +28,11 @@ _LOW_BALANCE_SLEEP = 15 * 60  # 15 minute sleep când balanța e insuficientă
 _CACHE_TTL_SECONDS = 4 * 3600 # cooldown: re-analizează o piață cel mult o dată la 4h (persistat în history.json)
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 _GAMMA_PAGE_SIZE = 100                                           # piețe per pagină la paginare Gamma
-_MARKET_SCAN_LIMIT = int(os.getenv("MARKET_SCAN_LIMIT", "200"))  # plafon piețe scanate per buclă
+# Plafon OPȚIONAL de siguranță pe câte piețe se preiau per buclă. 0 (implicit) =
+# fără plafon → paginarea dinamică preia TOATE piețele active până când API-ul
+# întoarce o pagină goală/parțială. Setează-l (ex. 2000) doar ca să limitezi
+# numărul de cereri către Gamma pe rețele lente/cu rate-limit agresiv.
+_MARKET_SCAN_LIMIT = int(os.getenv("MARKET_SCAN_LIMIT", "0"))
 # Sortare Gamma (câmp + direcție). Gol = ordinea implicită a API-ului. Ex:
 # GAMMA_ORDER=volumeNum (lichide întâi) sau GAMMA_ORDER=startDate (cele mai noi —
 # utile pentru meciurile create azi). Dacă valoarea e respinsă, se reia fără sortare.
@@ -152,53 +156,62 @@ def _fetch_markets_page(params: dict) -> list | None:
         return None
 
 
-def _collect_active_markets(extra_params: dict, limit: int, seen_ids: set, out: list) -> None:
-    """Paginează Gamma /markets (offset) și adaugă în `out` piețe noi (deduplicate după id),
-    până la `limit` piețe adăugate din acest pas. Oprește la prima eroare sau pagină goală.
+def _collect_active_markets(extra_params: dict, seen_ids: set, out: list, cap: int = 0) -> None:
+    """Paginează DINAMIC Gamma /markets și adaugă în `out` TOATE piețele noi
+    (deduplicate după id), incrementând offset-ul cu _GAMMA_PAGE_SIZE la fiecare
+    pas, până când API-ul întoarce o listă goală sau o pagină parțială (mai
+    puține rezultate decât o pagină completă). Oprește și la prima eroare.
+
+    Între cereri se inserează o mică pauză (time.sleep) pentru a evita rate-limit
+    (HTTP 429). `cap` > 0 = plafon opțional de siguranță pe totalul din `out`
+    (0 = fără plafon, preia tot).
 
     Dacă GAMMA_ORDER e setat dar respins de API (non-200), reia pagina FĂRĂ sortare,
     astfel încât o valoare de `order` greșită să nu golească complet scanarea.
     """
     order_params = {"order": _GAMMA_ORDER, "ascending": _GAMMA_ASCENDING} if _GAMMA_ORDER else {}
     offset = 0
-    added = 0
-    while added < limit:
-        page_size = min(_GAMMA_PAGE_SIZE, limit - added)
+    while True:
         base = {"active": "true", "closed": "false",
-                "limit": page_size, "offset": offset, **extra_params}
+                "limit": _GAMMA_PAGE_SIZE, "offset": offset, **extra_params}
         page = _fetch_markets_page({**base, **order_params})
         if page is None and order_params:
             logger.warning("[Agent] Reîncerc fără 'order=%s' (posibil nesuportat de Gamma).", _GAMMA_ORDER)
             page = _fetch_markets_page(base)
         if not page:
-            return  # eroare sau nu mai sunt pagini
+            return  # eroare sau listă goală → gata
 
         for m in page:
             mid = str(m.get("id", ""))
             if mid and mid not in seen_ids:
                 seen_ids.add(mid)
                 out.append(m)
-                added += 1
 
-        if len(page) < page_size:
-            return  # ultima pagină (mai puține rezultate decât am cerut)
-        offset += page_size
+        if cap and len(out) >= cap:
+            logger.info("[Agent] Plafon de siguranță MARKET_SCAN_LIMIT=%d atins — opresc paginarea.", cap)
+            return
+        if len(page) < _GAMMA_PAGE_SIZE:
+            return  # ultima pagină (mai puține rezultate decât o pagină completă)
+        offset += _GAMMA_PAGE_SIZE
+        time.sleep(0.1)  # mică pauză între cereri pentru a evita rate-limit (HTTP 429)
 
 
 def fetch_active_markets(limit: int = _MARKET_SCAN_LIMIT) -> list[dict]:
-    """Preia piețe active din Gamma, paginat (offset) și deduplicat după id.
+    """Preia DINAMIC toate piețele active din Gamma, paginat (offset) și
+    deduplicat după id, până când API-ul nu mai întoarce rezultate.
 
     Paginarea aduce și meciurile individuale (head-to-head), care altfel sunt
     îngropate sub piețele mari de tip outright în primele ~30 de rezultate.
     Opțional, face un deep-scan suplimentar pe tag-urile din GAMMA_TAG_IDS
     (ex: fotbal / FIFA World Cup), ca meciurile de azi să nu fie ratate.
+    `limit` > 0 = plafon opțional de siguranță (0 = fără plafon, preia tot).
     """
     seen_ids: set = set()
     markets: list[dict] = []
-    _collect_active_markets({}, limit, seen_ids, markets)
+    _collect_active_markets({}, seen_ids, markets, cap=limit)
     for tag_id in _GAMMA_TAG_IDS:
-        _collect_active_markets({"tag_id": tag_id}, _GAMMA_PAGE_SIZE, seen_ids, markets)
-    logger.info("[Agent] Gamma: %d piețe active preluate (paginat, %d tag-uri deep-scan).",
+        _collect_active_markets({"tag_id": tag_id}, seen_ids, markets, cap=limit)
+    logger.info("[Agent] Gamma: %d piețe active preluate (paginat dinamic, %d tag-uri deep-scan).",
                 len(markets), len(_GAMMA_TAG_IDS))
     return markets
 

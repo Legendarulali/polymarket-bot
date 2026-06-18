@@ -1027,6 +1027,52 @@ class TestFetchActiveMarkets:
         assert any("order" not in p for p in seen)     # then retried without it
         assert [m["id"] for m in out] == ["1"]
 
+    def test_paginates_dynamically_beyond_200(self, monkeypatch):
+        # Fără plafon (implicit), paginarea continuă dincolo de vechiul cap de 200:
+        # 4 pagini (100+100+100+30 = 330) până la pagina parțială.
+        import main
+        sleeps = []
+        monkeypatch.setattr(main.time, "sleep", lambda s: sleeps.append(s))
+        pages = [
+            [{"id": str(i)} for i in range(0, 100)],
+            [{"id": str(i)} for i in range(100, 200)],
+            [{"id": str(i)} for i in range(200, 300)],
+            [{"id": str(i)} for i in range(300, 330)],
+        ]
+        seen_offsets = []
+
+        def fake_get(url, params=None, timeout=None):
+            seen_offsets.append(params["offset"])
+            idx = len(seen_offsets) - 1
+            return self._resp(pages[idx]) if idx < len(pages) else self._resp([])
+
+        monkeypatch.setattr(main.httpx, "get", fake_get)
+        out = main.fetch_active_markets()              # limit=0 → fără plafon
+        assert len(out) == 330                          # toate cele 4 pagini (> 200)
+        assert seen_offsets == [0, 100, 200, 300]       # offset += 100 pe iterație
+        assert sleeps == [0.1, 0.1, 0.1]                # pauză între cereri, nu după ultima
+
+    def test_safety_cap_stops_pagination_early(self, monkeypatch):
+        # MARKET_SCAN_LIMIT > 0 = plafon opțional: oprește după pagina care îl atinge.
+        import main
+        monkeypatch.setattr(main.time, "sleep", lambda *a: None)
+        pages = [
+            [{"id": str(i)} for i in range(0, 100)],
+            [{"id": str(i)} for i in range(100, 200)],
+            [{"id": str(i)} for i in range(200, 300)],
+        ]
+        calls = {"n": 0}
+
+        def fake_get(url, params=None, timeout=None):
+            i = calls["n"]
+            calls["n"] += 1
+            return self._resp(pages[i]) if i < len(pages) else self._resp([])
+
+        monkeypatch.setattr(main.httpx, "get", fake_get)
+        out = main.fetch_active_markets(limit=150)     # plafon de siguranță
+        assert len(out) == 200                          # se oprește la pagina care atinge ≥150
+        assert calls["n"] == 2                          # doar 2 cereri, nu a treia
+
 
 # ---------------------------------------------------------------------------
 # Tests: positions inventory webhook (Mesaj 2)
