@@ -44,6 +44,8 @@ Env-driven via `config/settings.py` (loads `.env`). It **raises at import time**
 
   `_execute_trade` is the shared tail: `confidence ≥ 0.70` is gated by the caller, then balance / duplicate-token / slippage checks → `place_limit_order` → `notify_trade`. Each filter bumps a `_scan_stats` counter; the loop logs a per-scan `[Scan] Rezultat filtrare ...` summary so you can see *why* markets are skipped → record to `history.json`.
 
+**Log verbosity (Railway 500 logs/s rate limit):** the per-market lines — `[Agent] Procesez piața ...` (fired for *every* market) and every per-market `[FILTER] Ignor ...` skip — are at **DEBUG**, so at the default `LOG_LEVEL=INFO` they don't emit. The aggregate `[Scan] Rezultat filtrare ...` summary, the `[Meci]` 1X2-odds line, news-found, the AI decision, `[TRADE]`, and all warnings/errors stay at INFO. The cheap-filter inner loop intentionally has **no per-market sleep** (only a 3 s throttle *after a real LLM call*), so INFO must stay quiet there or a single scan of thousands of markets bursts past the rate limit; set `LOG_LEVEL=DEBUG` to see the per-market detail again. The outer loop already cools down `_LOOP_INTERVAL` (60 s) at the end of every iteration and on every `continue`.
+
 **Module map:**
 - `config/settings.py` — `Settings` singleton + root logging config.
 - `src/clob_client.py` — singleton `ClobClient` via `get_clob_client()` (never construct directly). Explicit-creds mode (proxy, sig_type 3) vs derive mode. `get_signature_type()` centralizes the signature type used elsewhere.

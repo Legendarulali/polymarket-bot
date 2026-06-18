@@ -453,7 +453,10 @@ def process_market(market: dict, account_state: dict) -> None:
     market_type = _classify_market(title, market.get("slug", ""))
     type_label = _TYPE_LABELS.get(market_type, market_type)
 
-    logger.info("[Agent] Procesez piața id=%s [Tip: %s]: %s", market_id, type_label, title[:80])
+    # Log de nivel DEBUG: se emite o linie per FIECARE piață scanată (mii/buclă).
+    # La INFO ar inunda Railway (rate-limit 500 loguri/s) — vezi sumarul [Scan] de
+    # la finalul buclei pentru imaginea de ansamblu.
+    logger.debug("[Agent] Procesez piața id=%s [Tip: %s]: %s", market_id, type_label, title[:80])
 
     # Limita globală de poziții se re-verifică per piață: în aceeași iterație
     # pot fi deschise mai multe poziții noi, iar verificarea din bucla main
@@ -463,7 +466,7 @@ def process_market(market: dict, account_state: dict) -> None:
         and len(active_positions) >= settings.MAX_ACTIVE_POSITIONS
     ):
         _scan_stats["expunere maximă"] += 1
-        logger.info(
+        logger.debug(
             "[FILTER] Limită de expunere atinsă (%d/%d poziții). Skip piața '%s'.",
             len(active_positions), settings.MAX_ACTIVE_POSITIONS, title[:60],
         )
@@ -473,7 +476,7 @@ def process_market(market: dict, account_state: dict) -> None:
     # dezactivat — botul e universal și procesează toate tipurile de piață. ---
     if _FOOTBALL_ONLY and market_type != "match":
         _scan_stats["non-meci (outright/general)"] += 1
-        logger.info(
+        logger.debug(
             "[FILTER] Ignor piața '%s' [%s] — FOOTBALL_ONLY activ, nu e meci 1X2.",
             title[:60], type_label,
         )
@@ -487,7 +490,7 @@ def process_market(market: dict, account_state: dict) -> None:
         pass
     if volume < _MIN_VOLUME_USD:
         _scan_stats["volum mic"] += 1
-        logger.info(
+        logger.debug(
             "[FILTER] Ignor piața '%s' [%s] (Volum prea mic: $%.0f < $%.0f).",
             title[:60], type_label, volume, _MIN_VOLUME_USD,
         )
@@ -502,7 +505,7 @@ def process_market(market: dict, account_state: dict) -> None:
         if parsed:
             _process_match_1x2(market, account_state, parsed, event_id, title, market_id)
             return
-        logger.info(
+        logger.debug(
             "[Meci] '%s' nu e structurat 1X2 (rezultate binare) — folosesc fluxul YES/NO.",
             title[:60],
         )
@@ -534,7 +537,7 @@ def _process_match_1x2(
     ]
     if not candidates:
         _scan_stats["probabilitate în afara ferestrei"] += 1
-        logger.info(
+        logger.debug(
             "[FILTER] Ignor meciul '%s' — niciun rezultat 1X2 în fereastra [%.2f, %.2f] (%s).",
             parsed["label"], _MIN_PROBABILITY, _MAX_PROBABILITY, format_legs(parsed),
         )
@@ -548,7 +551,7 @@ def _process_match_1x2(
 
     _record_analyzed(str(market_id))
     _scan_stats["analizate (LLM)"] += 1
-    logger.info(
+    logger.debug(
         "[Agent] Piață id=%s marcată ca analizată în history.json (cooldown=%dh).",
         market_id, _CACHE_TTL_SECONDS // 3600,
     )
@@ -599,7 +602,7 @@ def _process_legacy_binary(
     yes_price_raw = _current_price(market, "YES")
     if not (_MIN_PROBABILITY < yes_price_raw < _MAX_PROBABILITY):
         _scan_stats["probabilitate în afara ferestrei"] += 1
-        logger.info(
+        logger.debug(
             "[FILTER] Ignor piața '%s' [%s] (Probabilitate YES=%.2f în afara ferestrei [%.2f, %.2f]).",
             title[:60], type_label, yes_price_raw, _MIN_PROBABILITY, _MAX_PROBABILITY,
         )
@@ -613,7 +616,7 @@ def _process_legacy_binary(
         event_positions = sum(1 for pos in active_positions if pos.get("event_id") == event_id)
         if event_positions >= limit:
             _scan_stats["event clustering"] += 1
-            logger.info(
+            logger.debug(
                 "[FILTER] Ignor piața '%s' [%s] (eveniment %s: %d/%d poziții).",
                 title[:60], type_label, event_id, event_positions, limit,
             )
@@ -627,7 +630,7 @@ def _process_legacy_binary(
 
     _record_analyzed(str(market_id))
     _scan_stats["analizate (LLM)"] += 1
-    logger.info(
+    logger.debug(
         "[Agent] Piață id=%s marcată ca analizată în history.json (cooldown=%dh).",
         market_id, _CACHE_TTL_SECONDS // 3600,
     )
