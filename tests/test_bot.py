@@ -973,11 +973,6 @@ class TestProbabilityWindow:
         self._run(self._market("USA vs Iran", ["USA", "Draw", "Iran"],
                                ["0.50", "0.30", "0.20"])).assert_called_once()
 
-    def test_general_market_skipped_in_football_only(self):
-        # Piață generală (nu meci) → ignorată complet în modul focus pe fotbal.
-        self._run(self._market("Will the team win the final?", ["Yes", "No"],
-                               ["0.50", "0.50"])).assert_not_called()
-
     def test_low_probability_noise_blocked(self):
         # Niciun leg ≥ 0.45 → meci „necompetitiv pentru bot", filtrat.
         self._run(self._market("USA vs Iran", ["USA", "Draw", "Iran"],
@@ -1264,10 +1259,14 @@ class TestFootballParsing:
 
 
 # ---------------------------------------------------------------------------
-# Tests: football-only filtering in process_market
+# Tests: market routing (universal default + opt-in football-only)
 # ---------------------------------------------------------------------------
 
-class TestFootballOnlyFilter:
+class TestMarketRouting:
+    """Modul universal (implicit): toate piețele sunt evaluate — fotbalul pe ruta
+    1X2, restul (politice/crypto/generale) pe ruta binară YES/NO. FOOTBALL_ONLY
+    e opt-in (off by default) și, când e activ, ignoră tot ce nu e meci."""
+
     def _match_1x2(self):
         return {
             "id": "m1", "question": "Arsenal vs Chelsea", "volume": "50000",
@@ -1277,8 +1276,30 @@ class TestFootballOnlyFilter:
             "events": [{"slug": "epl-ars-che"}],
         }
 
-    def test_outright_skipped_and_counted(self):
+    def test_non_match_processed_by_default(self):
+        # IMPLICIT (universal): o piață politică NU mai e ignorată — merge pe fluxul
+        # binar YES/NO și ajunge la analiză. (_FOOTBALL_ONLY = False by default.)
         import main
+        market = {
+            "id": "p1", "question": "Will the Democrats win the 2028 election?", "volume": "50000",
+            "outcomes": json.dumps(["Yes", "No"]),
+            "outcomePrices": json.dumps(["0.55", "0.45"]),
+            "clobTokenIds": json.dumps(["0xY", "0xN"]), "events": [{"slug": "us-2028"}],
+        }
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._record_analyzed"), \
+             patch("main.analyse_match") as am, \
+             patch("main.analyse_market",
+                   return_value={"trade": False, "outcome": "NO",
+                                 "confidence": 0.0, "reason": "x"}) as ab:
+            main.process_market(market, {"pusd_balance": 20.0, "active_positions": []})
+        ab.assert_called_once()   # ruta binară (universal) rulează pe piața non-fotbal
+        am.assert_not_called()    # nu e meci 1X2
+
+    def test_outright_skipped_only_when_football_only_enabled(self, monkeypatch):
+        # Opt-in FOOTBALL_ONLY=true: outright-urile sunt ignorate complet.
+        import main
+        monkeypatch.setattr(main, "_FOOTBALL_ONLY", True)
         main._scan_stats.clear()
         market = {
             "id": "o1", "question": "Win the 2026 FIFA World Cup", "volume": "999999",
@@ -1294,6 +1315,24 @@ class TestFootballOnlyFilter:
         mo.assert_not_called()
         assert main._scan_stats["non-meci (outright/general)"] == 1
 
+    def test_outright_processed_when_football_only_disabled(self):
+        # IMPLICIT: același outright e acum procesat (ruta binară), nu aruncat.
+        # Preț 0.55 în fereastra [0.45, 0.95] ca să ajungă la analiză.
+        import main
+        market = {
+            "id": "o2", "question": "Will Brazil win the 2026 FIFA World Cup?", "volume": "999999",
+            "outcomes": json.dumps(["Yes", "No"]),
+            "outcomePrices": json.dumps(["0.55", "0.45"]),
+            "clobTokenIds": json.dumps(["0xY", "0xN"]), "events": [{"slug": "wc-2026"}],
+        }
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._record_analyzed"), \
+             patch("main.analyse_market",
+                   return_value={"trade": False, "outcome": "NO",
+                                 "confidence": 0.0, "reason": "x"}) as ab:
+            main.process_market(market, {"pusd_balance": 20.0, "active_positions": []})
+        ab.assert_called_once()
+
     def test_match_reaches_1x2_analysis(self):
         import main
         with patch("main.fetch_free_news", return_value=[]), \
@@ -1306,23 +1345,6 @@ class TestFootballOnlyFilter:
         # LLM-ul primește exact echipele + candidații, nu outright-uri.
         assert am.call_args.args[0] == "Arsenal"
         assert am.call_args.args[1] == "Chelsea"
-
-    def test_football_only_off_processes_general(self, monkeypatch):
-        import main
-        monkeypatch.setattr(main, "_FOOTBALL_ONLY", False)
-        market = {
-            "id": "g1", "question": "Will it rain in NYC?", "volume": "50000",
-            "outcomes": json.dumps(["Yes", "No"]),
-            "outcomePrices": json.dumps(["0.60", "0.40"]),
-            "clobTokenIds": json.dumps(["0xY", "0xN"]), "events": [{"slug": "nyc"}],
-        }
-        with patch("main.fetch_free_news", return_value=[]), \
-             patch("main._record_analyzed"), \
-             patch("main.analyse_market",
-                   return_value={"trade": False, "outcome": "NO",
-                                 "confidence": 0.0, "reason": "x"}) as ab:
-            main.process_market(market, {"pusd_balance": 20.0, "active_positions": []})
-        ab.assert_called_once()  # fluxul binar moștenit rulează când focusul e oprit
 
     def test_beat_format_binary_match_reaches_analysis(self):
         # „Will France beat Germany?" (Yes/No) nu mai e ignorat: e clasificat meci

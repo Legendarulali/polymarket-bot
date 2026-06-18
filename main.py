@@ -54,11 +54,11 @@ _MIN_PROBABILITY = float(os.getenv("PROBABILITY_MIN", "0.45"))  # Ignoră probab
 _MAX_PROBABILITY = float(os.getenv("PROBABILITY_MAX", "0.95"))  # Ignoră dacă probabilitatea YES e quasi-certă
 _MAX_POSITIONS_PER_EVENT = 2     # Max poziții per event_id (piețe generale)
 _MAX_OUTRIGHT_PER_EVENT = 1      # Max poziții pe piețe de tip "outright winner"
-# Focus exclusiv pe meciuri individuale de fotbal (Match Odds / 1X2): când e
-# activ (implicit), piețele care NU sunt meci head-to-head (outright/câștigător
-# de turneu, politice, generale) sunt ignorate complet — vezi cerința de produs.
-# Pune FOOTBALL_ONLY=false ca să reactivezi fluxul binar YES/NO pe toate tipurile.
-_FOOTBALL_ONLY = os.getenv("FOOTBALL_ONLY", "true").strip().lower() not in ("0", "false", "no", "off")
+# Mod universal (IMPLICIT): botul evaluează TOATE piețele active — politice,
+# crypto, generale ȘI meciuri de fotbal (acestea din urmă pe ruta dedicată 1X2).
+# Opțional, FOOTBALL_ONLY=true restrânge scanarea DOAR la meciuri individuale de
+# fotbal (ignoră complet outright/general) — util în timpul unui turneu.
+_FOOTBALL_ONLY = os.getenv("FOOTBALL_ONLY", "false").strip().lower() in ("1", "true", "yes", "on")
 
 # Istoric persistent al piețelor analizate: {market_id: timestamp_float}.
 # Încărcat din _HISTORY_FILE la pornire; folosit pentru a filtra piețele
@@ -442,10 +442,10 @@ def _maybe_send_pnl_report(account_state: dict) -> None:
 def process_market(market: dict, account_state: dict) -> None:
     """Orchestrează filtrarea unei piețe și decide ruta de analiză.
 
-    Focus pe fotbal (FOOTBALL_ONLY): piețele care nu sunt meci individual sunt
-    ignorate. Meciurile structurate 1X2 (Match Odds) merg pe fluxul dedicat
-    `_process_match_1x2` (rezultate mapate 1/X/2); restul (sau dacă focusul e
-    dezactivat) merg pe fluxul binar YES/NO moștenit."""
+    Mod universal (implicit): toate piețele sunt evaluate. Meciurile structurate
+    1X2 (Match Odds) merg pe fluxul dedicat `_process_match_1x2` (rezultate mapate
+    1/X/2); restul (politice, crypto, generale, outright) merg pe fluxul binar
+    YES/NO moștenit. Opțional, FOOTBALL_ONLY=true ignoră tot ce nu e meci."""
     active_positions: list[dict] = account_state.setdefault("active_positions", [])
 
     title = market.get("question") or market.get("title") or "Unknown market"
@@ -469,11 +469,12 @@ def process_market(market: dict, account_state: dict) -> None:
         )
         return
 
-    # --- FILTRU 0: Doar meciuri de fotbal (exclude outright / câștigător turneu / general) ---
+    # --- FILTRU 0 (OPȚIONAL): mod focus pe fotbal (FOOTBALL_ONLY=true). Implicit
+    # dezactivat — botul e universal și procesează toate tipurile de piață. ---
     if _FOOTBALL_ONLY and market_type != "match":
         _scan_stats["non-meci (outright/general)"] += 1
         logger.info(
-            "[FILTER] Ignor piața '%s' [%s] — nu e meci individual 1X2 (focus pe fotbal).",
+            "[FILTER] Ignor piața '%s' [%s] — FOOTBALL_ONLY activ, nu e meci 1X2.",
             title[:60], type_label,
         )
         return
@@ -781,9 +782,9 @@ def main() -> None:
         settings.FUNDER_ADDRESS,
     )
     logger.info(
-        "Mod focus: %s",
+        "Mod scanare: %s",
         "DOAR meciuri de fotbal (Match Odds / 1X2)" if _FOOTBALL_ONLY
-        else "toate piețele (flux binar YES/NO)",
+        else "universal — toate piețele (fotbal → 1X2, restul → binar YES/NO)",
     )
 
     if settings.OVERRIDE_BALANCE > 0:
