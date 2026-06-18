@@ -36,7 +36,19 @@ _DRAW_NAMES = {"draw", "tie", "x", "empate", "nul", "egalite", "egal"}
 
 # Separatori titlu „Echipă A vs Echipă B", în ordinea priorității.
 _TITLE_SEPARATORS = (" vs. ", " vs ", " v. ", " v ", " versus ")
-_SLUG_SEPARATOR = "-vs-"
+_SLUG_SEPARATORS = ("-vs-", "-v-", "-beat-")
+# Format binar „Will [Echipa A] beat [Echipa B]?": ambii operanzi trebuie să
+# înceapă cu MAJUSCULĂ (nume proprii de echipe), ca să NU confundăm fraze gen
+# „beat expectations" / „defeat inflation" cu un meci. Articol opțional „the".
+_BEAT_RE = re.compile(
+    r"\b([A-Z][\w.&'’-]*(?:\s+[A-Z][\w.&'’-]*)*)\s+(?:to\s+)?"
+    r"(?:beat|beats|defeat|defeats)\s+(?:the\s+)?"
+    r"([A-Z][\w.&'’-]*(?:\s+[A-Z][\w.&'’-]*)*)"
+)
+# Prefix interogativ eliminat înainte de detecția „beat" (plus articolul „the").
+_LEAD_INTERROGATIVE_RE = re.compile(
+    r"^\s*(?:will|can|could|would|does|do|is|are)\s+(?:the\s+)?", re.IGNORECASE
+)
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
@@ -79,10 +91,12 @@ def _strip_prefix(team: str) -> str:
 
 
 def extract_teams(title: str, slug: str = "") -> tuple[str | None, str | None]:
-    """Extrage (gazdă, oaspete) din titlu ('A vs B') sau slug ('a-vs-b').
+    """Extrage (gazdă, oaspete) dintr-un titlu/slug de meci head-to-head.
 
-    Întoarce (None, None) dacă nu se găsește un format head-to-head — caz în care
-    apelantul cade pe numele rezultatelor (outcomes) pentru a deduce echipele.
+    Acoperă: 'A vs B' / 'A v B' / 'A versus B', formatul binar 'Will A beat B?'
+    ('beat'/'defeat', cu operanzi cu majusculă) și slug-uri 'a-vs-b' / 'a-beat-b'.
+    Întoarce (None, None) dacă nu e un format head-to-head — caz în care apelantul
+    cade pe numele rezultatelor (outcomes) pentru a deduce echipele.
     """
     text = str(title or "")
     lowered = text.lower()
@@ -94,15 +108,25 @@ def extract_teams(title: str, slug: str = "") -> tuple[str | None, str | None]:
             if home and away:
                 return home, away
 
-    slug_lower = (slug or "").lower()
-    if _SLUG_SEPARATOR in slug_lower:
-        left, _, right = slug_lower.partition(_SLUG_SEPARATOR)
-        home = _strip_prefix(left.replace("-", " ")).title()
-        # Slug-ul poate avea sufix de dată după echipa oaspete (ex: '...-2026-06-18').
-        right = re.sub(r"[-\s]\d{2,4}([-\s]\d{1,2}){0,2}$", "", right)
-        away = _strip_prefix(right.replace("-", " ")).title()
+    # Format „beat / defeat" (întrebări binare: „Will France beat Germany?").
+    # Eliminăm prefixul interogativ, apoi cerem doi operanzi cu majusculă.
+    match = _BEAT_RE.search(_LEAD_INTERROGATIVE_RE.sub("", text))
+    if match:
+        home = _strip_prefix(match.group(1))
+        away = _strip_prefix(match.group(2))
         if home and away:
             return home, away
+
+    slug_lower = (slug or "").lower()
+    for sep in _SLUG_SEPARATORS:
+        if sep in slug_lower:
+            left, _, right = slug_lower.partition(sep)
+            home = _strip_prefix(left.replace("-", " ")).title()
+            # Slug-ul poate avea sufix de dată după echipa oaspete (ex: '...-2026-06-18').
+            right = re.sub(r"[-\s]\d{2,4}([-\s]\d{1,2}){0,2}$", "", right)
+            away = _strip_prefix(right.replace("-", " ")).title()
+            if home and away:
+                return home, away
 
     return None, None
 

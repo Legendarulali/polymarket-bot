@@ -866,6 +866,41 @@ class TestClassifyMarket:
         import main
         assert main._classify_market("Will it rain in NYC?", "rain-nyc") == "general"
 
+    def test_beat_format_is_match(self):
+        # Formatul binar World Cup „Will [A] beat [B]?" trebuie detectat ca meci.
+        import main
+        assert main._classify_market("Will France beat Germany?", "") == "match"
+
+    def test_defeat_format_is_match(self):
+        import main
+        assert main._classify_market("Will Argentina defeat Brazil?", "") == "match"
+
+    def test_single_v_separator_is_match(self):
+        import main
+        assert main._classify_market("England v Croatia", "") == "match"
+
+    def test_beat_slug_is_match(self):
+        import main
+        assert main._classify_market("Match result", "france-beat-germany") == "match"
+
+    def test_world_cup_winner_question_is_outright(self):
+        # Outright pe termen lung — NU meci.
+        import main
+        assert main._classify_market("Will Germany win the World Cup?", "") == "outright"
+
+    def test_group_winner_is_outright(self):
+        import main
+        assert main._classify_market("Will Brazil win Group A?", "") == "outright"
+
+    def test_advance_prop_is_outright(self):
+        import main
+        assert main._classify_market("Will the USA advance to the knockouts?", "") == "outright"
+
+    def test_beat_with_lowercase_operands_not_match(self):
+        # „beat expectations" / „defeat inflation" NU sunt meciuri (fără nume proprii).
+        import main
+        assert main._classify_market("Will inflation beat expectations?", "") == "general"
+
     def test_world_cup_winner_is_outright(self):
         import main
         assert main._classify_market("Will Brazil win the 2026 FIFA World Cup?", "") == "outright"
@@ -1199,6 +1234,19 @@ class TestFootballParsing:
         from src.football import extract_teams
         assert extract_teams("Will it rain in NYC?") == (None, None)
 
+    def test_extract_teams_beat_format(self):
+        from src.football import extract_teams
+        assert extract_teams("Will France beat Germany?") == ("France", "Germany")
+
+    def test_extract_teams_beat_with_articles_and_multiword(self):
+        from src.football import extract_teams
+        assert extract_teams("Will the Netherlands beat the USA?") == ("Netherlands", "USA")
+        assert extract_teams("Costa Rica defeat Brazil") == ("Costa Rica", "Brazil")
+
+    def test_extract_teams_beat_lowercase_not_teams(self):
+        from src.football import extract_teams
+        assert extract_teams("Will inflation beat expectations?") == (None, None)
+
     def test_extract_teams_from_slug(self):
         from src.football import extract_teams
         home, away = extract_teams("", "arsenal-vs-chelsea-2026-06-18")
@@ -1275,6 +1323,26 @@ class TestFootballOnlyFilter:
                                  "confidence": 0.0, "reason": "x"}) as ab:
             main.process_market(market, {"pusd_balance": 20.0, "active_positions": []})
         ab.assert_called_once()  # fluxul binar moștenit rulează când focusul e oprit
+
+    def test_beat_format_binary_match_reaches_analysis(self):
+        # „Will France beat Germany?" (Yes/No) nu mai e ignorat: e clasificat meci
+        # și rulează pe fluxul binar moștenit (nu e 1X2, deci nu analyse_match).
+        import main
+        market = {
+            "id": "b1", "question": "Will France beat Germany?", "volume": "50000",
+            "outcomes": json.dumps(["Yes", "No"]),
+            "outcomePrices": json.dumps(["0.60", "0.40"]),
+            "clobTokenIds": json.dumps(["0xY", "0xN"]), "events": [{"slug": "wc-fra-ger"}],
+        }
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._record_analyzed"), \
+             patch("main.analyse_match") as am, \
+             patch("main.analyse_market",
+                   return_value={"trade": False, "outcome": "NO",
+                                 "confidence": 0.0, "reason": "x"}) as ab:
+            main.process_market(market, {"pusd_balance": 20.0, "active_positions": []})
+        ab.assert_called_once()   # ruta binară moștenită rulează (meci, dar Yes/No)
+        am.assert_not_called()    # nu e 1X2 → nu folosește analyse_match
 
 
 # ---------------------------------------------------------------------------

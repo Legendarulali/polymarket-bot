@@ -15,7 +15,7 @@ from src.execution import Side, place_limit_order, compute_order_size
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market, analyse_match
-from src.football import parse_match_market, format_legs
+from src.football import parse_match_market, format_legs, extract_teams
 from src.allowance import ensure_collateral_approved
 from src.position_manager import check_exit_conditions
 from src.notifications import notify_trade, notify_portfolio, notify_positions
@@ -80,7 +80,10 @@ _session_start_value: float | None = None
 _scan_stats: Counter = Counter()
 
 _MATCH_KEYWORDS = (" vs ", " vs. ", "match winner")
-_MATCH_SLUG_PATTERNS = ("-vs-", "match-winner")
+_MATCH_SLUG_PATTERNS = ("-vs-", "-v-", "-beat-", "match-winner")
+# Fraze de tip outright / pariu pe termen lung — NU sunt meciuri 1X2 și se exclud
+# din modul focus-fotbal: câștigător de turneu, câștigător/clasare de grupă,
+# avansare, golgheter etc. (verificate DUPĂ detecția de meci, care are precedență).
 _OUTRIGHT_PHRASES = (
     "win the 2026 fifa world cup",
     "win the fifa world cup",
@@ -89,6 +92,19 @@ _OUTRIGHT_PHRASES = (
     "outright winner",
     "championship winner",
     "tournament winner",
+    "win group",            # câștigător de grupă (ex: 'Will Brazil win Group A?')
+    "win their group",
+    "to win the group",
+    "group winner",
+    "group stage winner",
+    "to advance",           # avansare / calificare (prop, nu meci 1X2)
+    "advance to",
+    "to qualify",
+    "reach the final",
+    "reach the knockout",
+    "top goalscorer",
+    "golden boot",
+    "top scorer",
 )
 _TYPE_LABELS = {"match": "Meci", "outright": "Outright", "general": "General"}
 
@@ -98,17 +114,26 @@ def _classify_market(title: str, slug: str = "") -> str:
 
     Ordinea contează: meciul (head-to-head) are PRECEDENȚĂ față de outright, ca
     un titlu de tip 'World Cup Match Winner: USA vs Iran' să fie clasificat MECI,
-    nu câștigător de turneu. 'Win the World Cup' (fără vs / match winner) rămâne
-    outright. Slug-ul prinde meciurile al căror titlu nu are ' vs ' explicit.
+    nu câștigător de turneu. 'Win the World Cup' (fără head-to-head) rămâne
+    outright.
+
+    Detecția de meci e robustă: pe lângă cuvintele-cheie ('vs'/'match winner') și
+    slug, folosește `extract_teams`, care prinde și 'A v B', 'A versus B' și
+    formatul binar 'Will A beat B?' (curent la meciurile World Cup pe Polymarket).
     """
     lower = title.lower()
     slug_lower = (slug or "").lower()
 
-    # 1) Meci individual (head-to-head / 'Match Winner') — verificat PRIMUL.
-    if any(kw in lower for kw in _MATCH_KEYWORDS) or any(p in slug_lower for p in _MATCH_SLUG_PATTERNS):
+    # 1) Meci individual (head-to-head) — verificat PRIMUL. Dacă putem extrage
+    #    cele două echipe, e cu certitudine un meci, nu un outright.
+    if (
+        any(kw in lower for kw in _MATCH_KEYWORDS)
+        or any(p in slug_lower for p in _MATCH_SLUG_PATTERNS)
+        or extract_teams(title, slug) != (None, None)
+    ):
         return "match"
 
-    # 2) Outright / câștigător turneu (ex: 'Win the 2026 FIFA World Cup').
+    # 2) Outright / câștigător turneu sau grupă (ex: 'Win the World Cup', 'win Group A').
     if any(phrase in lower for phrase in _OUTRIGHT_PHRASES):
         return "outright"
 
