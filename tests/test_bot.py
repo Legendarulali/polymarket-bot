@@ -474,15 +474,25 @@ class TestProcessMarketStateTracking:
         mock_order = self._run(self._market(), state)
         mock_order.assert_not_called()
 
-    def test_low_balance_places_dynamically_sized_order(self):
-        # $1.96 (< $5 dar >= $1): ordinul NU mai e blocat — e dimensionat la balanță.
+    def test_low_balance_below_min_shares_skips_market(self):
+        # $1.96 la preț 0.70: safe_balance = 1.90, expected_shares = 2.7 < 5 → ordinul
+        # ar fi respins (400 Bad Request), deci e sărit LOCAL, nu trimis la API.
         state = {"pusd_balance": 1.9611, "active_positions": []}
+        mock_order = self._run(self._market(), state)
+        mock_order.assert_not_called()
+        assert state["pusd_balance"] == pytest.approx(1.9611)  # balanța neatinsă
+        assert state["active_positions"] == []
+
+    def test_low_balance_above_min_shares_places_buffered_order(self):
+        # $4.00 la preț 0.70: safe_balance = 3.88, expected_shares = 5.5 >= 5 → ordin
+        # mic (sub ținta de $5) plasat, dimensionat în limita balanței SIGURE (buffer 3%).
+        state = {"pusd_balance": 4.0, "active_positions": []}
         mock_order = self._run(self._market(), state)
         mock_order.assert_called_once()
         kwargs = mock_order.call_args.kwargs
-        # Size-ul dinamic e pasat la place_limit_order și nu depășește balanța.
-        assert kwargs["size"] * kwargs["price"] <= 1.9611
-        assert state["pusd_balance"] < 1.9611   # balanța a fost decrementată cu costul real
+        assert kwargs["size"] >= 5.0                                  # respectă minimul de 5 share-uri
+        assert kwargs["size"] * kwargs["price"] <= 4.0 * 0.97 + 1e-9  # buffer 3% respectat
+        assert state["pusd_balance"] < 4.0                            # balanța decrementată cu costul real
 
     # --- Slippage guard ---
 

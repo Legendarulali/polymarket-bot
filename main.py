@@ -11,7 +11,10 @@ import httpx
 
 from config.settings import settings
 from src.reconciliation import log_reconciliation_report, get_account_state, compute_portfolio_summary
-from src.execution import Side, place_limit_order, compute_order_size, _TARGET_ORDER_VALUE
+from src.execution import (
+    Side, place_limit_order, compute_order_size,
+    _TARGET_ORDER_VALUE, _BALANCE_SAFETY_BUFFER, _MIN_SHARES,
+)
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market, analyse_match
@@ -720,15 +723,32 @@ def _execute_trade(
                 return
             price = min(price, best_ask)
 
-    # Dimensionare dinamică: țintim o valoare de $5/ordin, dar dacă balanța
-    # disponibilă e sub $5 folosim cât mai mult din ea (compute_order_size
-    # garantează size*price <= balanță). Balanța sub $1 e deja blocată mai sus,
-    # deci aici ordinul e mereu plasabil — nu mai blocăm pentru „cost > balanță".
-    estimated_size = compute_order_size(price, budget=pusd_balance)
+    # Buffer de siguranță pentru taxe/slippage dinamice Polymarket: nu angajăm
+    # niciodată întreaga balanță, ca estimarea de fee a CLOB să nu împingă ordinul
+    # în „Insufficient Balance". safe_balance = balanță * 0.97.
+    safe_balance = pusd_balance * _BALANCE_SAFETY_BUFFER
+    expected_shares = safe_balance / price
+
+    # Regula Polymarket: minim 5 share-uri per ordin. Dacă nici safe_balance nu
+    # ajunge pentru 5 share-uri la acest preț, ordinul ar fi respins cu 400 Bad
+    # Request → îl sărim local, fără a trimite cererea invalidă la API. Astfel
+    # botul plasează ordine mici doar pe piețe ieftine unde banii cumpără 5+ share-uri.
+    if expected_shares < _MIN_SHARES:
+        logger.info(
+            "[Sizing] Skipped market: $%.2f at price $%.2f would yield only %.2f shares "
+            "(Polymarket requires minimum %d shares).",
+            safe_balance, price, expected_shares, int(_MIN_SHARES),
+        )
+        return
+
+    # Dimensionare dinamică în limita balanței SIGURE (post-buffer): țintim
+    # $5/ordin, dar folosim cel mult safe_balance (compute_order_size trunchiază
+    # astfel încât size*price <= safe_balance). Garantat >= 5 share-uri aici.
+    estimated_size = compute_order_size(price, budget=safe_balance)
     order_total = round(estimated_size * price, 4)
     if pusd_balance < _TARGET_ORDER_VALUE:
         logger.info(
-            "[Agent] Balanță %.4f pUSD sub ținta de $%.2f — dimensionez ordinul la $%.2f (size≈%.2f).",
+            "[Agent] Balanță %.4f pUSD sub ținta de $%.2f — dimensionez ordinul la $%.2f (≈%.2f share-uri).",
             pusd_balance, _TARGET_ORDER_VALUE, order_total, estimated_size,
         )
 
