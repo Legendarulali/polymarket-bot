@@ -14,7 +14,8 @@ from src.reconciliation import log_reconciliation_report, get_account_state, com
 from src.execution import Side, place_limit_order, compute_order_size
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
-from src.ai_analyser import analyse_market
+from src.ai_analyser import analyse_market, analyse_match
+from src.football import parse_match_market, format_legs
 from src.allowance import ensure_collateral_approved
 from src.position_manager import check_exit_conditions
 from src.notifications import notify_trade, notify_portfolio, notify_positions
@@ -49,6 +50,11 @@ _MIN_PROBABILITY = float(os.getenv("PROBABILITY_MIN", "0.45"))  # Ignoră probab
 _MAX_PROBABILITY = float(os.getenv("PROBABILITY_MAX", "0.95"))  # Ignoră dacă probabilitatea YES e quasi-certă
 _MAX_POSITIONS_PER_EVENT = 2     # Max poziții per event_id (piețe generale)
 _MAX_OUTRIGHT_PER_EVENT = 1      # Max poziții pe piețe de tip "outright winner"
+# Focus exclusiv pe meciuri individuale de fotbal (Match Odds / 1X2): când e
+# activ (implicit), piețele care NU sunt meci head-to-head (outright/câștigător
+# de turneu, politice, generale) sunt ignorate complet — vezi cerința de produs.
+# Pune FOOTBALL_ONLY=false ca să reactivezi fluxul binar YES/NO pe toate tipurile.
+_FOOTBALL_ONLY = os.getenv("FOOTBALL_ONLY", "true").strip().lower() not in ("0", "false", "no", "off")
 
 # Istoric persistent al piețelor analizate: {market_id: timestamp_float}.
 # Încărcat din _HISTORY_FILE la pornire; folosit pentru a filtra piețele
@@ -396,7 +402,12 @@ def _maybe_send_pnl_report(account_state: dict) -> None:
 
 
 def process_market(market: dict, account_state: dict) -> None:
-    pusd_balance: float = account_state.get("pusd_balance", 0.0)
+    """Orchestrează filtrarea unei piețe și decide ruta de analiză.
+
+    Focus pe fotbal (FOOTBALL_ONLY): piețele care nu sunt meci individual sunt
+    ignorate. Meciurile structurate 1X2 (Match Odds) merg pe fluxul dedicat
+    `_process_match_1x2` (rezultate mapate 1/X/2); restul (sau dacă focusul e
+    dezactivat) merg pe fluxul binar YES/NO moștenit."""
     active_positions: list[dict] = account_state.setdefault("active_positions", [])
 
     title = market.get("question") or market.get("title") or "Unknown market"
@@ -420,6 +431,15 @@ def process_market(market: dict, account_state: dict) -> None:
         )
         return
 
+    # --- FILTRU 0: Doar meciuri de fotbal (exclude outright / câștigător turneu / general) ---
+    if _FOOTBALL_ONLY and market_type != "match":
+        _scan_stats["non-meci (outright/general)"] += 1
+        logger.info(
+            "[FILTER] Ignor piața '%s' [%s] — nu e meci individual 1X2 (focus pe fotbal).",
+            title[:60], type_label,
+        )
+        return
+
     # --- FILTRU 1: Volum minim ---
     volume = 0.0
     try:
@@ -434,10 +454,109 @@ def process_market(market: dict, account_state: dict) -> None:
         )
         return
 
-    # --- FILTRU 2: Fereastra de probabilitate (unică pentru toate tipurile) ---
-    # Fereastră [0.45, 0.95]: concentrează botul pe meciurile competitive și
-    # ignoră zgomotul de probabilitate foarte mică. Decizia reală rămâne la
-    # LLM + pragul de confidence.
+    event_id = _extract_event_id(market)
+
+    # Meci structurat 1X2 → flux dedicat cu maparea 1/X/2. Dacă piața e un meci
+    # dar nu are structura 1X2 (rezultate binare Yes/No), cade pe fluxul moștenit.
+    if market_type == "match":
+        parsed = parse_match_market(market)
+        if parsed:
+            _process_match_1x2(market, account_state, parsed, event_id, title, market_id)
+            return
+        logger.info(
+            "[Meci] '%s' nu e structurat 1X2 (rezultate binare) — folosesc fluxul YES/NO.",
+            title[:60],
+        )
+
+    _process_legacy_binary(market, account_state, event_id, title, market_id, market_type, type_label)
+
+
+def _process_match_1x2(
+    market: dict,
+    account_state: dict,
+    parsed: dict,
+    event_id: str,
+    title: str,
+    market_id,
+) -> None:
+    """Flux de analiză pentru un meci 1X2 (Match Odds).
+
+    Logează numele meciului și cotele 1/X/2, aplică fereastra de probabilitate
+    pe fiecare rezultat (YES = prețul rezultatului), apoi cere LLM-ului să aleagă
+    un cod (1/X/2) și plasează ordinul pe token-ul rezultatului ales."""
+    home, away = parsed["home"], parsed["away"]
+    # Cerință de produs: logurile arată clar meciul + cotele 1/X/2.
+    logger.info("[Meci] %s | %s", parsed["label"], format_legs(parsed))
+
+    # --- FILTRU 2: Fereastra de probabilitate [0.45, 0.95] pe fiecare leg 1X2 ---
+    candidates = [
+        leg for leg in parsed["legs"]
+        if _MIN_PROBABILITY < leg["price"] < _MAX_PROBABILITY
+    ]
+    if not candidates:
+        _scan_stats["probabilitate în afara ferestrei"] += 1
+        logger.info(
+            "[FILTER] Ignor meciul '%s' — niciun rezultat 1X2 în fereastra [%.2f, %.2f] (%s).",
+            parsed["label"], _MIN_PROBABILITY, _MAX_PROBABILITY, format_legs(parsed),
+        )
+        return
+
+    # Culegere știri + analiză 1X2 via Groq.
+    news = fetch_free_news(query=title[:100])
+    logger.info("[Agent] %d știri găsite pentru '%s'.", len(news), parsed["label"][:50])
+
+    decision = analyse_match(home, away, candidates, news)
+
+    _record_analyzed(str(market_id))
+    _scan_stats["analizate (LLM)"] += 1
+    logger.info(
+        "[Agent] Piață id=%s marcată ca analizată în history.json (cooldown=%dh).",
+        market_id, _CACHE_TTL_SECONDS // 3600,
+    )
+    logger.info(
+        "[Agent] Decizie AI 1X2: trade=%s | outcome=%s | confidence=%.2f | reason=%s",
+        decision["trade"], decision["outcome"], decision["confidence"], decision["reason"],
+    )
+
+    if not decision["trade"]:
+        return
+    if decision["confidence"] < _MIN_CONFIDENCE:
+        logger.info(
+            "[Agent] Confidence %.2f sub pragul %.2f. Ordin blocat.",
+            decision["confidence"], _MIN_CONFIDENCE,
+        )
+        return
+
+    pick = decision["outcome"]
+    leg = parsed["by_code"].get(pick)
+    if not leg:
+        logger.warning("[Agent] Cod 1X2 ales (%s) fără leg corespunzător. Ordin blocat.", pick)
+        return
+
+    _execute_trade(
+        market, account_state,
+        token_id=leg["token_id"],
+        price=leg["price"],
+        outcome_label=f"{pick} ({leg['name']})",
+        decision=decision,
+        event_id=event_id,
+        title=title,
+    )
+
+
+def _process_legacy_binary(
+    market: dict,
+    account_state: dict,
+    event_id: str,
+    title: str,
+    market_id,
+    market_type: str,
+    type_label: str,
+) -> None:
+    """Flux binar YES/NO moștenit (piețe non-1X2 sau focus pe fotbal dezactivat)."""
+    active_positions: list[dict] = account_state.setdefault("active_positions", [])
+
+    # --- FILTRU 2: Fereastra de probabilitate pe YES ---
     yes_price_raw = _current_price(market, "YES")
     if not (_MIN_PROBABILITY < yes_price_raw < _MAX_PROBABILITY):
         _scan_stats["probabilitate în afara ferestrei"] += 1
@@ -447,20 +566,12 @@ def process_market(market: dict, account_state: dict) -> None:
         )
         return
 
-    # --- FILTRU 3: Event clustering ---
-    # Meciurile individuale (ex: 'SUA vs Iran') nu sunt blocate de limita pe
-    # event_id, deoarece aceasta ar afecta și piețele de tip outright winner
-    # din același turneu. Fiecare tip de piață are propria limită.
-    event_id = _extract_event_id(market)
-
+    # --- FILTRU 3: Event clustering (meciurile nu sunt plafonate pe event_id) ---
     if market_type == "match":
         logger.debug("[FILTER] Piață de tip meci detectată ('%s') — skip event clustering.", title[:60])
     elif event_id:
         limit = _MAX_OUTRIGHT_PER_EVENT if market_type == "outright" else _MAX_POSITIONS_PER_EVENT
-        event_positions = sum(
-            1 for pos in active_positions
-            if pos.get("event_id") == event_id
-        )
+        event_positions = sum(1 for pos in active_positions if pos.get("event_id") == event_id)
         if event_positions >= limit:
             _scan_stats["event clustering"] += 1
             logger.info(
@@ -469,58 +580,72 @@ def process_market(market: dict, account_state: dict) -> None:
             )
             return
 
-    # Pas 1: Culegere știri + analiză AI via Groq.
-    # Piețele analizate recent sunt deja filtrate din lista de intrare (history.json),
-    # deci aici ajung doar piețe care chiar trebuie (re)analizate.
     news = fetch_free_news(query=title[:100])
     logger.info("[Agent] %d știri găsite pentru '%s'.", len(news), title[:50])
 
     yes_price = _current_price(market, "YES")
     decision = analyse_market(title, yes_price, news)
 
-    # Înregistrează piața ca analizată și persistă imediat (cooldown=_CACHE_TTL_SECONDS).
     _record_analyzed(str(market_id))
     _scan_stats["analizate (LLM)"] += 1
     logger.info(
         "[Agent] Piață id=%s marcată ca analizată în history.json (cooldown=%dh).",
-        market_id,
-        _CACHE_TTL_SECONDS // 3600,
+        market_id, _CACHE_TTL_SECONDS // 3600,
     )
-
     logger.info(
         "[Agent] Decizie AI: trade=%s | outcome=%s | confidence=%.2f | reason=%s",
-        decision["trade"],
-        decision["outcome"],
-        decision["confidence"],
-        decision["reason"],
+        decision["trade"], decision["outcome"], decision["confidence"], decision["reason"],
     )
 
     if not decision["trade"]:
         return
-
     if decision["confidence"] < _MIN_CONFIDENCE:
         logger.info(
             "[Agent] Confidence %.2f sub pragul %.2f. Ordin blocat.",
-            decision["confidence"],
-            _MIN_CONFIDENCE,
-        )
-        return
-
-    # Pas 3: Verificări de risc
-    if pusd_balance < _MIN_BALANCE_PUSD:
-        logger.warning(
-            "[Agent] Fonduri insuficiente (%.4f pUSD < %.1f minim). Ordin blocat.",
-            pusd_balance,
-            _MIN_BALANCE_PUSD,
+            decision["confidence"], _MIN_CONFIDENCE,
         )
         return
 
     outcome = decision["outcome"]
-    token_id = _token_for_outcome(market, outcome)
-    if not token_id:
+    _execute_trade(
+        market, account_state,
+        token_id=_token_for_outcome(market, outcome),
+        price=_current_price(market, outcome),
+        outcome_label=outcome,
+        decision=decision,
+        event_id=event_id,
+        title=title,
+    )
+
+
+def _execute_trade(
+    market: dict,
+    account_state: dict,
+    *,
+    token_id: str | None,
+    price: float,
+    outcome_label: str,
+    decision: dict,
+    event_id: str,
+    title: str,
+) -> None:
+    """Verificări de risc finale + plasare ordin BUY + actualizare stare locală.
+
+    Comun fluxului 1X2 și celui binar: balanță minimă, token valid, dedup pe
+    token, preț valid, protecție anti-slippage față de best ask live și
+    dimensionare ordin în limita balanței."""
+    pusd_balance: float = account_state.get("pusd_balance", 0.0)
+    active_positions: list[dict] = account_state.setdefault("active_positions", [])
+
+    if pusd_balance < _MIN_BALANCE_PUSD:
         logger.warning(
-            "[Agent] Token negăsit pentru outcome=%s în piața id=%s.", outcome, market_id
+            "[Agent] Fonduri insuficiente (%.4f pUSD < %.1f minim). Ordin blocat.",
+            pusd_balance, _MIN_BALANCE_PUSD,
         )
+        return
+
+    if not token_id:
+        logger.warning("[Agent] Token negăsit pentru outcome=%s (piață '%s').", outcome_label, title[:60])
         return
 
     # Verificare poziție duplicată
@@ -531,8 +656,6 @@ def process_market(market: dict, account_state: dict) -> None:
         )
         return
 
-    # Pas 4: Plasare ordin
-    price = _current_price(market, outcome)
     if price < 0.01:
         logger.warning("[Agent] Preț invalid (%.4f) pentru token=%s. Ordin blocat.", price, token_id)
         return
@@ -558,20 +681,14 @@ def process_market(market: dict, account_state: dict) -> None:
     if pusd_balance < order_total:
         logger.warning(
             "[Agent] Balanță insuficientă pentru ordin: %.4f pUSD disponibil < %.4f cost estimat. Ordin blocat.",
-            pusd_balance,
-            order_total,
+            pusd_balance, order_total,
         )
         return
 
     logger.warning(
         "[TRADE] AI → BUY %s | '%s' | token=%s | price=$%.4f | size≈%.2f | total≈$%.2f | confidence=%.2f",
-        outcome,
-        title[:60],
-        token_id,
-        price,
-        estimated_size,
-        order_total,
-        decision["confidence"],
+        outcome_label, title[:60], token_id, price, estimated_size, order_total,
+        decision.get("confidence", 0.0),
     )
 
     tick_size = str(market.get("orderPriceMinTickSize") or "0.01")
@@ -592,7 +709,7 @@ def process_market(market: dict, account_state: dict) -> None:
         active_positions.append({
             "asset_name":    title,
             "token_id":      token_id,
-            "outcome":       outcome,
+            "outcome":       outcome_label,
             "side":          "BUY",
             "size":          estimated_size,
             "avg_price":     price,
@@ -607,7 +724,7 @@ def process_market(market: dict, account_state: dict) -> None:
             price=price,
             size=estimated_size,
             total=order_total,
-            outcome=outcome,
+            outcome=outcome_label,
             confidence=decision.get("confidence"),
             reason=decision.get("reason"),
             order_id=result.get("order_id"),
@@ -624,6 +741,11 @@ def main() -> None:
         settings.CLOB_HOST,
         settings.CHAIN_ID,
         settings.FUNDER_ADDRESS,
+    )
+    logger.info(
+        "Mod focus: %s",
+        "DOAR meciuri de fotbal (Match Odds / 1X2)" if _FOOTBALL_ONLY
+        else "toate piețele (flux binar YES/NO)",
     )
 
     if settings.OVERRIDE_BALANCE > 0:

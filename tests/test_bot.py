@@ -351,25 +351,30 @@ class TestExitConditions:
 # ---------------------------------------------------------------------------
 
 class TestProcessMarketStateTracking:
-    def _market(self, market_id="m1", token_ids=("0xYES", "0xNO"), event_slug="ev-1"):
+    def _market(self, market_id="m1", token_ids=("0xYES", "0xDRAW", "0xNO"),
+                outcomes=("Arsenal", "Draw", "Chelsea"),
+                prices=("0.70", "0.20", "0.10"), event_slug="ev-1"):
+        # Meci 1X2: outcome '1' (Arsenal) → clobTokenIds[0] = '0xYES', preț 0.70.
         return {
             "id": market_id,
-            "question": "Will team X win the final?",
+            "question": "Arsenal vs Chelsea",
             "volume": "50000",
-            "outcomePrices": json.dumps(["0.70", "0.30"]),
+            "outcomes": json.dumps(list(outcomes)),
+            "outcomePrices": json.dumps(list(prices)),
             "clobTokenIds": json.dumps(list(token_ids)),
             "events": [{"slug": event_slug}],
         }
 
     def _run(self, market, account_state, decision=None, order_result=None, live_ask=None):
         import main
-        decision = decision or {"trade": True, "outcome": "YES", "confidence": 0.9, "reason": "test"}
+        # Decizia 1X2 implicită: pariem '1' (gazda, Arsenal).
+        decision = decision or {"trade": True, "outcome": "1", "confidence": 0.9, "reason": "test"}
         order_result = order_result or {"success": True, "order_id": "oid-1"}
 
         # _record_analyzed is patched out so process_market does not touch history.json;
         # history persistence is covered separately by TestAnalyzedHistory.
         with patch("main.fetch_free_news", return_value=[]), \
-             patch("main.analyse_market", return_value=decision), \
+             patch("main.analyse_match", return_value=decision), \
              patch("main._record_analyzed"), \
              patch("main._live_best_ask", return_value=live_ask), \
              patch("main.place_limit_order", return_value=order_result) as mock_order:
@@ -418,11 +423,10 @@ class TestProcessMarketStateTracking:
         mock_order.assert_not_called()
 
     def test_probability_window_enforced_with_json_string_prices(self):
-        # YES=0.95 sits on the upper bound of the unified [0.45, 0.95] window
-        # (exclusive) → filtered — and must be read correctly from the JSON
-        # string, not silently default to 0.5.
-        market = self._market()
-        market["outcomePrices"] = json.dumps(["0.95", "0.05"])
+        # Leg '1' (Arsenal)=0.95 sits on the upper bound of the [0.45, 0.95]
+        # window (exclusive) and the other legs are below 0.45 → no eligible 1X2
+        # outcome → filtered. Prices must be read from the JSON string.
+        market = self._market(prices=("0.95", "0.03", "0.02"))
         state = {"pusd_balance": 20.0, "active_positions": []}
         mock_order = self._run(market, state)
         mock_order.assert_not_called()
@@ -903,23 +907,25 @@ class TestClassifyMarket:
 # ---------------------------------------------------------------------------
 
 class TestProbabilityWindow:
-    """Fereastra de probabilitate e UNICĂ [0.45, 0.95] pentru meci/outright/general:
-    concentrează botul pe meciurile competitive și ignoră zgomotul de probabilitate mică."""
+    """Fereastra de probabilitate [0.45, 0.95] se aplică pe fiecare rezultat 1X2
+    (YES = prețul rezultatului): pariem doar pe outcome-uri în fereastră, iar dacă
+    niciunul nu califică, meciul e ignorat."""
 
-    def _market(self, question, prices):
+    def _market(self, question, outcomes, prices):
         return {
             "id": "mx", "question": question, "volume": "50000",
+            "outcomes": json.dumps(outcomes),
             "outcomePrices": json.dumps(prices),
-            "clobTokenIds": json.dumps(["0xYES", "0xNO"]),
+            "clobTokenIds": json.dumps([f"0x{i}" for i in range(len(outcomes))]),
             "events": [{"slug": "ev"}],
         }
 
-    def _run(self, market):
+    def _run(self, market, outcome="1"):
         import main
-        decision = {"trade": True, "outcome": "YES", "confidence": 0.9, "reason": "t"}
+        decision = {"trade": True, "outcome": outcome, "confidence": 0.9, "reason": "t"}
         state = {"pusd_balance": 20.0, "active_positions": []}
         with patch("main.fetch_free_news", return_value=[]), \
-             patch("main.analyse_market", return_value=decision), \
+             patch("main.analyse_match", return_value=decision), \
              patch("main._record_analyzed"), \
              patch("main._live_best_ask", return_value=None), \
              patch("main.place_limit_order",
@@ -928,29 +934,34 @@ class TestProbabilityWindow:
         return mock_order
 
     def test_match_midrange_allowed(self):
-        # Meci la 0.50 — în fereastra unică [0.45, 0.95].
-        self._run(self._market("USA vs Iran", ["0.50", "0.50"])).assert_called_once()
+        # Leg '1' (USA) la 0.50 — în fereastra [0.45, 0.95].
+        self._run(self._market("USA vs Iran", ["USA", "Draw", "Iran"],
+                               ["0.50", "0.30", "0.20"])).assert_called_once()
 
-    def test_general_midrange_allowed(self):
-        # General la 0.50 — fereastra unică nu mai blochează (era filtrat înainte).
-        self._run(self._market("Will the team win the final?", ["0.50", "0.50"])).assert_called_once()
+    def test_general_market_skipped_in_football_only(self):
+        # Piață generală (nu meci) → ignorată complet în modul focus pe fotbal.
+        self._run(self._market("Will the team win the final?", ["Yes", "No"],
+                               ["0.50", "0.50"])).assert_not_called()
 
     def test_low_probability_noise_blocked(self):
-        # 0.30 < 0.45 → „zgomot" de probabilitate mică, filtrat (focus pe meciuri competitive).
-        self._run(self._market("USA vs Iran", ["0.30", "0.70"])).assert_not_called()
+        # Niciun leg ≥ 0.45 → meci „necompetitiv pentru bot", filtrat.
+        self._run(self._market("USA vs Iran", ["USA", "Draw", "Iran"],
+                               ["0.30", "0.30", "0.40"])).assert_not_called()
 
     def test_extreme_high_probability_blocked(self):
-        # 0.97 > 0.95 → în afara ferestrei.
-        self._run(self._market("USA vs Iran", ["0.97", "0.03"])).assert_not_called()
+        # 0.97 > 0.95 (favorit quasi-cert), restul sub 0.45 → niciun leg eligibil.
+        self._run(self._market("USA vs Iran", ["USA", "Draw", "Iran"],
+                               ["0.97", "0.02", "0.01"])).assert_not_called()
 
     def test_extreme_low_probability_blocked(self):
-        # 0.005 ≪ 0.45 → în afara ferestrei.
-        self._run(self._market("USA vs Iran", ["0.005", "0.995"])).assert_not_called()
+        # Meci 2-way (fără egal): 0.005 / 0.995 → ambele în afara ferestrei.
+        self._run(self._market("USA vs Iran", ["USA", "Iran"],
+                               ["0.005", "0.995"])).assert_not_called()
 
     def test_volume_filter_increments_scan_stats(self):
         import main
         main._scan_stats.clear()
-        m = self._market("X vs Y", ["0.50", "0.50"])
+        m = self._market("X vs Y", ["X", "Draw", "Y"], ["0.50", "0.30", "0.20"])
         m["volume"] = "100"   # below MIN_VOLUME_USD → filtered before any LLM call
         main.process_market(m, {"pusd_balance": 20.0, "active_positions": []})
         assert main._scan_stats["volum mic"] == 1
@@ -1072,3 +1083,192 @@ class TestPositionsNotification:
             mock_post.return_value = MagicMock(status_code=204)
             notifications.notify_positions(positions)
         assert "și încă 15 poziții" in self._embed(mock_post)["description"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: football 1X2 market parsing (src/football.py)
+# ---------------------------------------------------------------------------
+
+class TestFootballParsing:
+    def _market(self, question, outcomes, prices, tokens, slug=""):
+        return {
+            "question": question, "slug": slug,
+            "outcomes": json.dumps(outcomes),
+            "outcomePrices": json.dumps(prices),
+            "clobTokenIds": json.dumps(tokens),
+        }
+
+    def test_three_way_mapped_to_1x2(self):
+        from src.football import parse_match_market
+        p = parse_match_market(self._market(
+            "Arsenal vs. Chelsea", ["Arsenal", "Draw", "Chelsea"],
+            ["0.55", "0.25", "0.20"], ["0xA", "0xX", "0xC"]))
+        assert p["home"] == "Arsenal" and p["away"] == "Chelsea"
+        assert p["is_three_way"] is True
+        assert p["by_code"]["1"]["token_id"] == "0xA"
+        assert p["by_code"]["X"]["price"] == pytest.approx(0.25)
+        assert p["by_code"]["2"]["name"] == "Chelsea"
+        assert [leg["code"] for leg in p["legs"]] == ["1", "X", "2"]
+
+    def test_outcome_order_irrelevant_maps_by_name(self):
+        from src.football import parse_match_market
+        # Outcomes listed away-first/draw-last: mapping must follow names, not order.
+        p = parse_match_market(self._market(
+            "Arsenal vs Chelsea", ["Chelsea", "Arsenal", "Draw"],
+            ["0.20", "0.55", "0.25"], ["0xC", "0xA", "0xX"]))
+        assert p["by_code"]["1"]["token_id"] == "0xA"   # Arsenal = home
+        assert p["by_code"]["2"]["token_id"] == "0xC"   # Chelsea = away
+        assert p["by_code"]["X"]["token_id"] == "0xX"
+
+    def test_two_way_match_has_no_draw(self):
+        from src.football import parse_match_market
+        p = parse_match_market(self._market(
+            "USA vs Iran", ["USA", "Iran"], ["0.60", "0.40"], ["0xU", "0xI"]))
+        assert p["is_three_way"] is False
+        assert "X" not in p["by_code"]
+        assert p["by_code"]["1"]["name"] == "USA"
+        assert p["by_code"]["2"]["name"] == "Iran"
+
+    def test_draw_synonym_tie_detected(self):
+        from src.football import parse_match_market
+        p = parse_match_market(self._market(
+            "A vs B", ["A", "Tie", "B"], ["0.5", "0.3", "0.2"], ["0xA", "0xT", "0xB"]))
+        assert p["by_code"]["X"]["token_id"] == "0xT"
+
+    def test_binary_yes_no_is_not_1x2(self):
+        from src.football import parse_match_market
+        assert parse_match_market(self._market(
+            "Brazil Match Winner", ["Yes", "No"], ["0.6", "0.4"], ["0xY", "0xN"])) is None
+
+    def test_missing_arrays_returns_none(self):
+        from src.football import parse_match_market
+        assert parse_match_market({"question": "A vs B"}) is None
+
+    def test_extract_teams_from_title_with_prefix(self):
+        from src.football import extract_teams
+        assert extract_teams("EPL: Arsenal vs. Chelsea") == ("Arsenal", "Chelsea")
+        assert extract_teams("France vs Croatia") == ("France", "Croatia")
+
+    def test_extract_teams_none_when_no_separator(self):
+        from src.football import extract_teams
+        assert extract_teams("Will it rain in NYC?") == (None, None)
+
+    def test_extract_teams_from_slug(self):
+        from src.football import extract_teams
+        home, away = extract_teams("", "arsenal-vs-chelsea-2026-06-18")
+        assert home.lower() == "arsenal" and away.lower() == "chelsea"
+
+    def test_format_legs_renders_codes_and_prices(self):
+        from src.football import parse_match_market, format_legs
+        p = parse_match_market(self._market(
+            "Arsenal vs Chelsea", ["Arsenal", "Draw", "Chelsea"],
+            ["0.55", "0.25", "0.20"], ["0xA", "0xX", "0xC"]))
+        s = format_legs(p)
+        assert "1 (Arsenal)=0.55" in s
+        assert "X (Draw)=0.25" in s
+        assert "2 (Chelsea)=0.20" in s
+
+
+# ---------------------------------------------------------------------------
+# Tests: football-only filtering in process_market
+# ---------------------------------------------------------------------------
+
+class TestFootballOnlyFilter:
+    def _match_1x2(self):
+        return {
+            "id": "m1", "question": "Arsenal vs Chelsea", "volume": "50000",
+            "outcomes": json.dumps(["Arsenal", "Draw", "Chelsea"]),
+            "outcomePrices": json.dumps(["0.55", "0.25", "0.20"]),
+            "clobTokenIds": json.dumps(["0xA", "0xX", "0xC"]),
+            "events": [{"slug": "epl-ars-che"}],
+        }
+
+    def test_outright_skipped_and_counted(self):
+        import main
+        main._scan_stats.clear()
+        market = {
+            "id": "o1", "question": "Win the 2026 FIFA World Cup", "volume": "999999",
+            "outcomes": json.dumps(["Brazil", "Argentina"]),
+            "outcomePrices": json.dumps(["0.20", "0.18"]),
+            "clobTokenIds": json.dumps(["0xB", "0xAr"]), "events": [{"slug": "wc-2026"}],
+        }
+        with patch("main.analyse_match") as am, patch("main.analyse_market") as ab, \
+             patch("main.place_limit_order") as mo:
+            main.process_market(market, {"pusd_balance": 20.0, "active_positions": []})
+        am.assert_not_called()
+        ab.assert_not_called()
+        mo.assert_not_called()
+        assert main._scan_stats["non-meci (outright/general)"] == 1
+
+    def test_match_reaches_1x2_analysis(self):
+        import main
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._record_analyzed"), \
+             patch("main.analyse_match",
+                   return_value={"trade": False, "outcome": "NONE",
+                                 "confidence": 0.0, "reason": "x"}) as am:
+            main.process_market(self._match_1x2(), {"pusd_balance": 20.0, "active_positions": []})
+        am.assert_called_once()
+        # LLM-ul primește exact echipele + candidații, nu outright-uri.
+        assert am.call_args.args[0] == "Arsenal"
+        assert am.call_args.args[1] == "Chelsea"
+
+    def test_football_only_off_processes_general(self, monkeypatch):
+        import main
+        monkeypatch.setattr(main, "_FOOTBALL_ONLY", False)
+        market = {
+            "id": "g1", "question": "Will it rain in NYC?", "volume": "50000",
+            "outcomes": json.dumps(["Yes", "No"]),
+            "outcomePrices": json.dumps(["0.60", "0.40"]),
+            "clobTokenIds": json.dumps(["0xY", "0xN"]), "events": [{"slug": "nyc"}],
+        }
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._record_analyzed"), \
+             patch("main.analyse_market",
+                   return_value={"trade": False, "outcome": "NO",
+                                 "confidence": 0.0, "reason": "x"}) as ab:
+            main.process_market(market, {"pusd_balance": 20.0, "active_positions": []})
+        ab.assert_called_once()  # fluxul binar moștenit rulează când focusul e oprit
+
+
+# ---------------------------------------------------------------------------
+# Tests: analyse_match 1X2 decision validation (src/ai_analyser.py)
+# ---------------------------------------------------------------------------
+
+class TestAnalyseMatch:
+    def _candidates(self):
+        return [
+            {"code": "1", "name": "Arsenal", "price": 0.55},
+            {"code": "X", "name": "Draw", "price": 0.25},
+        ]
+
+    def _run(self, raw):
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "GROQ_API_KEY", "test-key"), \
+             patch("src.ai_analyser._call_groq", return_value=raw):
+            return ai_analyser.analyse_match("Arsenal", "Chelsea", self._candidates(), [])
+
+    def test_valid_home_pick(self):
+        d = self._run('{"trade": true, "outcome": "1", "confidence": 0.8, "reason": "r"}')
+        assert d["trade"] is True and d["outcome"] == "1" and d["confidence"] == pytest.approx(0.8)
+
+    def test_draw_pick_allowed(self):
+        d = self._run('{"trade": true, "outcome": "X", "confidence": 0.7, "reason": "r"}')
+        assert d["trade"] is True and d["outcome"] == "X"
+
+    def test_pick_outside_candidates_cancels_trade(self):
+        # "2" (away) nu e printre candidați → trade anulat, outcome NONE.
+        d = self._run('{"trade": true, "outcome": "2", "confidence": 0.9, "reason": "r"}')
+        assert d["trade"] is False and d["outcome"] == "NONE"
+
+    def test_none_pick_no_trade(self):
+        d = self._run('{"trade": false, "outcome": "NONE", "confidence": 0.0, "reason": "r"}')
+        assert d["trade"] is False and d["outcome"] == "NONE"
+
+    def test_no_api_key_skips(self):
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "GROQ_API_KEY", ""):
+            d = ai_analyser.analyse_match("A", "B", self._candidates(), [])
+        assert d["trade"] is False and d["outcome"] == "NONE"
