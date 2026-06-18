@@ -261,6 +261,43 @@ class TestExplicitOrderSize:
 
 
 # ---------------------------------------------------------------------------
+# Tests: budget-aware dynamic order sizing (compute_order_size(price, budget))
+# ---------------------------------------------------------------------------
+
+class TestBudgetAwareSizing:
+    """Țintă $5/ordin; dacă balanța (budget) e sub $5, folosește cât mai mult din
+    ea fără s-o depășească. Balanța < $1 e blocată de apelant (vezi _execute_trade)."""
+
+    def test_ample_budget_uses_5usd_target(self):
+        from src.execution import compute_order_size
+        # budget >> $5 → valoare ordin ~$5 (ținta).
+        assert compute_order_size(0.50, budget=20.0) * 0.50 == pytest.approx(5.0, abs=0.01)
+
+    def test_low_budget_uses_available_balance(self):
+        from src.execution import compute_order_size
+        # $1.96 (< $5, >= $1) → folosește ~toată balanța, fără s-o depășească.
+        cost = compute_order_size(0.70, budget=1.9611) * 0.70
+        assert cost <= 1.9611                          # nu depășește balanța
+        assert cost == pytest.approx(1.96, abs=0.02)   # ~toată balanța
+
+    def test_never_exceeds_budget_across_prices(self):
+        from src.execution import compute_order_size
+        for price in (0.05, 0.33, 0.50, 0.70, 0.90, 0.99):
+            for budget in (1.0, 1.9611, 3.5, 4.99):
+                assert compute_order_size(price, budget=budget) * price <= budget + 1e-9
+
+    def test_budget_at_target_uses_5usd(self):
+        from src.execution import compute_order_size
+        assert compute_order_size(0.50, budget=5.0) * 0.50 == pytest.approx(5.0, abs=0.01)
+
+    def test_no_budget_keeps_5usd_target(self):
+        from src.execution import compute_order_size
+        # Ramura fără buget (apel din place_limit_order) rămâne neschimbată.
+        assert compute_order_size(0.50) == pytest.approx(10.0)
+        assert compute_order_size(0.25) == pytest.approx(20.0)
+
+
+# ---------------------------------------------------------------------------
 # Tests: position_manager exit logic (take-profit / stop-loss)
 # ---------------------------------------------------------------------------
 
@@ -432,9 +469,20 @@ class TestProcessMarketStateTracking:
         mock_order.assert_not_called()
 
     def test_insufficient_balance_blocks_order(self):
+        # < $1 → blocat (minim absolut Polymarket).
         state = {"pusd_balance": 0.5, "active_positions": []}
         mock_order = self._run(self._market(), state)
         mock_order.assert_not_called()
+
+    def test_low_balance_places_dynamically_sized_order(self):
+        # $1.96 (< $5 dar >= $1): ordinul NU mai e blocat — e dimensionat la balanță.
+        state = {"pusd_balance": 1.9611, "active_positions": []}
+        mock_order = self._run(self._market(), state)
+        mock_order.assert_called_once()
+        kwargs = mock_order.call_args.kwargs
+        # Size-ul dinamic e pasat la place_limit_order și nu depășește balanța.
+        assert kwargs["size"] * kwargs["price"] <= 1.9611
+        assert state["pusd_balance"] < 1.9611   # balanța a fost decrementată cu costul real
 
     # --- Slippage guard ---
 

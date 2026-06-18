@@ -1,4 +1,5 @@
 import logging
+import math
 from enum import Enum
 
 from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
@@ -14,15 +15,25 @@ class Side(str, Enum):
     SELL = "SELL"
 
 
-_MIN_ORDER_VALUE = 5.0   # target $5 per order (satisfies Polymarket's $1 minimum)
-_MIN_SIZE        = 2.0   # absolute floor in shares (safety net)
+_TARGET_ORDER_VALUE = 5.0   # țintă valoare ordin ($). Polymarket acceptă ordine >= $1.
+_MIN_SIZE           = 2.0   # floor absolut în shares (safety net, ramura fără buget)
 _VALID_TICK_SIZES = ("0.1", "0.01", "0.001", "0.0001")
 _DEFAULT_TICK_SIZE = "0.01"
 
 
-def compute_order_size(price: float) -> float:
-    """Size dinamic: target $5 valoare ordin, cu floor absolut de _MIN_SIZE shares."""
-    return round(max(_MIN_ORDER_VALUE / price, _MIN_SIZE), 2)
+def compute_order_size(price: float, budget: float | None = None) -> float:
+    """Size dinamic pentru un ordin BUY.
+
+    Țintește o valoare de $5 per ordin. Dacă `budget` (balanța pUSD disponibilă)
+    e dată și sub $5, folosește cât mai mult din ea fără a o depăși
+    (size * price <= budget), ca un ordin mic să NU fie respins pentru fonduri
+    insuficiente. Apelantul garantează budget >= minimul Polymarket de $1.
+    """
+    if budget is not None:
+        value = min(_TARGET_ORDER_VALUE, budget)
+        # Trunchiere (floor) la 2 zecimale: size*price nu trebuie să depășească `value`.
+        return math.floor((value / price) * 100) / 100
+    return round(max(_TARGET_ORDER_VALUE / price, _MIN_SIZE), 2)
 
 
 def place_limit_order(

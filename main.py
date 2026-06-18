@@ -11,7 +11,7 @@ import httpx
 
 from config.settings import settings
 from src.reconciliation import log_reconciliation_report, get_account_state, compute_portfolio_summary
-from src.execution import Side, place_limit_order, compute_order_size
+from src.execution import Side, place_limit_order, compute_order_size, _TARGET_ORDER_VALUE
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
 from src.ai_analyser import analyse_market, analyse_match
@@ -676,9 +676,12 @@ def _execute_trade(
     pusd_balance: float = account_state.get("pusd_balance", 0.0)
     active_positions: list[dict] = account_state.setdefault("active_positions", [])
 
+    # Polymarket respinge ordinele sub $1 valoare totală: dacă balanța e sub acest
+    # minim absolut nu putem plasa niciun ordin valid → blocăm. Între $1 și $5
+    # ordinul NU mai e blocat, ci dimensionat dinamic (vezi mai jos).
     if pusd_balance < _MIN_BALANCE_PUSD:
         logger.warning(
-            "[Agent] Fonduri insuficiente (%.4f pUSD < %.1f minim). Ordin blocat.",
+            "[Agent] Balanță %.4f pUSD sub minimul Polymarket de $%.2f — ordin imposibil. Blocat.",
             pusd_balance, _MIN_BALANCE_PUSD,
         )
         return
@@ -714,15 +717,17 @@ def _execute_trade(
                 return
             price = min(price, best_ask)
 
-    # Estimare cost ordin și verificare balanță disponibilă
-    estimated_size = compute_order_size(price)
+    # Dimensionare dinamică: țintim o valoare de $5/ordin, dar dacă balanța
+    # disponibilă e sub $5 folosim cât mai mult din ea (compute_order_size
+    # garantează size*price <= balanță). Balanța sub $1 e deja blocată mai sus,
+    # deci aici ordinul e mereu plasabil — nu mai blocăm pentru „cost > balanță".
+    estimated_size = compute_order_size(price, budget=pusd_balance)
     order_total = round(estimated_size * price, 4)
-    if pusd_balance < order_total:
-        logger.warning(
-            "[Agent] Balanță insuficientă pentru ordin: %.4f pUSD disponibil < %.4f cost estimat. Ordin blocat.",
-            pusd_balance, order_total,
+    if pusd_balance < _TARGET_ORDER_VALUE:
+        logger.info(
+            "[Agent] Balanță %.4f pUSD sub ținta de $%.2f — dimensionez ordinul la $%.2f (size≈%.2f).",
+            pusd_balance, _TARGET_ORDER_VALUE, order_total, estimated_size,
         )
-        return
 
     logger.warning(
         "[TRADE] AI → BUY %s | '%s' | token=%s | price=$%.4f | size≈%.2f | total≈$%.2f | confidence=%.2f",
@@ -737,6 +742,7 @@ def _execute_trade(
         price=price,
         side=Side.BUY,
         tick_size=tick_size,
+        size=estimated_size,
     )
 
     if result.get("success"):
