@@ -888,13 +888,16 @@ def main() -> None:
             except Exception as exc:
                 logger.error("[Agent] Exit check eșuat: %s", exc, exc_info=True)
 
-            # Verificare balanță înainte de orice apel LLM sau API Polymarket
+            # Verificare balanță înainte de orice apel LLM (Groq) sau scanare de
+            # piețe: cu balanța epuizată orice analiză ar irosi API calls degeaba.
+            # P/L report + exit checks (TP/SL) au rulat deja mai sus — niciunul nu
+            # apelează Groq — ca raportul să iasă la timp și pozițiile să poată fi
+            # închise chiar și fără fonduri de cumpărare.
             if pusd_balance < _MIN_BALANCE_PUSD:
                 logger.warning(
-                    "[Agent] Balanță insuficientă (%.4f pUSD < %.1f minim). "
-                    "Suspendez analiza pentru %d minute.",
+                    "[Agent] Balanță insuficientă (%.4f pUSD). Intru în standby timp "
+                    "de %d minute pentru a economisi API calls.",
                     pusd_balance,
-                    _MIN_BALANCE_PUSD,
                     _LOW_BALANCE_SLEEP // 60,
                 )
                 _interruptible_sleep(_LOW_BALANCE_SLEEP)
@@ -947,6 +950,18 @@ def main() -> None:
             _scan_stats.clear()
             for market in markets:
                 if not RUNNING:
+                    break
+                # Gate de balanță INTRA-scanare: un trade dintr-o piață anterioară a
+                # aceleiași runde poate epuiza balanța (_execute_trade actualizează
+                # account_state["pusd_balance"]). Fără asta, restul piețelor ar trece
+                # prin news + Groq doar ca să fie blocate apoi în _execute_trade → zeci
+                # de API calls irosite. Abandonăm runda; sleep-ul defensiv de la
+                # începutul iterației următoare preia cât timp balanța rămâne sub minim.
+                if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+                    logger.info(
+                        "[Agent] Balanța a fost epuizată în timpul scanării curente. "
+                        "Abandonez restul piețelor din această rundă pentru a economisi API calls."
+                    )
                     break
                 hist_before = len(_analyzed_history)
                 try:
