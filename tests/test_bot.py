@@ -474,25 +474,59 @@ class TestProcessMarketStateTracking:
         mock_order = self._run(self._market(), state)
         mock_order.assert_not_called()
 
-    def test_low_balance_below_min_shares_skips_market(self):
-        # $1.96 la preț 0.70: safe_balance = 1.90, expected_shares = 2.7 < 5 → ordinul
-        # ar fi respins (400 Bad Request), deci e sărit LOCAL, nu trimis la API.
+    def test_low_balance_places_dynamic_order(self):
+        # $1.96 la preț 0.70: safe_balance ≈ 1.90 → 2.71 acțiuni, valoare ordin ≈ $1.90.
+        # Sub vechea regulă de „minim 5 share-uri" era sărit; acum, fiind > 1 acțiune
+        # și peste $1.00, ordinul DINAMIC se plasează cu cantitatea calculată.
         state = {"pusd_balance": 1.9611, "active_positions": []}
         mock_order = self._run(self._market(), state)
-        mock_order.assert_not_called()
-        assert state["pusd_balance"] == pytest.approx(1.9611)  # balanța neatinsă
-        assert state["active_positions"] == []
+        mock_order.assert_called_once()
+        kwargs = mock_order.call_args.kwargs
+        assert kwargs["size"] >= 1.0                                    # cel puțin o acțiune
+        assert kwargs["size"] * kwargs["price"] >= 1.0                  # peste minimul de $1.00
+        assert kwargs["size"] * kwargs["price"] <= 1.9611 * 0.97 + 1e-9  # nu depășește balanța sigură
+        assert state["pusd_balance"] < 1.9611                          # balanța decrementată cu costul real
+        assert len(state["active_positions"]) == 1
 
-    def test_low_balance_above_min_shares_places_buffered_order(self):
-        # $4.00 la preț 0.70: safe_balance = 3.88, expected_shares = 5.5 >= 5 → ordin
-        # mic (sub ținta de $5) plasat, dimensionat în limita balanței SIGURE (buffer 3%).
+    def test_low_balance_places_buffered_order(self):
+        # $4.00 la preț 0.70: safe_balance = 3.88 → ordin mic (sub ținta de $5),
+        # dimensionat dinamic în limita balanței SIGURE (buffer 3%).
         state = {"pusd_balance": 4.0, "active_positions": []}
         mock_order = self._run(self._market(), state)
         mock_order.assert_called_once()
         kwargs = mock_order.call_args.kwargs
-        assert kwargs["size"] >= 5.0                                  # respectă minimul de 5 share-uri
+        assert kwargs["size"] >= 1.0                                  # cel puțin o acțiune (fără minim rigid)
+        assert kwargs["size"] * kwargs["price"] >= 1.0               # peste minimul de $1.00
         assert kwargs["size"] * kwargs["price"] <= 4.0 * 0.97 + 1e-9  # buffer 3% respectat
-        assert state["pusd_balance"] < 4.0                            # balanța decrementată cu costul real
+        assert state["pusd_balance"] < 4.0                           # balanța decrementată cu costul real
+
+    def test_sub_dollar_order_value_skipped(self):
+        # Balanță $1.00 (trece de gate-ul de $1) dar bufferul 3% → safe_balance $0.97.
+        # La preț 0.46: 2.10 acțiuni × $0.46 = $0.97 valoare ordin < $1.00 → sărit
+        # LOCAL (ar fi respins de API), fără să se trimită cererea.
+        market = self._market(prices=("0.46", "0.30", "0.20"))
+        state = {"pusd_balance": 1.0, "active_positions": []}
+        mock_order = self._run(market, state)
+        mock_order.assert_not_called()
+        assert state["pusd_balance"] == pytest.approx(1.0)   # balanța neatinsă
+        assert state["active_positions"] == []
+
+    def test_price_too_high_for_single_share_skipped(self):
+        # Gardă directă pe _execute_trade: la balanță $1.00 (safe $0.97) și preț 0.98,
+        # bugetul nu acoperă nici măcar o acțiune întreagă (0.98 < 1) → sărit, fără ordin.
+        import main
+        state = {"pusd_balance": 1.0, "active_positions": []}
+        decision = {"trade": True, "outcome": "1", "confidence": 0.9, "reason": "t"}
+        with patch("main._live_best_ask", return_value=None), \
+             patch("main.place_limit_order") as mock_order:
+            main._execute_trade(
+                self._market(), state,
+                token_id="0xHI", price=0.98, outcome_label="1",
+                decision=decision, event_id="", title="High price market",
+            )
+        mock_order.assert_not_called()
+        assert state["pusd_balance"] == pytest.approx(1.0)
+        assert state["active_positions"] == []
 
     # --- Slippage guard ---
 

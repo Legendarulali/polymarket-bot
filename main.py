@@ -13,7 +13,7 @@ from config.settings import settings
 from src.reconciliation import log_reconciliation_report, get_account_state, compute_portfolio_summary
 from src.execution import (
     Side, place_limit_order, compute_order_size,
-    _TARGET_ORDER_VALUE, _BALANCE_SAFETY_BUFFER, _MIN_SHARES,
+    _TARGET_ORDER_VALUE, _BALANCE_SAFETY_BUFFER,
 )
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
@@ -46,6 +46,10 @@ _GAMMA_ASCENDING = os.getenv("GAMMA_ASCENDING", "false").strip()
 _GAMMA_TAG_IDS = [t.strip() for t in os.getenv("GAMMA_TAG_IDS", "").split(",") if t.strip()]
 _INTER_ANALYSIS_DELAY = 3                                        # secunde throttle între analize LLM
 _MIN_BALANCE_PUSD = 1.0
+# Valoarea minimă (în $) a unui ordin acceptat de API-ul Polymarket. Verificată
+# DUPĂ dimensionarea dinamică: din cauza bufferului de 3%, o balanță abia peste
+# $1 poate produce un ordin sub $1 → îl sărim local în loc să primim un 400.
+_MIN_ORDER_VALUE_USD = 1.0
 _MIN_CONFIDENCE = 0.70
 _MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "10000"))  # Ignoră piețele sub acest volum ($)
 # Fereastră de probabilitate YES UNICĂ pentru toate tipurile de piață (meci,
@@ -727,29 +731,38 @@ def _execute_trade(
     # niciodată întreaga balanță, ca estimarea de fee a CLOB să nu împingă ordinul
     # în „Insufficient Balance". safe_balance = balanță * 0.97.
     safe_balance = pusd_balance * _BALANCE_SAFETY_BUFFER
-    expected_shares = safe_balance / price
 
-    # Regula Polymarket: minim 5 share-uri per ordin. Dacă nici safe_balance nu
-    # ajunge pentru 5 share-uri la acest preț, ordinul ar fi respins cu 400 Bad
-    # Request → îl sărim local, fără a trimite cererea invalidă la API. Astfel
-    # botul plasează ordine mici doar pe piețe ieftine unde banii cumpără 5+ share-uri.
-    if expected_shares < _MIN_SHARES:
+    # Dimensionare DINAMICĂ: cumpărăm câte acțiuni permite bugetul alocat (țintă
+    # $5/ordin, plafonat la safe_balance), trunchiat (floor) la 2 zecimale astfel
+    # încât valoarea ordinului să nu depășească bugetul. Fără minim rigid de
+    # share-uri — singurele bariere sunt cele două verificări de siguranță de mai jos.
+    estimated_size = compute_order_size(price, budget=safe_balance)   # acțiuni de cumpărat
+    order_total = round(estimated_size * price, 4)                    # valoarea ordinului ($)
+
+    # Verificare 1: la acest preț bugetul nu acoperă nici măcar o acțiune întreagă.
+    if estimated_size < 1:
         logger.info(
-            "[Sizing] Skipped market: $%.2f at price $%.2f would yield only %.2f shares "
-            "(Polymarket requires minimum %d shares).",
-            safe_balance, price, expected_shares, int(_MIN_SHARES),
+            "[Sizing] Skip '%s': preț $%.2f prea mare — bugetul de $%.2f cumpără doar "
+            "%.2f acțiuni (< 1). Niciun ordin trimis.",
+            title[:40], price, safe_balance, estimated_size,
         )
         return
 
-    # Dimensionare dinamică în limita balanței SIGURE (post-buffer): țintim
-    # $5/ordin, dar folosim cel mult safe_balance (compute_order_size trunchiază
-    # astfel încât size*price <= safe_balance). Garantat >= 5 share-uri aici.
-    estimated_size = compute_order_size(price, budget=safe_balance)
-    order_total = round(estimated_size * price, 4)
+    # Verificare 2: valoarea totală a ordinului e sub minimul de $1.00 impus de
+    # API-ul Polymarket → ar fi respins (400). Îl sărim local, fără a lovi API-ul.
+    if order_total < _MIN_ORDER_VALUE_USD:
+        logger.info(
+            "[Sizing] Skip '%s': valoare ordin $%.2f (%.2f acțiuni × $%.2f) sub minimul "
+            "Polymarket de $%.2f. Niciun ordin trimis.",
+            title[:40], order_total, estimated_size, price, _MIN_ORDER_VALUE_USD,
+        )
+        return
+
     if pusd_balance < _TARGET_ORDER_VALUE:
         logger.info(
-            "[Agent] Balanță %.4f pUSD sub ținta de $%.2f — dimensionez ordinul la $%.2f (≈%.2f share-uri).",
-            pusd_balance, _TARGET_ORDER_VALUE, order_total, estimated_size,
+            "[Agent] Balanță %.4f pUSD sub ținta de $%.2f — dimensionare dinamică: "
+            "ordin $%.2f (%.2f acțiuni × $%.2f).",
+            pusd_balance, _TARGET_ORDER_VALUE, order_total, estimated_size, price,
         )
 
     logger.warning(

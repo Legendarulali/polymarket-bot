@@ -21,10 +21,6 @@ _MIN_SIZE           = 2.0   # floor absolut în shares (safety net, ramura făr�
 # angajăm niciodată întreaga balanță, ca estimarea dinamică de fee a CLOB să nu
 # împingă ordinul în „Insufficient Balance". safe_balance = balanță * 0.97.
 _BALANCE_SAFETY_BUFFER = 0.97
-# Polymarket respinge (400 Bad Request) ordinele sub acest număr de share-uri.
-# Verificat de apelant ÎNAINTE de a trimite ordinul, ca să nu lovim API-ul cu
-# cereri invalide pe balanțe mici.
-_MIN_SHARES = 5.0
 _VALID_TICK_SIZES = ("0.1", "0.01", "0.001", "0.0001")
 _DEFAULT_TICK_SIZE = "0.01"
 
