@@ -1,4 +1,6 @@
+import html
 import logging
+import re
 import defusedxml.ElementTree as ET
 import requests
 from config.settings import settings
@@ -83,6 +85,93 @@ def fetch_free_news(query: str) -> list[str]:
     except Exception as exc:
         logger.warning("[NewsMonitor] Free news fetch failed: %s", exc)
         return []
+
+
+# ---------------------------------------------------------------------------
+# Serializare știri → Markdown compact pentru prompt (curăță textul → modelul
+# Instant procesează input mai curat și dă un confidence mai precis).
+# ---------------------------------------------------------------------------
+_MD_MAX_ARTICLES = 5      # maximum articole/snippet-uri păstrate per piață
+_MD_MAX_TITLE = 140       # plafon caractere titlu (după curățare)
+_MD_MAX_SNIPPET = 200     # plafon caractere snippet (după curățare)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+
+def _clean_text(text, max_len: int) -> str:
+    """Curăță un fragment de știre pentru prompt: dez-escapează entitățile HTML, scoate
+    tag-urile HTML și orice paranteze unghiulare rămase (anti prompt-injection),
+    colapsează spațiile albe și taie la max_len. Reduce tokenii și zgomotul."""
+    if not text:
+        return ""
+    text = html.unescape(str(text))                  # &amp; → &, &#39; → ' etc.
+    text = _HTML_TAG_RE.sub(" ", text)               # scoate <tag ...>
+    text = text.replace("<", " ").replace(">", " ")  # neutralizează unghiularele rămase
+    text = _WS_RE.sub(" ", text).strip()             # colapsează spațiile
+    if len(text) > max_len:
+        text = text[:max_len].rstrip() + "…"
+    return text
+
+
+def _strip_source_suffix(title: str) -> str:
+    """Elimină sufixul „ - Publisher" tipic titlurilor Google News RSS (publisher-ul
+    se repetă pe fiecare linie → tokeni irosiți, fără valoare pentru decizie)."""
+    idx = title.rfind(" - ")
+    if idx > 0:
+        suffix = title[idx + 3:]
+        if 0 < len(suffix) <= 40 and len(suffix.split()) <= 6:
+            return title[:idx].rstrip()
+    return title
+
+
+def _title_and_snippet(item) -> tuple[str, str]:
+    """Normalizează un articol brut (string sau dict) la (titlu, snippet).
+
+    - dict (ex. Tavily / NewsAPI): citește title + snippet/description/content/summary;
+    - string (ex. titlu Google News RSS „Headline - Sursă"): titlul = headline fără
+      sufixul de sursă, fără snippet distinct."""
+    if isinstance(item, dict):
+        title = item.get("title") or item.get("headline") or ""
+        snippet = (item.get("snippet") or item.get("description")
+                   or item.get("content") or item.get("summary") or "")
+        return str(title), str(snippet)
+    return _strip_source_suffix(str(item)), ""
+
+
+def serialize_news_to_markdown(news_list, market_title: str) -> str:
+    """Comprimă lista brută de știri într-un Markdown curat și compact pentru prompt.
+
+    - păstrează maximum _MD_MAX_ARTICLES (5) cele mai relevante articole/snippet-uri;
+    - curăță fiecare fragment (entități + tag-uri HTML, spații) → text mai curat;
+    - emite structura:
+        ### Context News for: <market_title>
+        1. **[TITLE] <titlu>**
+           - Snippet: <rezumat curățat>
+      Linia „Snippet" e omisă când articolul NU are un rezumat distinct de titlu
+      (ex. titlurile Google News) — ca să nu dublăm textul și să irosim tokeni.
+
+    Acceptă atât string-uri (titluri brute) cât și dict-uri ({title, snippet, ...}).
+    Listă goală → marcaj compact „_No recent news available._"."""
+    safe_title = _clean_text(market_title, 120) or "Unknown market"
+    lines = [f"### Context News for: {safe_title}"]
+
+    count = 0
+    for item in (news_list or []):
+        raw_title, raw_snippet = _title_and_snippet(item)
+        title = _clean_text(raw_title, _MD_MAX_TITLE)
+        if not title:
+            continue
+        count += 1
+        lines.append(f"{count}. **[TITLE] {title}**")
+        snippet = _clean_text(raw_snippet, _MD_MAX_SNIPPET)
+        if snippet and snippet.lower() != title.lower():
+            lines.append(f"   - Snippet: {snippet}")
+        if count >= _MD_MAX_ARTICLES:
+            break
+
+    if count == 0:
+        lines.append("_No recent news available._")
+    return "\n".join(lines)
 
 
 def fetch_latest_breaking_news(query: str = "politics election market") -> list[str]:

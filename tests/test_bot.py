@@ -1516,6 +1516,53 @@ class TestAnalyseMatch:
 
 
 # ---------------------------------------------------------------------------
+# Tests: serialize_news_to_markdown (src/news_monitor.py)
+# ---------------------------------------------------------------------------
+
+class TestSerializeNewsToMarkdown:
+    def test_header_and_basic_shape(self):
+        from src.news_monitor import serialize_news_to_markdown
+        md = serialize_news_to_markdown(
+            ["Arsenal sign new striker - BBC Sport"], "Arsenal vs Chelsea"
+        )
+        assert md.startswith("### Context News for: Arsenal vs Chelsea")
+        # sufixul „ - BBC Sport" (sursa Google News RSS) e eliminat
+        assert "1. **[TITLE] Arsenal sign new striker**" in md
+        # titlu fără snippet distinct → linia Snippet e omisă
+        assert "Snippet:" not in md
+
+    def test_caps_at_five_articles(self):
+        from src.news_monitor import serialize_news_to_markdown
+        md = serialize_news_to_markdown([f"Headline number {i}" for i in range(7)], "Market")
+        assert "5. **[TITLE]" in md
+        assert "6. **[TITLE]" not in md
+
+    def test_html_entities_and_tags_cleaned(self):
+        from src.news_monitor import serialize_news_to_markdown
+        md = serialize_news_to_markdown([{"title": "Spurs &amp; <b>Arsenal</b> draw"}], "M")
+        assert "Spurs & Arsenal draw" in md
+        assert "&amp;" not in md and "<b>" not in md
+
+    def test_snippet_included_when_distinct_from_title(self):
+        from src.news_monitor import serialize_news_to_markdown
+        md = serialize_news_to_markdown(
+            [{"title": "Title A", "snippet": "A longer distinct summary"}], "M"
+        )
+        assert "   - Snippet: A longer distinct summary" in md
+
+    def test_snippet_omitted_when_identical_to_title(self):
+        from src.news_monitor import serialize_news_to_markdown
+        md = serialize_news_to_markdown([{"title": "Same text", "snippet": "Same text"}], "M")
+        assert "Snippet:" not in md
+
+    def test_empty_list_marker(self):
+        from src.news_monitor import serialize_news_to_markdown
+        md = serialize_news_to_markdown([], "Market X")
+        assert md.startswith("### Context News for: Market X")
+        assert "_No recent news available._" in md
+
+
+# ---------------------------------------------------------------------------
 # Tests: "next in line" opportunity queue persistence (next_in_line.json)
 # ---------------------------------------------------------------------------
 
