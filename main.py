@@ -95,6 +95,12 @@ _QUEUE_FILE = os.getenv("QUEUE_FILE") or os.path.join(
 )
 _QUEUE_TTL_HOURS = 12   # oportunitățile mai vechi sunt eliminate (știri expirate)
 _QUEUE_MAX_SIZE = 10    # plafon coadă: păstrăm intrările cu cel mai mare confidence
+# Activează coada „Wishlist". IMPLICIT dezactivată (False): coada e complet inertă —
+# funcțiile ei (_clean_queue / _process_queue / _enqueue_opportunity) NU sunt apelate.
+# Când e ON, coada salvează DOAR piețele aprobate de AI care nu pot fi deschise pentru
+# că s-a atins MAX_ACTIVE_POSITIONS (deși balanța e suficientă, ≥ _MIN_BALANCE_PUSD), și
+# le re-evaluează prioritar când se eliberează un slot. NU atinge regula de balanță 1.05.
+_ACTIVATE_QUEUE = os.getenv("ACTIVATE_QUEUE", "false").strip().lower() in ("1", "true", "yes", "on")
 
 # Stare raport orar P/L pe Discord (ts=0 → primul raport e trimis imediat la pornire)
 _last_pnl_report_ts: float = 0.0
@@ -594,8 +600,14 @@ def process_market(market: dict, account_state: dict) -> None:
     # Limita globală de poziții se re-verifică per piață: în aceeași iterație
     # pot fi deschise mai multe poziții noi, iar verificarea din bucla main
     # vede doar starea de la începutul iterației.
+    #
+    # Cu ACTIVATE_QUEUE NU ieșim devreme aici: lăsăm analiza AI să ruleze, iar dacă
+    # aprobă, `_execute_trade` salvează piața în wishlist (next_in_line.json) în loc s-o
+    # tranzacționeze. Fără ACTIVATE_QUEUE păstrăm comportamentul implicit (skip ieftin,
+    # fără apel LLM) ca să nu irosim API calls când suntem la MAX.
     if (
-        settings.MAX_ACTIVE_POSITIONS > 0
+        not _ACTIVATE_QUEUE
+        and settings.MAX_ACTIVE_POSITIONS > 0
         and len(active_positions) >= settings.MAX_ACTIVE_POSITIONS
     ):
         _scan_stats["expunere maximă"] += 1
@@ -811,32 +823,23 @@ def _execute_trade(
     token, preț valid, protecție anti-slippage față de best ask live și
     dimensionare ordin în limita balanței.
 
-    Dacă ordinul e sărit EXCLUSIV din lipsă de fonduri (balanță sub minim sau buget
-    prea mic pentru un ordin valid), oportunitatea aprobată de AI e pusă în coada
-    next_in_line.json pentru re-evaluare prioritară când revin fondurile.
-    `from_queue=True` (apel din re-procesarea cozii) dezactivează re-punerea în
-    coadă, ca o intrare să nu se reintroducă la nesfârșit."""
+    Wishlist (doar cu ACTIVATE_QUEUE): dacă balanța e suficientă (≥ _MIN_BALANCE_PUSD)
+    dar s-a atins MAX_ACTIVE_POSITIONS, piața aprobată de AI nu se tranzacționează, ci
+    se salvează în next_in_line.json pentru re-evaluare prioritară când se eliberează un
+    slot. `from_queue=True` (apel din re-procesarea cozii) dezactivează salvarea, ca o
+    intrare re-evaluată să nu se reintroducă la nesfârșit."""
     pusd_balance: float = account_state.get("pusd_balance", 0.0)
     active_positions: list[dict] = account_state.setdefault("active_positions", [])
 
-    def _queue_if_unfunded() -> None:
-        """Salvează oportunitatea în coadă (doar pe skip-urile din lipsă de fonduri)."""
-        if not from_queue:
-            _enqueue_opportunity(
-                market.get("id", "?"), token_id, title, outcome_label, price,
-                decision.get("confidence", 0.0), event_id=event_id,
-                tick_size=str(market.get("orderPriceMinTickSize") or "0.01"),
-            )
-
     # Sub pragul _MIN_BALANCE_PUSD (1.05, peste minimul Polymarket de $1 ca să acopere
-    # bufferul de 3% — vezi „zona moartă") nu putem plasa un ordin valid → blocăm (și
-    # punem în coadă). Între prag și $5 ordinul NU e blocat, ci dimensionat dinamic.
+    # bufferul de 3% — vezi „zona moartă") nu putem plasa un ordin valid → blocăm.
+    # Între prag și $5 ordinul NU e blocat, ci dimensionat dinamic. Regula NU e atinsă
+    # de ACTIVATE_QUEUE: wishlist-ul de mai jos rulează DOAR după ce trecem de acest gate.
     if pusd_balance < _MIN_BALANCE_PUSD:
         logger.warning(
             "[Agent] Balanță %.4f pUSD sub pragul de $%.2f (buffer anti-zonă-moartă) — ordin imposibil. Blocat.",
             pusd_balance, _MIN_BALANCE_PUSD,
         )
-        _queue_if_unfunded()
         return
 
     if not token_id:
@@ -853,6 +856,24 @@ def _execute_trade(
 
     if price < 0.01:
         logger.warning("[Agent] Preț invalid (%.4f) pentru token=%s. Ordin blocat.", price, token_id)
+        return
+
+    # Wishlist (ACTIVATE_QUEUE): balanță OK, token valid, fără duplicat, dar suntem la
+    # MAX_ACTIVE_POSITIONS → nu putem deschide o poziție nouă acum. Salvăm piața aprobată
+    # de AI în next_in_line.json pentru când se eliberează un slot, în loc s-o pierdem.
+    # Doar la scanare reală (not from_queue), ca o re-evaluare din coadă să nu se re-pună.
+    if (
+        not from_queue
+        and _ACTIVATE_QUEUE
+        and settings.MAX_ACTIVE_POSITIONS > 0
+        and len(active_positions) >= settings.MAX_ACTIVE_POSITIONS
+    ):
+        _scan_stats["adăugate în wishlist"] += 1
+        _enqueue_opportunity(
+            market.get("id", "?"), token_id, title, outcome_label, price,
+            decision.get("confidence", 0.0), event_id=event_id,
+            tick_size=str(market.get("orderPriceMinTickSize") or "0.01"),
+        )
         return
 
     # Protecție anti-slippage: prețul Gamma poate fi stale față de orderbook.
@@ -889,7 +910,6 @@ def _execute_trade(
             "%.2f acțiuni (< 1). Niciun ordin trimis.",
             title[:40], price, safe_balance, estimated_size,
         )
-        _queue_if_unfunded()
         return
 
     # Verificare 2: valoarea totală a ordinului e sub minimul de $1.00 impus de
@@ -900,7 +920,6 @@ def _execute_trade(
             "Polymarket de $%.2f. Niciun ordin trimis.",
             title[:40], order_total, estimated_size, price, _MIN_ORDER_VALUE_USD,
         )
-        _queue_if_unfunded()
         return
 
     if pusd_balance < _TARGET_ORDER_VALUE:
@@ -1119,13 +1138,14 @@ def main() -> None:
                 pusd_balance = settings.OVERRIDE_BALANCE
                 account_state = {**account_state, "pusd_balance": pusd_balance}
 
-            # Curățarea cozii: elimină oportunitățile expirate (> _QUEUE_TTL_HOURS)
-            # la începutul fiecărei iterații, înainte de a verifica coada sau piețele,
-            # ca să nu re-evaluăm teze pe baza unor știri perimate.
-            try:
-                _clean_queue()
-            except Exception as exc:
-                logger.error("[Queue] Curățarea cozii a eșuat: %s", exc, exc_info=True)
+            # Curățarea cozii (DOAR cu ACTIVATE_QUEUE — altfel coada e complet inertă):
+            # elimină oportunitățile expirate (> _QUEUE_TTL_HOURS) la începutul fiecărei
+            # iterații, ca să nu re-evaluăm teze pe baza unor știri perimate.
+            if _ACTIVATE_QUEUE:
+                try:
+                    _clean_queue()
+                except Exception as exc:
+                    logger.error("[Queue] Curățarea cozii a eșuat: %s", exc, exc_info=True)
 
             # Raport orar P/L pe Discord. Rulează înaintea verificării de balanță
             # ca să continue și când fondurile sunt insuficiente (bucla doarme
@@ -1160,7 +1180,15 @@ def main() -> None:
 
             # Limită globală de expunere
             n_open = len(account_state.get("active_positions", []))
-            if settings.MAX_ACTIVE_POSITIONS > 0 and n_open >= settings.MAX_ACTIVE_POSITIONS:
+            maxed = (
+                settings.MAX_ACTIVE_POSITIONS > 0
+                and n_open >= settings.MAX_ACTIVE_POSITIONS
+            )
+            # Fără ACTIVATE_QUEUE: MAX poziții = standby (comportament implicit — nu
+            # irosim API calls scanând când nu putem deschide nimic). Cu ACTIVATE_QUEUE
+            # NU dormim: scanăm ca să construim wishlist-ul (piețele aprobate de AI sunt
+            # salvate în next_in_line.json pentru când se eliberează un slot).
+            if maxed and not _ACTIVATE_QUEUE:
                 logger.info(
                     "[Agent] Limită de expunere atinsă: %d/%d poziții deschise. "
                     "Nu se deschid poziții noi. Aștept...",
@@ -1170,25 +1198,32 @@ def main() -> None:
                 _interruptible_sleep(_LOOP_INTERVAL)
                 continue
 
-            # Procesare PRIORITARĂ a cozii de oportunități (next_in_line.json) ÎNAINTE
-            # de scanarea masivă: piețe aprobate anterior de AI dar nefinanțate, acum
-            # că avem fonduri (>= _MIN_BALANCE_PUSD) și sloturi de poziții libere.
-            # Economisește API calls — nu re-scanăm mii de piețe pentru a le regăsi.
-            try:
-                _process_queue(account_state)
-            except Exception as exc:
-                logger.error("[Queue] Procesarea cozii a eșuat: %s", exc, exc_info=True)
+            # Procesare PRIORITARĂ a cozii (DOAR cu ACTIVATE_QUEUE și DOAR când avem
+            # sloturi libere): re-evaluăm wishlist-ul și deschidem pozițiile aprobate
+            # ÎNAINTE de scanarea masivă. La MAX poziții n-am putea deschide nimic, deci
+            # sărim execuția și mergem direct la scanare (care doar va alimenta wishlist-ul).
+            if _ACTIVATE_QUEUE and not maxed:
+                try:
+                    _process_queue(account_state)
+                except Exception as exc:
+                    logger.error("[Queue] Procesarea cozii a eșuat: %s", exc, exc_info=True)
 
-            # Coada poate epuiza fondurile: dacă balanța a scăzut sub minim, sărim
-            # scanarea masivă (ar fi abandonată oricum de gate-ul intra-scanare, dar
-            # nu înainte de un fetch costisitor) și intrăm direct în standby.
-            if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+                # Coada poate epuiza fondurile: dacă balanța a scăzut sub minim, sărim
+                # scanarea masivă (economisim fetch-ul costisitor) și intrăm în standby.
+                if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+                    logger.info(
+                        "[Agent] Fonduri epuizate la procesarea cozii — sar scanarea, standby %d min.",
+                        _LOW_BALANCE_SLEEP // 60,
+                    )
+                    _interruptible_sleep(_LOW_BALANCE_SLEEP)
+                    continue
+
+            if maxed:  # implică _ACTIVATE_QUEUE (altfel am fi făcut deja continue)
                 logger.info(
-                    "[Agent] Fonduri epuizate la procesarea cozii — sar scanarea, intru în standby %d min.",
-                    _LOW_BALANCE_SLEEP // 60,
+                    "[Agent] Limită de expunere atinsă (%d/%d) — ACTIVATE_QUEUE activ: "
+                    "scanez pentru wishlist (next_in_line.json), fără a deschide poziții noi.",
+                    n_open, settings.MAX_ACTIVE_POSITIONS,
                 )
-                _interruptible_sleep(_LOW_BALANCE_SLEEP)
-                continue
 
             markets = fetch_active_markets()
             if not markets:

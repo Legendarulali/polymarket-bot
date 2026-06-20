@@ -1613,13 +1613,14 @@ class TestQueuePersistence:
 
 
 # ---------------------------------------------------------------------------
-# Tests: _execute_trade enqueues ONLY when skipped for lack of funds
+# Tests: _execute_trade "wishlist" enqueue — ONLY when maxed + ACTIVATE_QUEUE
 # ---------------------------------------------------------------------------
 
-class TestExecuteTradeQueueing:
-    """Faza „Save": _execute_trade pune oportunitatea în coadă DOAR când ordinul e
-    sărit din lipsă de fonduri (nu și pentru slippage/duplicat/ordin reușit), și
-    niciodată când e apelat din re-procesarea cozii (from_queue=True)."""
+class TestWishlistEnqueue:
+    """Faza „Save" (Wishlist, ACTIVATE_QUEUE): _execute_trade salvează piața aprobată
+    de AI DOAR când balanța e suficientă (≥ 1.05) dar s-a atins MAX_ACTIVE_POSITIONS.
+    NU salvează pe lipsă de fonduri / slippage / duplicat, nu când ACTIVATE_QUEUE e
+    off, și nu la re-procesarea cozii (from_queue=True)."""
 
     def _market(self):
         return {"id": "m1", "orderPriceMinTickSize": "0.01"}
@@ -1627,15 +1628,17 @@ class TestExecuteTradeQueueing:
     def _decision(self):
         return {"trade": True, "outcome": "1", "confidence": 0.88, "reason": "t"}
 
-    def _call(self, state, *, token_id="0xTOK", price=0.50, live_ask=None, from_queue=False):
+    def _maxed_positions(self, n=5):
+        return [{"token_id": f"0xPOS{i}"} for i in range(n)]
+
+    def _call(self, state, *, activate_queue=True, max_positions=5,
+              token_id="0xTOK", price=0.50, live_ask=None, from_queue=False):
         import main
-        # Prag de fonduri pinned la 1.0 ca skip-urile de sizing (order_total /
-        # estimated_size) să rămână reachable la balanța 1.0 folosită mai jos; în
-        # producție pragul e 1.05 (zona moartă e acoperită de TestDeadZoneGuard).
-        # Funds wall la balanța 0.5 se declanșează identic sub orice prag ≥ 1.0.
-        with patch.object(main, "_MIN_BALANCE_PUSD", 1.0), \
+        from config.settings import settings
+        with patch.object(main, "_ACTIVATE_QUEUE", activate_queue), \
+             patch.object(settings, "MAX_ACTIVE_POSITIONS", max_positions), \
              patch("main._live_best_ask", return_value=live_ask), \
-             patch("main.place_limit_order", return_value={"success": True, "order_id": "o"}), \
+             patch("main.place_limit_order", return_value={"success": True, "order_id": "o"}) as mock_order, \
              patch("main._enqueue_opportunity") as mock_enq:
             main._execute_trade(
                 self._market(), state,
@@ -1643,45 +1646,63 @@ class TestExecuteTradeQueueing:
                 decision=self._decision(), event_id="ev", title="Arsenal vs Chelsea",
                 from_queue=from_queue,
             )
-        return mock_enq
+        return mock_order, mock_enq
 
-    def test_funds_wall_enqueues(self):
-        enq = self._call({"pusd_balance": 0.5, "active_positions": []})
-        enq.assert_called_once()
-        args, kwargs = enq.call_args
+    def test_maxed_and_activate_queue_enqueues(self):
+        # balanță OK (≥1.05), MAX poziții atins, ACTIVATE_QUEUE on → wishlist (fără ordin).
+        state = {"pusd_balance": 20.0, "active_positions": self._maxed_positions()}
+        mock_order, mock_enq = self._call(state)
+        mock_order.assert_not_called()
+        mock_enq.assert_called_once()
+        args, kwargs = mock_enq.call_args
         assert args[0] == "m1"               # market_id
         assert args[1] == "0xTOK"            # token_id
         assert args[3] == "1 (Arsenal)"      # outcome_label
         assert kwargs["event_id"] == "ev"
 
-    def test_order_total_skip_enqueues(self):
-        # balanță $1.00, preț 0.46: după bufferul de 3% ordinul scade sub $1 → skip.
-        enq = self._call({"pusd_balance": 1.0, "active_positions": []}, price=0.46)
-        enq.assert_called_once()
+    def test_not_maxed_trades_no_enqueue(self):
+        # ACTIVATE_QUEUE on dar sub MAX → tranzacționăm normal, fără wishlist.
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        mock_order, mock_enq = self._call(state)
+        mock_order.assert_called_once()
+        mock_enq.assert_not_called()
 
-    def test_price_too_high_skip_enqueues(self):
-        # balanță $1.00, preț 0.98: bugetul nu acoperă o acțiune întreagă → skip.
-        enq = self._call({"pusd_balance": 1.0, "active_positions": []}, price=0.98)
-        enq.assert_called_once()
+    def test_maxed_but_queue_off_no_enqueue(self):
+        # ACTIVATE_QUEUE off: _execute_trade NU verifică MAX (process_market o face);
+        # apel direct → fără wishlist, ordinul se plasează normal.
+        state = {"pusd_balance": 20.0, "active_positions": self._maxed_positions()}
+        mock_order, mock_enq = self._call(state, activate_queue=False)
+        mock_enq.assert_not_called()
+        mock_order.assert_called_once()
 
-    def test_slippage_skip_does_not_enqueue(self):
-        # ask live mult peste preț → slippage (NU lipsă de fonduri) → fără enqueue.
-        enq = self._call({"pusd_balance": 20.0, "active_positions": []}, price=0.50, live_ask=0.80)
-        enq.assert_not_called()
+    def test_below_balance_gate_no_enqueue(self):
+        # Regula 1.05 e neatinsă de ACTIVATE_QUEUE: sub prag → blocat la funds wall,
+        # fără wishlist, chiar dacă suntem la MAX (protejează API-ul).
+        state = {"pusd_balance": 1.0, "active_positions": self._maxed_positions()}
+        mock_order, mock_enq = self._call(state)
+        mock_order.assert_not_called()
+        mock_enq.assert_not_called()
 
-    def test_duplicate_token_does_not_enqueue(self):
-        state = {"pusd_balance": 20.0, "active_positions": [{"token_id": "0xTOK"}]}
-        enq = self._call(state)
-        enq.assert_not_called()
+    def test_duplicate_token_no_enqueue_when_maxed(self):
+        # Dacă deținem deja token-ul, dedup-ul iese înainte de verificarea de wishlist.
+        positions = self._maxed_positions()
+        positions[0] = {"token_id": "0xTOK"}
+        state = {"pusd_balance": 20.0, "active_positions": positions}
+        _, mock_enq = self._call(state)
+        mock_enq.assert_not_called()
 
-    def test_successful_order_does_not_enqueue(self):
-        enq = self._call({"pusd_balance": 20.0, "active_positions": []})
-        enq.assert_not_called()
+    def test_from_queue_does_not_reenqueue_when_maxed(self):
+        # Re-procesarea cozii (from_queue=True) nu re-pune în wishlist (anti-buclă).
+        state = {"pusd_balance": 20.0, "active_positions": self._maxed_positions()}
+        _, mock_enq = self._call(state, from_queue=True)
+        mock_enq.assert_not_called()
 
-    def test_from_queue_does_not_reenqueue(self):
-        # chiar și pe funds wall, from_queue=True NU re-pune în coadă (anti-buclă).
-        enq = self._call({"pusd_balance": 0.5, "active_positions": []}, from_queue=True)
-        enq.assert_not_called()
+    def test_lack_of_funds_no_longer_enqueues(self):
+        # Vechiul trigger pe lipsă de fonduri a fost ELIMINAT: coada e DOAR pe MAX
+        # poziții. Balanță 1.0 (sub prag), fără poziții → blocat, nimic în wishlist.
+        state = {"pusd_balance": 1.0, "active_positions": []}
+        _, mock_enq = self._call(state)
+        mock_enq.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1874,11 +1895,12 @@ class TestDeadZoneGuard:
             )
         return state, mock_order, mock_enq
 
-    def test_dead_zone_balance_blocked_and_enqueued(self):
-        # 1.04 ∈ [1.00, 1.05): blocat la funds wall, niciun ordin, dar pus în coadă.
+    def test_dead_zone_balance_blocked_no_order(self):
+        # 1.04 ∈ [1.00, 1.05): blocat la funds wall, niciun ordin. Fără wishlist:
+        # coada e DOAR pe MAX poziții, nu pe lipsă de fonduri (ACTIVATE_QUEUE off aici).
         state, mock_order, mock_enq = self._run(1.04, price=0.50)
         mock_order.assert_not_called()
-        mock_enq.assert_called_once()
+        mock_enq.assert_not_called()
         assert state["pusd_balance"] == pytest.approx(1.04)   # balanța neatinsă
 
     def test_one_dollar_balance_now_blocked(self):
@@ -1900,3 +1922,68 @@ class TestDeadZoneGuard:
         state, mock_order, mock_enq = self._run(1.05, price=0.50)
         mock_order.assert_called_once()
         mock_enq.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: ACTIVATE_QUEUE flag gating (default off; wishlist only when maxed)
+# ---------------------------------------------------------------------------
+
+class TestActivateQueueFlag:
+    """ACTIVATE_QUEUE gatează întreaga coadă. IMPLICIT False (coadă inertă). Când e
+    True ȘI suntem la MAX poziții, process_market lasă AI-ul să analizeze și salvează
+    aprobările în wishlist; când e False, păstrează skip-ul ieftin (fără apel LLM)."""
+
+    def _match_market(self):
+        return {
+            "id": "m1", "question": "Arsenal vs Chelsea", "volume": "50000",
+            "outcomes": json.dumps(["Arsenal", "Draw", "Chelsea"]),
+            "outcomePrices": json.dumps(["0.70", "0.20", "0.10"]),
+            "clobTokenIds": json.dumps(["0xA", "0xX", "0xC"]),
+            "events": [{"slug": "ev-1"}],
+        }
+
+    def test_default_is_false(self):
+        import main
+        assert main._ACTIVATE_QUEUE is False
+
+    def _run(self, *, activate_queue, n_positions):
+        import main
+        from config.settings import settings
+        decision = {"trade": True, "outcome": "1", "confidence": 0.9, "reason": "t"}
+        state = {
+            "pusd_balance": 20.0,
+            "active_positions": [{"token_id": f"0xP{i}", "event_id": ""} for i in range(n_positions)],
+        }
+        with patch.object(main, "_ACTIVATE_QUEUE", activate_queue), \
+             patch.object(settings, "MAX_ACTIVE_POSITIONS", 5), \
+             patch("main.fetch_free_news", return_value=[]), \
+             patch("main.analyse_match", return_value=decision) as am, \
+             patch("main._record_analyzed"), \
+             patch("main._live_best_ask", return_value=None), \
+             patch("main.place_limit_order", return_value={"success": True, "order_id": "o"}) as mo, \
+             patch("main._enqueue_opportunity") as enq:
+            main.process_market(self._match_market(), state)
+        return am, mo, enq
+
+    def test_maxed_with_queue_analyses_and_wishlists(self):
+        # ACTIVATE_QUEUE on + MAX poziții: AI rulează, dar piața merge în wishlist
+        # (niciun ordin deschis).
+        am, mo, enq = self._run(activate_queue=True, n_positions=5)
+        am.assert_called_once()    # analiza AI a rulat (NU early-return pe MAX)
+        mo.assert_not_called()     # niciun ordin (suntem la MAX)
+        enq.assert_called_once()   # salvat în wishlist
+
+    def test_maxed_without_queue_skips_before_llm(self):
+        # ACTIVATE_QUEUE off + MAX poziții: skip ieftin înainte de AI (comportament
+        # implicit — economisim API calls).
+        am, mo, enq = self._run(activate_queue=False, n_positions=5)
+        am.assert_not_called()     # Groq NU a fost apelat
+        mo.assert_not_called()
+        enq.assert_not_called()
+
+    def test_not_maxed_with_queue_trades(self):
+        # ACTIVATE_QUEUE on dar sub MAX: tranzacționăm normal, fără wishlist.
+        am, mo, enq = self._run(activate_queue=True, n_positions=0)
+        am.assert_called_once()
+        mo.assert_called_once()
+        enq.assert_not_called()
