@@ -45,10 +45,18 @@ _GAMMA_ASCENDING = os.getenv("GAMMA_ASCENDING", "false").strip()
 # Gol = dezactivat. Necesită tag_id-urile NUMERICE reale (vezi .env.example).
 _GAMMA_TAG_IDS = [t.strip() for t in os.getenv("GAMMA_TAG_IDS", "").split(",") if t.strip()]
 _INTER_ANALYSIS_DELAY = 3                                        # secunde throttle între analize LLM
-_MIN_BALANCE_PUSD = 1.0
+# Balanța minimă (pUSD) sub care nu mai analizăm/tranzacționăm. 1.05 (nu 1.00) ca
+# să acopere bufferul de siguranță de 3% din dimensionare: în „zona moartă"
+# 1.00–1.04, safe_balance = balanță*0.97 produce un ordin sub minimul Polymarket de
+# $1 ([Sizing] Skip) FĂRĂ ca balanța să scadă → break-ul nu se declanșează și botul
+# ar apela Groq în gol pe toate cele ~2100 de piețe la fiecare buclă. La 1.05,
+# safe_balance ≈ 1.0185, deci orice piață care trece de gate produce un ordin
+# finanțabil (≥ $1) și balanța chiar scade.
+_MIN_BALANCE_PUSD = 1.05
 # Valoarea minimă (în $) a unui ordin acceptat de API-ul Polymarket. Verificată
-# DUPĂ dimensionarea dinamică: din cauza bufferului de 3%, o balanță abia peste
-# $1 poate produce un ordin sub $1 → îl sărim local în loc să primim un 400.
+# DUPĂ dimensionarea dinamică. Acum în mare parte defensivă: pragul _MIN_BALANCE_PUSD
+# de 1.05 previne deja zona moartă, dar păstrăm verificarea ca plasă de siguranță
+# (ex: dacă bufferul de 3% se schimbă) — sărim local în loc să primim un 400.
 _MIN_ORDER_VALUE_USD = 1.0
 _MIN_CONFIDENCE = 0.70
 _MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "10000"))  # Ignoră piețele sub acest volum ($)
@@ -820,12 +828,12 @@ def _execute_trade(
                 tick_size=str(market.get("orderPriceMinTickSize") or "0.01"),
             )
 
-    # Polymarket respinge ordinele sub $1 valoare totală: dacă balanța e sub acest
-    # minim absolut nu putem plasa niciun ordin valid → blocăm (și punem în coadă).
-    # Între $1 și $5 ordinul NU mai e blocat, ci dimensionat dinamic (vezi mai jos).
+    # Sub pragul _MIN_BALANCE_PUSD (1.05, peste minimul Polymarket de $1 ca să acopere
+    # bufferul de 3% — vezi „zona moartă") nu putem plasa un ordin valid → blocăm (și
+    # punem în coadă). Între prag și $5 ordinul NU e blocat, ci dimensionat dinamic.
     if pusd_balance < _MIN_BALANCE_PUSD:
         logger.warning(
-            "[Agent] Balanță %.4f pUSD sub minimul Polymarket de $%.2f — ordin imposibil. Blocat.",
+            "[Agent] Balanță %.4f pUSD sub pragul de $%.2f (buffer anti-zonă-moartă) — ordin imposibil. Blocat.",
             pusd_balance, _MIN_BALANCE_PUSD,
         )
         _queue_if_unfunded()

@@ -410,8 +410,12 @@ class TestProcessMarketStateTracking:
 
         # _record_analyzed / _enqueue_opportunity are patched out so process_market
         # touches neither history.json nor next_in_line.json; that persistence is
-        # covered separately (TestAnalyzedHistory / TestQueuePersistence).
-        with patch("main.fetch_free_news", return_value=[]), \
+        # covered separately (TestAnalyzedHistory / TestQueuePersistence). The funds
+        # gate is pinned to 1.0 so the sizing/skip logic stays reachable at the
+        # balances these tests use, decoupled from the production value (1.05, whose
+        # dead-zone behaviour is covered by TestDeadZoneGuard).
+        with patch.object(main, "_MIN_BALANCE_PUSD", 1.0), \
+             patch("main.fetch_free_news", return_value=[]), \
              patch("main.analyse_match", return_value=decision), \
              patch("main._record_analyzed"), \
              patch("main._enqueue_opportunity"), \
@@ -519,7 +523,10 @@ class TestProcessMarketStateTracking:
         import main
         state = {"pusd_balance": 1.0, "active_positions": []}
         decision = {"trade": True, "outcome": "1", "confidence": 0.9, "reason": "t"}
-        with patch("main._live_best_ask", return_value=None), \
+        # Prag coborât la 1.0 ca să reabilităm garda de sizing (în producție pragul
+        # de 1.05 ar prinde această balanță la funds wall — vezi TestDeadZoneGuard).
+        with patch.object(main, "_MIN_BALANCE_PUSD", 1.0), \
+             patch("main._live_best_ask", return_value=None), \
              patch("main._enqueue_opportunity"), \
              patch("main.place_limit_order") as mock_order:
             main._execute_trade(
@@ -673,7 +680,9 @@ class TestSettings:
 
     def test_min_balance_constant_in_main(self):
         import main
-        assert main._MIN_BALANCE_PUSD == pytest.approx(1.0)
+        # 1.05, nu 1.00: nodul de 5 cenți acoperă bufferul de 3% din sizing și
+        # elimină „zona moartă" 1.00–1.04 (vezi TestDeadZoneGuard).
+        assert main._MIN_BALANCE_PUSD == pytest.approx(1.05)
 
     def test_min_confidence_constant_in_main(self):
         import main
@@ -1620,7 +1629,12 @@ class TestExecuteTradeQueueing:
 
     def _call(self, state, *, token_id="0xTOK", price=0.50, live_ask=None, from_queue=False):
         import main
-        with patch("main._live_best_ask", return_value=live_ask), \
+        # Prag de fonduri pinned la 1.0 ca skip-urile de sizing (order_total /
+        # estimated_size) să rămână reachable la balanța 1.0 folosită mai jos; în
+        # producție pragul e 1.05 (zona moartă e acoperită de TestDeadZoneGuard).
+        # Funds wall la balanța 0.5 se declanșează identic sub orice prag ≥ 1.0.
+        with patch.object(main, "_MIN_BALANCE_PUSD", 1.0), \
+             patch("main._live_best_ask", return_value=live_ask), \
              patch("main.place_limit_order", return_value={"success": True, "order_id": "o"}), \
              patch("main._enqueue_opportunity") as mock_enq:
             main._execute_trade(
@@ -1829,3 +1843,60 @@ class TestProcessQueue:
         # Prima re-evaluare e a intrării cu confidence mai mare (0.96 înaintea lui 0.72).
         assert seen[0].startswith("HIGH match")
         assert len(seen) == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: dead-zone guard — _MIN_BALANCE_PUSD = 1.05 covers the 3% sizing buffer
+# ---------------------------------------------------------------------------
+
+class TestDeadZoneGuard:
+    """La gate-ul REAL de 1.05, o balanță din „zona moartă" 1.00–1.04 e blocată la
+    funds wall (și pusă în coadă) în loc să treacă, să producă un [Sizing] Skip sub
+    $1 fără a scădea balanța și să trimită botul în bucla-în-gol care apela Groq pe
+    toate piețele. O balanță ≥ 1.05 produce un ordin finanțabil (≥ $1)."""
+
+    def _market(self):
+        return {"id": "m1", "orderPriceMinTickSize": "0.01"}
+
+    def _decision(self):
+        return {"trade": True, "outcome": "1", "confidence": 0.9, "reason": "t"}
+
+    def _run(self, balance, price):
+        import main
+        state = {"pusd_balance": balance, "active_positions": []}
+        with patch("main._live_best_ask", return_value=None), \
+             patch("main.place_limit_order", return_value={"success": True, "order_id": "o"}) as mock_order, \
+             patch("main._enqueue_opportunity") as mock_enq:
+            main._execute_trade(
+                self._market(), state,
+                token_id="0xTOK", price=price, outcome_label="1 (Arsenal)",
+                decision=self._decision(), event_id="ev", title="Arsenal vs Chelsea",
+            )
+        return state, mock_order, mock_enq
+
+    def test_dead_zone_balance_blocked_and_enqueued(self):
+        # 1.04 ∈ [1.00, 1.05): blocat la funds wall, niciun ordin, dar pus în coadă.
+        state, mock_order, mock_enq = self._run(1.04, price=0.50)
+        mock_order.assert_not_called()
+        mock_enq.assert_called_once()
+        assert state["pusd_balance"] == pytest.approx(1.04)   # balanța neatinsă
+
+    def test_one_dollar_balance_now_blocked(self):
+        # Exact $1.00 (vechea valoare a pragului) e acum tot în zona moartă → blocat.
+        _, mock_order, _ = self._run(1.0, price=0.50)
+        mock_order.assert_not_called()
+
+    def test_balance_at_gate_funds_order_worst_price(self):
+        # La 1.05 și prețul cel mai defavorabil truncării (0.99), ordinul tot
+        # depășește minimul de $1 → se plasează, balanța chiar scade, nimic în coadă.
+        state, mock_order, mock_enq = self._run(1.05, price=0.99)
+        mock_order.assert_called_once()
+        mock_enq.assert_not_called()
+        kwargs = mock_order.call_args.kwargs
+        assert kwargs["size"] * kwargs["price"] >= 1.0   # ordin finanțabil
+        assert state["pusd_balance"] < 1.05              # balanța chiar scade
+
+    def test_balance_above_gate_funds_order_midprice(self):
+        state, mock_order, mock_enq = self._run(1.05, price=0.50)
+        mock_order.assert_called_once()
+        mock_enq.assert_not_called()
