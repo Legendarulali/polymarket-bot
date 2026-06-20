@@ -2224,3 +2224,134 @@ class TestBatchScan:
             main._scan_markets([self._match_market("m1"), self._match_market("m2")], state)
         mock_ab.assert_not_called()                 # nu se folosește batch-ul
         assert mock_am.call_count == 2              # analiză individuală per piață
+
+
+# ---------------------------------------------------------------------------
+# Tests: DRY_RUN (mod simulare / stress test) — scanează & trimite loturi, dar
+# nu plasează niciun ordin real (interceptat în _execute_trade)
+# ---------------------------------------------------------------------------
+
+class TestDryRun:
+    """DRY_RUN trece peste gate-urile de balanță/expunere ca să trimită loturile către
+    Groq, dar `_execute_trade` e interceptat la intrare → niciun ordin real."""
+
+    def _market(self):
+        return {"id": "m1", "orderPriceMinTickSize": "0.01"}
+
+    def _decision(self):
+        return {"trade": True, "outcome": "1", "confidence": 0.88, "reason": "t"}
+
+    def _match_market(self, mid):
+        return {
+            "id": mid, "question": "Arsenal vs Chelsea", "volume": "50000",
+            "outcomes": json.dumps(["Arsenal", "Draw", "Chelsea"]),
+            "outcomePrices": json.dumps(["0.55", "0.25", "0.20"]),
+            "clobTokenIds": json.dumps([f"0xA{mid}", f"0xX{mid}", f"0xC{mid}"]),
+            "events": [{"slug": f"ev-{mid}"}],
+        }
+
+    def test_default_is_false(self):
+        import main
+        assert main._DRY_RUN is False
+
+    def test_execute_trade_blocks_order_and_logs(self, caplog):
+        import logging
+        import main
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        with patch.object(main, "_DRY_RUN", True), \
+             patch("main._live_best_ask", return_value=None), \
+             patch("main._enqueue_opportunity") as mock_enq, \
+             patch("main.place_limit_order") as mock_order:
+            with caplog.at_level(logging.WARNING):
+                main._execute_trade(
+                    self._market(), state,
+                    token_id="0xTOK", price=0.5, outcome_label="1 (Arsenal)",
+                    decision=self._decision(), event_id="ev", title="Arsenal vs Chelsea",
+                )
+        mock_order.assert_not_called()                       # niciun ordin real
+        mock_enq.assert_not_called()                         # nici wishlist
+        assert "[DRY_RUN] Simulare" in caplog.text
+        assert "Arsenal vs Chelsea" in caplog.text
+        assert "nu plasăm ordin real" in caplog.text
+        assert state["pusd_balance"] == pytest.approx(20.0)  # stare neatinsă
+        assert state["active_positions"] == []
+
+    def test_intercepts_above_funds_wall(self, caplog):
+        # Balanță 0.5 (< 1.05): normal ar fi blocată la funds wall ÎNAINTE de orice log.
+        # În DRY_RUN interceptarea e DEASUPRA gate-ului → tot simulăm, fără ordin.
+        import logging
+        import main
+        state = {"pusd_balance": 0.5, "active_positions": []}
+        with patch.object(main, "_DRY_RUN", True), \
+             patch("main.place_limit_order") as mock_order:
+            with caplog.at_level(logging.WARNING):
+                main._execute_trade(
+                    self._market(), state,
+                    token_id="0xTOK", price=0.5, outcome_label="1",
+                    decision=self._decision(), event_id="", title="Low balance market",
+                )
+        mock_order.assert_not_called()
+        assert "[DRY_RUN] Simulare" in caplog.text
+        assert "sub pragul" not in caplog.text   # NU a lovit funds wall-ul
+
+    def test_scan_sends_batches_despite_low_balance(self):
+        import main
+        state = {"pusd_balance": 0.5, "active_positions": []}   # < 1.05
+        captured = {"calls": 0}
+
+        def fake_batch(requests):
+            captured["calls"] += 1
+            return {str(r["market_id"]): {"trade": True, "outcome": "1",
+                    "confidence": 0.9, "reason": "r"} for r in requests}
+
+        with patch.object(main, "_DRY_RUN", True), \
+             patch.object(main, "_BATCH_SIZE", 5), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch("main.fetch_free_news", return_value=[]), \
+             patch("main._record_analyzed"), \
+             patch("main.analyse_batch", side_effect=fake_batch), \
+             patch("main._live_best_ask", return_value=None), \
+             patch("main.place_limit_order") as mock_order:
+            main._scan_markets([self._match_market("m1"), self._match_market("m2")], state)
+        assert captured["calls"] == 1        # lotul a fost trimis la Groq deși balanța < 1.05
+        mock_order.assert_not_called()        # dar niciun ordin real (DRY_RUN)
+
+    def test_scan_not_blocked_when_maxed(self):
+        # MAX poziții + DRY_RUN: _prepare_market NU mai iese devreme → piața ajunge în lot.
+        import main
+        from config.settings import settings
+        state = {"pusd_balance": 0.5,
+                 "active_positions": [{"token_id": f"0xP{i}", "event_id": ""} for i in range(5)]}
+        captured = {"calls": 0}
+
+        def fake_batch(requests):
+            captured["calls"] += 1
+            return {str(r["market_id"]): {"trade": False, "outcome": "NONE",
+                    "confidence": 0.0, "reason": "x"} for r in requests}
+
+        with patch.object(main, "_DRY_RUN", True), \
+             patch.object(main, "_BATCH_SIZE", 5), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch.object(settings, "MAX_ACTIVE_POSITIONS", 5), \
+             patch("main.fetch_free_news", return_value=[]), \
+             patch("main._record_analyzed"), \
+             patch("main.analyse_batch", side_effect=fake_batch):
+            main._scan_markets([self._match_market("m1")], state)
+        assert captured["calls"] == 1        # piața a ajuns în lot chiar la MAX poziții
+
+    def test_record_analyzed_is_noop(self, monkeypatch, tmp_path):
+        import main
+        monkeypatch.setattr(main, "_HISTORY_FILE", str(tmp_path / "h.json"))
+        monkeypatch.setattr(main, "_analyzed_history", {})
+        with patch.object(main, "_DRY_RUN", True):
+            main._record_analyzed("m1")
+        assert main._analyzed_history == {}                       # nimic persistat
+        assert not (tmp_path / "h.json").exists()                 # fișierul real neatins
+
+    def test_is_recently_analyzed_always_false(self, monkeypatch):
+        import main
+        import time
+        monkeypatch.setattr(main, "_analyzed_history", {"m1": time.time()})
+        with patch.object(main, "_DRY_RUN", True):
+            assert main._is_recently_analyzed("m1") is False      # cooldown ignorat
+        assert main._is_recently_analyzed("m1") is True           # fără DRY_RUN: recent

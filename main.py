@@ -50,6 +50,13 @@ _INTER_ANALYSIS_DELAY = 3                                        # secunde throt
 # fără a lovi rate-limit-urile (429). Implicit 12 (recomandat 10-15). BATCH_SIZE<=1
 # revine la analiza individuală (o cerere per piață, prin process_market).
 _BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "12")))
+# Mod SIMULARE (stress test Groq). IMPLICIT False. Când e True: botul trece peste
+# gate-urile de balanță (1.05 pUSD) și de expunere ca să scaneze și să trimită loturile
+# către Groq (testăm rate-limit-urile), dar NU plasează NICIUN ordin real — `_execute_trade`
+# e interceptat la intrare și doar loghează „[DRY_RUN] Simulare …". În plus: nu scrie în
+# history.json (ca să nu polueze cooldown-ul real) și sare verificările de exit TP/SL (care
+# plasează ordine SELL reale prin position_manager). Folosește DRY_RUN=true DOAR pentru teste.
+_DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in ("1", "true", "yes", "on")
 # Balanța minimă (pUSD) sub care nu mai analizăm/tranzacționăm. 1.05 (nu 1.00) ca
 # să acopere bufferul de siguranță de 3% din dimensionare: în „zona moartă"
 # 1.00–1.04, safe_balance = balanță*0.97 produce un ordin sub minimul Polymarket de
@@ -408,13 +415,23 @@ def _save_history() -> None:
 
 
 def _is_recently_analyzed(market_id: str) -> bool:
-    """True dacă piața a fost analizată în ultimele _CACHE_TTL_SECONDS (cooldown activ)."""
+    """True dacă piața a fost analizată în ultimele _CACHE_TTL_SECONDS (cooldown activ).
+
+    În DRY_RUN întoarce mereu False: ignorăm cooldown-ul ca fiecare iterație să re-scaneze
+    TOT și să retrimită loturile către Groq (sarcină susținută pentru stress test)."""
+    if _DRY_RUN:
+        return False
     ts = _analyzed_history.get(market_id)
     return ts is not None and (time.time() - ts) < _CACHE_TTL_SECONDS
 
 
 def _record_analyzed(market_id: str) -> None:
-    """Marchează o piață ca analizată acum și persistă imediat istoricul."""
+    """Marchează o piață ca analizată acum și persistă imediat istoricul.
+
+    În DRY_RUN e no-op: nu persistăm nimic, ca să nu poluăm cooldown-ul real din
+    history.json (altfel, după simulare, piețele ar fi blocate 4h în modul live)."""
+    if _DRY_RUN:
+        return
     _analyzed_history[market_id] = time.time()
     _save_history()
 
@@ -613,9 +630,11 @@ def _prepare_market(market: dict, account_state: dict) -> dict | None:
     # Cu ACTIVATE_QUEUE NU ieșim devreme aici: lăsăm analiza AI să ruleze, iar dacă
     # aprobă, `_execute_trade` salvează piața în wishlist (next_in_line.json) în loc s-o
     # tranzacționeze. Fără ACTIVATE_QUEUE păstrăm comportamentul implicit (skip ieftin,
-    # fără apel LLM) ca să nu irosim API calls când suntem la MAX.
+    # fără apel LLM) ca să nu irosim API calls când suntem la MAX. În DRY_RUN nu ieșim
+    # devreme nici la MAX: vrem ca piața să ajungă în lot și să fie trimisă către Groq.
     if (
         not _ACTIVATE_QUEUE
+        and not _DRY_RUN
         and settings.MAX_ACTIVE_POSITIONS > 0
         and len(active_positions) >= settings.MAX_ACTIVE_POSITIONS
     ):
@@ -875,6 +894,19 @@ def _execute_trade(
     intrare re-evaluată să nu se reintroducă la nesfârșit."""
     pusd_balance: float = account_state.get("pusd_balance", 0.0)
     active_positions: list[dict] = account_state.setdefault("active_positions", [])
+
+    # DRY_RUN (mod simulare / stress test): la acest punct piața a fost deja APROBATĂ de
+    # AI (trade=True, confidence ≥ prag — verificate în `_apply_decision`/`_reevaluate_queued`).
+    # Interceptăm AICI, înaintea oricărei verificări sau apel CLOB: NU plasăm niciun ordin
+    # real, nu atingem balanța/pozițiile/coada — doar logăm. E plasă de siguranță finală:
+    # indiferent ce gate-uri ar trece în amonte, niciun ordin real nu pleacă în DRY_RUN.
+    if _DRY_RUN:
+        logger.warning(
+            "[DRY_RUN] Simulare: Piața '%s' a fost aprobată de AI (outcome=%s, confidence=%.2f), "
+            "dar nu plasăm ordin real.",
+            title[:80], outcome_label, decision.get("confidence", 0.0),
+        )
+        return
 
     # Sub pragul _MIN_BALANCE_PUSD (1.05, peste minimul Polymarket de $1 ca să acopere
     # bufferul de 3% — vezi „zona moartă") nu putem plasa un ordin valid → blocăm.
@@ -1176,7 +1208,7 @@ def _flush_batch(batch: list[dict], account_state: dict) -> None:
             _apply_decision(it, decision, account_state)
         except Exception as exc:
             logger.error("[Batch] Eroare la aplicarea deciziei pentru id=%s: %s", mid, exc, exc_info=True)
-        if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+        if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
             logger.info(
                 "[Batch] Balanță sub minimul de $%.2f în timpul execuției lotului — "
                 "opresc aplicarea restului.", _MIN_BALANCE_PUSD,
@@ -1201,7 +1233,7 @@ def _scan_markets(markets: list[dict], account_state: dict) -> None:
         for market in markets:
             if not RUNNING:
                 break
-            if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+            if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
                 logger.info(
                     "[Agent] Balanța a fost epuizată în timpul scanării curente. "
                     "Abandonez restul piețelor din această rundă pentru a economisi API calls."
@@ -1225,7 +1257,7 @@ def _scan_markets(markets: list[dict], account_state: dict) -> None:
     for market in markets:
         if not RUNNING:
             break
-        if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+        if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
             logger.info(
                 "[Agent] Balanța a fost epuizată în timpul scanării curente. "
                 "Abandonez restul piețelor din această rundă pentru a economisi API calls."
@@ -1246,7 +1278,7 @@ def _scan_markets(markets: list[dict], account_state: dict) -> None:
         if len(batch) >= _BATCH_SIZE:
             _flush_batch(batch, account_state)
             batch = []
-            if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+            if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
                 logger.info("[Agent] Balanța a fost epuizată după un lot. Abandonez restul rundei.")
                 break
 
@@ -1269,6 +1301,13 @@ def main() -> None:
         "DOAR meciuri de fotbal (Match Odds / 1X2)" if _FOOTBALL_ONLY
         else "universal — toate piețele (fotbal → 1X2, restul → binar YES/NO)",
     )
+    if _DRY_RUN:
+        logger.warning(
+            "[DRY_RUN] MOD SIMULARE ACTIV: trec peste gate-urile de balanță ($%.2f) și de "
+            "expunere ca să scanez și să trimit loturi către Groq, dar NU plasez NICIUN ordin "
+            "real și sar verificările TP/SL. Dezactivează DRY_RUN pentru tranzacționare reală.",
+            _MIN_BALANCE_PUSD,
+        )
 
     if settings.OVERRIDE_BALANCE > 0:
         logger.warning(
@@ -1333,10 +1372,13 @@ def main() -> None:
             # Verifică TP/SL pe pozițiile deschise (opt-in via TAKE_PROFIT_PCT /
             # STOP_LOSS_PCT). Rulează înainte de verificarea de balanță: vânzarea
             # trebuie să funcționeze și când nu mai sunt fonduri de cumpărare.
-            try:
-                check_exit_conditions(account_state)
-            except Exception as exc:
-                logger.error("[Agent] Exit check eșuat: %s", exc, exc_info=True)
+            # În DRY_RUN sărim complet: TP/SL plasează ordine SELL REALE (prin
+            # position_manager, nu prin _execute_trade) → nimic nu trebuie să ajungă pe lanț.
+            if not _DRY_RUN:
+                try:
+                    check_exit_conditions(account_state)
+                except Exception as exc:
+                    logger.error("[Agent] Exit check eșuat: %s", exc, exc_info=True)
 
             # Verificare balanță înainte de orice apel LLM (Groq) sau scanare de
             # piețe: cu balanța epuizată orice analiză ar irosi API calls degeaba.
@@ -1344,14 +1386,19 @@ def main() -> None:
             # apelează Groq — ca raportul să iasă la timp și pozițiile să poată fi
             # închise chiar și fără fonduri de cumpărare.
             if pusd_balance < _MIN_BALANCE_PUSD:
-                logger.warning(
-                    "[Agent] Balanță insuficientă (%.4f pUSD). Intru în standby timp "
-                    "de %d minute pentru a economisi API calls.",
-                    pusd_balance,
-                    _LOW_BALANCE_SLEEP // 60,
+                if not _DRY_RUN:
+                    logger.warning(
+                        "[Agent] Balanță insuficientă (%.4f pUSD). Intru în standby timp "
+                        "de %d minute pentru a economisi API calls.",
+                        pusd_balance,
+                        _LOW_BALANCE_SLEEP // 60,
+                    )
+                    _interruptible_sleep(_LOW_BALANCE_SLEEP)
+                    continue
+                logger.info(
+                    "[DRY_RUN] Balanță %.4f sub $%.2f — ignor gate-ul de balanță și "
+                    "continui scanarea (simulare).", pusd_balance, _MIN_BALANCE_PUSD,
                 )
-                _interruptible_sleep(_LOW_BALANCE_SLEEP)
-                continue
 
             # Limită globală de expunere
             n_open = len(account_state.get("active_positions", []))
@@ -1363,7 +1410,9 @@ def main() -> None:
             # irosim API calls scanând când nu putem deschide nimic). Cu ACTIVATE_QUEUE
             # NU dormim: scanăm ca să construim wishlist-ul (piețele aprobate de AI sunt
             # salvate în next_in_line.json pentru când se eliberează un slot).
-            if maxed and not _ACTIVATE_QUEUE:
+            # În DRY_RUN nu dormim nici la MAX poziții: vrem să scanăm și să trimitem loturi
+            # către Groq (nu deschidem nimic oricum — _execute_trade e interceptat).
+            if maxed and not _ACTIVATE_QUEUE and not _DRY_RUN:
                 logger.info(
                     "[Agent] Limită de expunere atinsă: %d/%d poziții deschise. "
                     "Nu se deschid poziții noi. Aștept...",
@@ -1385,7 +1434,7 @@ def main() -> None:
 
                 # Coada poate epuiza fondurile: dacă balanța a scăzut sub minim, sărim
                 # scanarea masivă (economisim fetch-ul costisitor) și intrăm în standby.
-                if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+                if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
                     logger.info(
                         "[Agent] Fonduri epuizate la procesarea cozii — sar scanarea, standby %d min.",
                         _LOW_BALANCE_SLEEP // 60,
@@ -1393,12 +1442,19 @@ def main() -> None:
                     _interruptible_sleep(_LOW_BALANCE_SLEEP)
                     continue
 
-            if maxed:  # implică _ACTIVATE_QUEUE (altfel am fi făcut deja continue)
-                logger.info(
-                    "[Agent] Limită de expunere atinsă (%d/%d) — ACTIVATE_QUEUE activ: "
-                    "scanez pentru wishlist (next_in_line.json), fără a deschide poziții noi.",
-                    n_open, settings.MAX_ACTIVE_POSITIONS,
-                )
+            if maxed:  # _ACTIVATE_QUEUE sau _DRY_RUN (altfel am fi făcut deja continue)
+                if _DRY_RUN:
+                    logger.info(
+                        "[DRY_RUN] Limită de expunere atinsă (%d/%d) — ignor și scanez ca "
+                        "să trimit loturi către Groq (simulare).",
+                        n_open, settings.MAX_ACTIVE_POSITIONS,
+                    )
+                else:
+                    logger.info(
+                        "[Agent] Limită de expunere atinsă (%d/%d) — ACTIVATE_QUEUE activ: "
+                        "scanez pentru wishlist (next_in_line.json), fără a deschide poziții noi.",
+                        n_open, settings.MAX_ACTIVE_POSITIONS,
+                    )
 
             markets = fetch_active_markets()
             if not markets:
