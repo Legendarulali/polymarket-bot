@@ -17,7 +17,7 @@ from src.execution import (
 )
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
-from src.ai_analyser import analyse_market, analyse_match
+from src.ai_analyser import analyse_market, analyse_match, analyse_batch
 from src.football import parse_match_market, format_legs, extract_teams
 from src.allowance import ensure_collateral_approved
 from src.position_manager import check_exit_conditions
@@ -44,7 +44,12 @@ _GAMMA_ASCENDING = os.getenv("GAMMA_ASCENDING", "false").strip()
 # Deep-scan opțional pe tag-uri Gamma specifice (ex: fotbal / FIFA World Cup).
 # Gol = dezactivat. Necesită tag_id-urile NUMERICE reale (vezi .env.example).
 _GAMMA_TAG_IDS = [t.strip() for t in os.getenv("GAMMA_TAG_IDS", "").split(",") if t.strip()]
-_INTER_ANALYSIS_DELAY = 3                                        # secunde throttle între analize LLM
+_INTER_ANALYSIS_DELAY = 3                                        # secunde throttle între apeluri LLM (per lot)
+# Analiză în LOTURI (batching): câte piețe pregătite trimitem la Groq într-UN singur
+# apel. Reduce drastic numărul de cereri → permite modelul mare llama-3.3-70b-versatile
+# fără a lovi rate-limit-urile (429). Implicit 12 (recomandat 10-15). BATCH_SIZE<=1
+# revine la analiza individuală (o cerere per piață, prin process_market).
+_BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "12")))
 # Balanța minimă (pUSD) sub care nu mai analizăm/tranzacționăm. 1.05 (nu 1.00) ca
 # să acopere bufferul de siguranță de 3% din dimensionare: în „zona moartă"
 # 1.00–1.04, safe_balance = balanță*0.97 produce un ordin sub minimul Polymarket de
@@ -578,13 +583,17 @@ def _maybe_send_pnl_report(account_state: dict) -> None:
     _last_pnl_report_ts = now
 
 
-def process_market(market: dict, account_state: dict) -> None:
-    """Orchestrează filtrarea unei piețe și decide ruta de analiză.
+def _prepare_market(market: dict, account_state: dict) -> dict | None:
+    """Aplică TOATE filtrele ieftine (fără apel LLM) și, dacă piața merită analizată,
+    culege știrile și construiește un „item" de analiză. Întoarce None dacă piața e
+    filtrată (motivul e contorizat în `_scan_stats`).
 
-    Mod universal (implicit): toate piețele sunt evaluate. Meciurile structurate
-    1X2 (Match Odds) merg pe fluxul dedicat `_process_match_1x2` (rezultate mapate
-    1/X/2); restul (politice, crypto, generale, outright) merg pe fluxul binar
-    YES/NO moștenit. Opțional, FOOTBALL_ONLY=true ignoră tot ce nu e meci."""
+    Item-ul rezultat e folosit fie individual (`process_market`, fallback non-batch),
+    fie acumulat într-un lot și trimis la Groq într-un singur apel (`_scan_markets`).
+
+    Mod universal (implicit): toate piețele sunt evaluate. Meciurile structurate 1X2
+    (Match Odds) produc un item kind='match'; restul (politice, crypto, generale,
+    outright) un item kind='binary'. Opțional, FOOTBALL_ONLY=true ignoră tot ce nu e meci."""
     active_positions: list[dict] = account_state.setdefault("active_positions", [])
 
     title = market.get("question") or market.get("title") or "Unknown market"
@@ -615,7 +624,7 @@ def process_market(market: dict, account_state: dict) -> None:
             "[FILTER] Limită de expunere atinsă (%d/%d poziții). Skip piața '%s'.",
             len(active_positions), settings.MAX_ACTIVE_POSITIONS, title[:60],
         )
-        return
+        return None
 
     # --- FILTRU 0 (OPȚIONAL): mod focus pe fotbal (FOOTBALL_ONLY=true). Implicit
     # dezactivat — botul e universal și procesează toate tipurile de piață. ---
@@ -625,7 +634,7 @@ def process_market(market: dict, account_state: dict) -> None:
             "[FILTER] Ignor piața '%s' [%s] — FOOTBALL_ONLY activ, nu e meci 1X2.",
             title[:60], type_label,
         )
-        return
+        return None
 
     # --- FILTRU 1: Volum minim ---
     volume = 0.0
@@ -639,7 +648,7 @@ def process_market(market: dict, account_state: dict) -> None:
             "[FILTER] Ignor piața '%s' [%s] (Volum prea mic: $%.0f < $%.0f).",
             title[:60], type_label, volume, _MIN_VOLUME_USD,
         )
-        return
+        return None
 
     event_id = _extract_event_id(market)
 
@@ -648,29 +657,27 @@ def process_market(market: dict, account_state: dict) -> None:
     if market_type == "match":
         parsed = parse_match_market(market)
         if parsed:
-            _process_match_1x2(market, account_state, parsed, event_id, title, market_id)
-            return
+            return _prepare_match_1x2(market, parsed, event_id, title, market_id)
         logger.debug(
             "[Meci] '%s' nu e structurat 1X2 (rezultate binare) — folosesc fluxul YES/NO.",
             title[:60],
         )
 
-    _process_legacy_binary(market, account_state, event_id, title, market_id, market_type, type_label)
+    return _prepare_legacy_binary(market, account_state, event_id, title, market_id, market_type, type_label)
 
 
-def _process_match_1x2(
+def _prepare_match_1x2(
     market: dict,
-    account_state: dict,
     parsed: dict,
     event_id: str,
     title: str,
     market_id,
-) -> None:
-    """Flux de analiză pentru un meci 1X2 (Match Odds).
+) -> dict | None:
+    """Filtre ieftine + culegere știri pentru un meci 1X2 → item kind='match' (sau None).
 
-    Logează numele meciului și cotele 1/X/2, aplică fereastra de probabilitate
-    pe fiecare rezultat (YES = prețul rezultatului), apoi cere LLM-ului să aleagă
-    un cod (1/X/2) și plasează ordinul pe token-ul rezultatului ales."""
+    Logează numele meciului și cotele 1/X/2, aplică fereastra de probabilitate pe
+    fiecare rezultat (YES = prețul rezultatului) și culege știrile. Decizia LLM
+    (analyse_match / analyse_batch) și execuția se fac mai târziu, pe item-ul întors."""
     home, away = parsed["home"], parsed["away"]
     # Cerință de produs: logurile arată clar meciul + cotele 1/X/2.
     logger.info("[Meci] %s | %s", parsed["label"], format_legs(parsed))
@@ -686,52 +693,27 @@ def _process_match_1x2(
             "[FILTER] Ignor meciul '%s' — niciun rezultat 1X2 în fereastra [%.2f, %.2f] (%s).",
             parsed["label"], _MIN_PROBABILITY, _MAX_PROBABILITY, format_legs(parsed),
         )
-        return
+        return None
 
-    # Culegere știri + analiză 1X2 via Groq.
     news = fetch_free_news(query=title[:100])
     logger.info("[Agent] %d știri găsite pentru '%s'.", len(news), parsed["label"][:50])
 
-    decision = analyse_match(home, away, candidates, news)
-
-    _record_analyzed(str(market_id))
-    _scan_stats["analizate (LLM)"] += 1
-    logger.debug(
-        "[Agent] Piață id=%s marcată ca analizată în history.json (cooldown=%dh).",
-        market_id, _CACHE_TTL_SECONDS // 3600,
-    )
-    logger.info(
-        "[Agent] Decizie AI 1X2: trade=%s | outcome=%s | confidence=%.2f | reason=%s",
-        decision["trade"], decision["outcome"], decision["confidence"], decision["reason"],
-    )
-
-    if not decision["trade"]:
-        return
-    if decision["confidence"] < _MIN_CONFIDENCE:
-        logger.info(
-            "[Agent] Confidence %.2f sub pragul %.2f. Ordin blocat.",
-            decision["confidence"], _MIN_CONFIDENCE,
-        )
-        return
-
-    pick = decision["outcome"]
-    leg = parsed["by_code"].get(pick)
-    if not leg:
-        logger.warning("[Agent] Cod 1X2 ales (%s) fără leg corespunzător. Ordin blocat.", pick)
-        return
-
-    _execute_trade(
-        market, account_state,
-        token_id=leg["token_id"],
-        price=leg["price"],
-        outcome_label=f"{pick} ({leg['name']})",
-        decision=decision,
-        event_id=event_id,
-        title=title,
-    )
+    return {
+        "kind": "match",
+        "market": market,
+        "market_id": market_id,
+        "title": title,
+        "label": parsed["label"],
+        "event_id": event_id,
+        "home": home,
+        "away": away,
+        "candidates": candidates,
+        "by_code": parsed["by_code"],
+        "news": news,
+    }
 
 
-def _process_legacy_binary(
+def _prepare_legacy_binary(
     market: dict,
     account_state: dict,
     event_id: str,
@@ -739,8 +721,9 @@ def _process_legacy_binary(
     market_id,
     market_type: str,
     type_label: str,
-) -> None:
-    """Flux binar YES/NO moștenit (piețe non-1X2 sau focus pe fotbal dezactivat)."""
+) -> dict | None:
+    """Filtre ieftine + culegere știri pentru o piață binară YES/NO → item kind='binary'
+    (sau None). Flux moștenit pentru piețe non-1X2 (sau focus pe fotbal dezactivat)."""
     active_positions: list[dict] = account_state.setdefault("active_positions", [])
 
     # --- FILTRU 2: Fereastra de probabilitate pe YES ---
@@ -751,7 +734,7 @@ def _process_legacy_binary(
             "[FILTER] Ignor piața '%s' [%s] (Probabilitate YES=%.2f în afara ferestrei [%.2f, %.2f]).",
             title[:60], type_label, yes_price_raw, _MIN_PROBABILITY, _MAX_PROBABILITY,
         )
-        return
+        return None
 
     # --- FILTRU 3: Event clustering (meciurile nu sunt plafonate pe event_id) ---
     if market_type == "match":
@@ -765,24 +748,49 @@ def _process_legacy_binary(
                 "[FILTER] Ignor piața '%s' [%s] (eveniment %s: %d/%d poziții).",
                 title[:60], type_label, event_id, event_positions, limit,
             )
-            return
+            return None
 
     news = fetch_free_news(query=title[:100])
     logger.info("[Agent] %d știri găsite pentru '%s'.", len(news), title[:50])
 
-    yes_price = _current_price(market, "YES")
-    decision = analyse_market(title, yes_price, news)
+    return {
+        "kind": "binary",
+        "market": market,
+        "market_id": market_id,
+        "title": title,
+        "event_id": event_id,
+        "yes_price": _current_price(market, "YES"),
+        "news": news,
+    }
 
-    _record_analyzed(str(market_id))
-    _scan_stats["analizate (LLM)"] += 1
-    logger.debug(
-        "[Agent] Piață id=%s marcată ca analizată în history.json (cooldown=%dh).",
-        market_id, _CACHE_TTL_SECONDS // 3600,
-    )
-    logger.info(
-        "[Agent] Decizie AI: trade=%s | outcome=%s | confidence=%.2f | reason=%s",
-        decision["trade"], decision["outcome"], decision["confidence"], decision["reason"],
-    )
+
+def _analyse_single(item: dict) -> dict:
+    """Decizie LLM pentru UN singur item pregătit (cale non-batch: process_market).
+    Rutează către analyse_match (1X2) sau analyse_market (binar)."""
+    if item["kind"] == "match":
+        return analyse_match(item["home"], item["away"], item["candidates"], item["news"])
+    return analyse_market(item["title"], item["yes_price"], item["news"])
+
+
+def _apply_decision(item: dict, decision: dict, account_state: dict) -> None:
+    """Aplică o decizie LLM peste un item pregătit: log + poarta de confidence +
+    maparea outcome → token/preț → `_execute_trade` (care conține TOATE barierele de
+    risc: gate 1.05 pUSD, dedup, slippage, dimensionare). Comun fluxului individual
+    (process_market) și celui în batch (_flush_batch)."""
+    market = item["market"]
+    title = item["title"]
+    event_id = item["event_id"]
+
+    if item["kind"] == "match":
+        logger.info(
+            "[Agent] Decizie AI 1X2: trade=%s | outcome=%s | confidence=%.2f | reason=%s",
+            decision["trade"], decision["outcome"], decision["confidence"], decision["reason"],
+        )
+    else:
+        logger.info(
+            "[Agent] Decizie AI: trade=%s | outcome=%s | confidence=%.2f | reason=%s",
+            decision["trade"], decision["outcome"], decision["confidence"], decision["reason"],
+        )
 
     if not decision["trade"]:
         return
@@ -793,16 +801,53 @@ def _process_legacy_binary(
         )
         return
 
-    outcome = decision["outcome"]
-    _execute_trade(
-        market, account_state,
-        token_id=_token_for_outcome(market, outcome),
-        price=_current_price(market, outcome),
-        outcome_label=outcome,
-        decision=decision,
-        event_id=event_id,
-        title=title,
+    if item["kind"] == "match":
+        pick = decision["outcome"]
+        leg = item["by_code"].get(pick)
+        if not leg:
+            logger.warning("[Agent] Cod 1X2 ales (%s) fără leg corespunzător. Ordin blocat.", pick)
+            return
+        _execute_trade(
+            market, account_state,
+            token_id=leg["token_id"],
+            price=leg["price"],
+            outcome_label=f"{pick} ({leg['name']})",
+            decision=decision,
+            event_id=event_id,
+            title=title,
+        )
+    else:
+        outcome = decision["outcome"]
+        _execute_trade(
+            market, account_state,
+            token_id=_token_for_outcome(market, outcome),
+            price=_current_price(market, outcome),
+            outcome_label=outcome,
+            decision=decision,
+            event_id=event_id,
+            title=title,
+        )
+
+
+def process_market(market: dict, account_state: dict) -> None:
+    """Procesează O singură piață end-to-end: filtre ieftine → știri → analiză LLM
+    INDIVIDUALĂ → execuție.
+
+    E calea folosită de fallback-ul non-batch (BATCH_SIZE<=1) și de testele unitare;
+    bucla principală folosește, implicit, analiza în LOTURI (vezi `_scan_markets`).
+    Ambele căi partajează `_prepare_market` (filtrele) și `_apply_decision` (execuția),
+    deci barierele de risc din `_execute_trade` sunt identice indiferent de cale."""
+    item = _prepare_market(market, account_state)
+    if item is None:
+        return
+    decision = _analyse_single(item)
+    _record_analyzed(str(item["market_id"]))
+    _scan_stats["analizate (LLM)"] += 1
+    logger.debug(
+        "[Agent] Piață id=%s marcată ca analizată în history.json (cooldown=%dh).",
+        item["market_id"], _CACHE_TTL_SECONDS // 3600,
     )
+    _apply_decision(item, decision, account_state)
 
 
 def _execute_trade(
@@ -1080,6 +1125,136 @@ def _process_queue(account_state: dict) -> None:
         _interruptible_sleep(_INTER_ANALYSIS_DELAY)  # throttle după apelul LLM
 
 
+# ---------------------------------------------------------------------------
+# Scanare cu analiză în LOTURI (batching)
+# ---------------------------------------------------------------------------
+def _batch_request(item: dict) -> dict:
+    """Reduce un item pregătit la payload-ul minim trimis lui analyse_batch."""
+    if item["kind"] == "match":
+        return {
+            "market_id": item["market_id"], "kind": "match",
+            "title": item["label"], "candidates": item["candidates"], "news": item["news"],
+        }
+    return {
+        "market_id": item["market_id"], "kind": "binary",
+        "title": item["title"], "price": item["yes_price"], "news": item["news"],
+    }
+
+
+def _flush_batch(batch: list[dict], account_state: dict) -> None:
+    """Trimite un lot de piețe pregătite la Groq într-UN singur apel (analyse_batch),
+    apoi aplică deciziile. Toate piețele din lot sunt marcate ca analizate (apelul LLM
+    le-a acoperit pe toate). Un eșec total al apelului (rate-limit/API) NU marchează
+    nimic → lotul se reîncearcă la scanarea următoare. Un singur throttle după apel.
+
+    Bariera de balanță rămâne intactă: `_apply_decision` → `_execute_trade` verifică
+    gate-ul de 1.05 pUSD per ordin; în plus, oprim aplicarea restului lotului dacă
+    balanța scade sub minim în timpul execuției."""
+    if not batch:
+        return
+    requests = [_batch_request(it) for it in batch]
+    try:
+        decisions = analyse_batch(requests)
+    except Exception as exc:
+        logger.error(
+            "[Batch] Analiză batch eșuată (%d piețe) — reîncerc la scanarea următoare: %s",
+            len(batch), exc,
+        )
+        return  # nu marcăm nimic ca analizat → se reîncearcă
+
+    # Apelul LLM a acoperit tot lotul → marcăm fiecare piață ca analizată (cooldown 4h).
+    for it in batch:
+        _record_analyzed(str(it["market_id"]))
+        _scan_stats["analizate (LLM)"] += 1
+
+    for it in batch:
+        mid = str(it["market_id"])
+        decision = decisions.get(mid) or {
+            "trade": False, "outcome": "NONE", "confidence": 0.0, "reason": "lipsă din răspunsul batch",
+        }
+        try:
+            _apply_decision(it, decision, account_state)
+        except Exception as exc:
+            logger.error("[Batch] Eroare la aplicarea deciziei pentru id=%s: %s", mid, exc, exc_info=True)
+        if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+            logger.info(
+                "[Batch] Balanță sub minimul de $%.2f în timpul execuției lotului — "
+                "opresc aplicarea restului.", _MIN_BALANCE_PUSD,
+            )
+            break
+
+    _interruptible_sleep(_INTER_ANALYSIS_DELAY)  # throttle după apelul LLM (per lot)
+
+
+def _scan_markets(markets: list[dict], account_state: dict) -> None:
+    """Scanează piețele deja filtrate pe istoric. IMPLICIT acumulează piețele în loturi
+    de _BATCH_SIZE și le trimite la Groq într-un SINGUR apel (economisind cereri →
+    modelul mare 70b fără rate-limit). BATCH_SIZE<=1 revine la analiza individuală
+    (process_market, o cerere per piață).
+
+    Gate de balanță intra-scanare: dacă un ordin epuizează balanța, abandonăm restul
+    rundei (sleep-ul defensiv de la începutul iterației următoare preia)."""
+    _scan_stats.clear()
+
+    # Fallback non-batch: o cerere LLM per piață (comportamentul clasic).
+    if _BATCH_SIZE <= 1:
+        for market in markets:
+            if not RUNNING:
+                break
+            if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+                logger.info(
+                    "[Agent] Balanța a fost epuizată în timpul scanării curente. "
+                    "Abandonez restul piețelor din această rundă pentru a economisi API calls."
+                )
+                break
+            hist_before = len(_analyzed_history)
+            try:
+                process_market(market, account_state)
+            except Exception as exc:
+                logger.error(
+                    "[Agent] Eroare la procesarea pieței id=%s: %s",
+                    market.get("id", "?"), exc, exc_info=True,
+                )
+            # Throttle DOAR după o analiză reală (s-a înregistrat piața în history).
+            if len(_analyzed_history) > hist_before:
+                _interruptible_sleep(_INTER_ANALYSIS_DELAY)
+        return
+
+    # Cale implicită: acumulează loturi de _BATCH_SIZE și trimite-le într-un apel.
+    batch: list[dict] = []
+    for market in markets:
+        if not RUNNING:
+            break
+        if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+            logger.info(
+                "[Agent] Balanța a fost epuizată în timpul scanării curente. "
+                "Abandonez restul piețelor din această rundă pentru a economisi API calls."
+            )
+            break
+        try:
+            item = _prepare_market(market, account_state)
+        except Exception as exc:
+            logger.error(
+                "[Agent] Eroare la pregătirea pieței id=%s: %s",
+                market.get("id", "?"), exc, exc_info=True,
+            )
+            item = None
+        if item is None:
+            continue
+
+        batch.append(item)
+        if len(batch) >= _BATCH_SIZE:
+            _flush_batch(batch, account_state)
+            batch = []
+            if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+                logger.info("[Agent] Balanța a fost epuizată după un lot. Abandonez restul rundei.")
+                break
+
+    # Lotul parțial rămas la finalul scanării.
+    if batch and RUNNING:
+        _flush_batch(batch, account_state)
+
+
 def main() -> None:
     _load_history()  # prima instrucțiune la rulare: încarcă history.json (piețe deja analizate)
 
@@ -1257,37 +1432,10 @@ def main() -> None:
                 "[Agent] Procesez %d piețe active (%d meciuri prioritizate la început).",
                 len(markets), n_matches,
             )
-            _scan_stats.clear()
-            for market in markets:
-                if not RUNNING:
-                    break
-                # Gate de balanță INTRA-scanare: un trade dintr-o piață anterioară a
-                # aceleiași runde poate epuiza balanța (_execute_trade actualizează
-                # account_state["pusd_balance"]). Fără asta, restul piețelor ar trece
-                # prin news + Groq doar ca să fie blocate apoi în _execute_trade → zeci
-                # de API calls irosite. Abandonăm runda; sleep-ul defensiv de la
-                # începutul iterației următoare preia cât timp balanța rămâne sub minim.
-                if account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
-                    logger.info(
-                        "[Agent] Balanța a fost epuizată în timpul scanării curente. "
-                        "Abandonez restul piețelor din această rundă pentru a economisi API calls."
-                    )
-                    break
-                hist_before = len(_analyzed_history)
-                try:
-                    process_market(market, account_state)
-                except Exception as exc:
-                    logger.error(
-                        "[Agent] Eroare la procesarea pieței id=%s: %s",
-                        market.get("id", "?"),
-                        exc,
-                        exc_info=True,
-                    )
-                # Throttle DOAR după o analiză reală (process_market a înregistrat
-                # piața în history → a făcut apel LLM). Piețele filtrate ieftin nu
-                # dorm, altfel scanarea paginată ar pierde minute pe nimic.
-                if len(_analyzed_history) > hist_before:
-                    _interruptible_sleep(_INTER_ANALYSIS_DELAY)
+            # Scanare cu analiză în LOTURI (sau individual dacă BATCH_SIZE<=1). Gate-ul
+            # de balanță intra-scanare și throttle-ul (un singur sleep per lot/analiză)
+            # sunt încapsulate în `_scan_markets`, care resetează și `_scan_stats`.
+            _scan_markets(markets, account_state)
 
             # Sumar de filtrare: ce a oprit piețele. Cheia pentru a vedea DE CE
             # „ignoră" botul tot — ex: {'volum mic': 195, 'analizate (LLM)': 3}.
