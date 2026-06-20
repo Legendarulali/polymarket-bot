@@ -45,6 +45,9 @@ logs/
 # Bot state (istoric persistent al piețelor analizate)
 history.json*
 
+# Bot state (coadă de oportunități „next in line" — re-evaluate când revin fondurile)
+next_in_line.json*
+
 # OS
 .DS_Store
 Thumbs.db

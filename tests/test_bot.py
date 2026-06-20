@@ -408,11 +408,13 @@ class TestProcessMarketStateTracking:
         decision = decision or {"trade": True, "outcome": "1", "confidence": 0.9, "reason": "test"}
         order_result = order_result or {"success": True, "order_id": "oid-1"}
 
-        # _record_analyzed is patched out so process_market does not touch history.json;
-        # history persistence is covered separately by TestAnalyzedHistory.
+        # _record_analyzed / _enqueue_opportunity are patched out so process_market
+        # touches neither history.json nor next_in_line.json; that persistence is
+        # covered separately (TestAnalyzedHistory / TestQueuePersistence).
         with patch("main.fetch_free_news", return_value=[]), \
              patch("main.analyse_match", return_value=decision), \
              patch("main._record_analyzed"), \
+             patch("main._enqueue_opportunity"), \
              patch("main._live_best_ask", return_value=live_ask), \
              patch("main.place_limit_order", return_value=order_result) as mock_order:
             main.process_market(market, account_state)
@@ -518,6 +520,7 @@ class TestProcessMarketStateTracking:
         state = {"pusd_balance": 1.0, "active_positions": []}
         decision = {"trade": True, "outcome": "1", "confidence": 0.9, "reason": "t"}
         with patch("main._live_best_ask", return_value=None), \
+             patch("main._enqueue_opportunity"), \
              patch("main.place_limit_order") as mock_order:
             main._execute_trade(
                 self._market(), state,
@@ -875,7 +878,8 @@ class TestAnalyzedHistory:
     """_load_history / _save_history / _record_analyzed / _is_recently_analyzed."""
 
     def _fresh_main(self, monkeypatch, tmp_path):
-        import importlib, sys
+        import importlib
+        import sys
         if "main" not in sys.modules:
             importlib.import_module("main")
         import main
@@ -901,7 +905,7 @@ class TestAnalyzedHistory:
         assert main._is_recently_analyzed("m2") is True
 
     def test_expired_entries_pruned_on_load(self, monkeypatch, tmp_path):
-        import json, time
+        import time
         main, hist_file = self._fresh_main(monkeypatch, tmp_path)
         now = time.time()
         hist_file.write_text(json.dumps({
@@ -1500,3 +1504,328 @@ class TestAnalyseMatch:
         with patch.object(settings, "GROQ_API_KEY", ""):
             d = ai_analyser.analyse_match("A", "B", self._candidates(), [])
         assert d["trade"] is False and d["outcome"] == "NONE"
+
+
+# ---------------------------------------------------------------------------
+# Tests: "next in line" opportunity queue persistence (next_in_line.json)
+# ---------------------------------------------------------------------------
+
+class TestQueuePersistence:
+    """_load_queue / _save_queue / _enqueue_opportunity / _clean_queue."""
+
+    def _fresh_main(self, monkeypatch, tmp_path):
+        import importlib
+        import sys
+        if "main" not in sys.modules:
+            importlib.import_module("main")
+        import main
+        queue_file = tmp_path / "next_in_line.json"
+        monkeypatch.setattr(main, "_QUEUE_FILE", str(queue_file))
+        return main, queue_file
+
+    def test_missing_file_returns_empty(self, monkeypatch, tmp_path):
+        main, _ = self._fresh_main(monkeypatch, tmp_path)
+        assert main._load_queue() == []
+
+    def test_corrupt_file_returns_empty(self, monkeypatch, tmp_path):
+        main, qf = self._fresh_main(monkeypatch, tmp_path)
+        qf.write_text("{not valid json", encoding="utf-8")
+        assert main._load_queue() == []
+
+    def test_non_list_returns_empty(self, monkeypatch, tmp_path):
+        main, qf = self._fresh_main(monkeypatch, tmp_path)
+        qf.write_text(json.dumps({"market_id": "m1"}), encoding="utf-8")
+        assert main._load_queue() == []
+
+    def test_enqueue_then_load_roundtrip(self, monkeypatch, tmp_path):
+        main, qf = self._fresh_main(monkeypatch, tmp_path)
+        main._enqueue_opportunity("m1", "0xTOK", "Arsenal vs Chelsea", "1 (Arsenal)", 0.55, 0.82)
+        q = main._load_queue()
+        assert len(q) == 1
+        item = q[0]
+        assert item["market_id"] == "m1"
+        assert item["token_id"] == "0xTOK"
+        assert item["market_title"] == "Arsenal vs Chelsea"
+        assert item["predicted_outcome"] == "1 (Arsenal)"
+        assert item["original_price"] == pytest.approx(0.55)
+        assert item["confidence"] == pytest.approx(0.82)
+        assert "added_at" in item
+        assert qf.exists()
+
+    def test_enqueue_without_token_is_skipped(self, monkeypatch, tmp_path):
+        main, _ = self._fresh_main(monkeypatch, tmp_path)
+        main._enqueue_opportunity("m1", None, "Title", "YES", 0.5, 0.9)
+        assert main._load_queue() == []
+
+    def test_enqueue_dedupes_on_market_id(self, monkeypatch, tmp_path):
+        main, _ = self._fresh_main(monkeypatch, tmp_path)
+        main._enqueue_opportunity("m1", "0xA", "T1", "YES", 0.50, 0.70)
+        main._enqueue_opportunity("m1", "0xA", "T1", "YES", 0.60, 0.95)  # same id → replace
+        q = main._load_queue()
+        assert len(q) == 1
+        assert q[0]["confidence"] == pytest.approx(0.95)
+        assert q[0]["original_price"] == pytest.approx(0.60)
+
+    def test_cap_keeps_highest_confidence(self, monkeypatch, tmp_path):
+        main, _ = self._fresh_main(monkeypatch, tmp_path)
+        # 12 unique markets, increasing confidence; cap=10 keeps the top-10.
+        for i in range(12):
+            main._enqueue_opportunity(f"m{i}", f"0x{i}", f"T{i}", "YES", 0.5, i / 100.0)
+        q = main._load_queue()
+        assert len(q) == main._QUEUE_MAX_SIZE  # 10
+        confs = sorted(it["confidence"] for it in q)
+        assert confs[0] == pytest.approx(0.02)   # the two lowest (0.00, 0.01) dropped
+
+    def test_enqueue_logs_message(self, monkeypatch, tmp_path, caplog):
+        import logging
+        main, _ = self._fresh_main(monkeypatch, tmp_path)
+        with caplog.at_level(logging.INFO):
+            main._enqueue_opportunity("m1", "0xTOK", "Arsenal vs Chelsea", "1", 0.55, 0.82)
+        assert "a fost adăugată în lista de așteptare" in caplog.text
+        assert "Arsenal vs Chelsea" in caplog.text
+
+    def test_clean_removes_expired_keeps_fresh(self, monkeypatch, tmp_path):
+        import time
+        main, qf = self._fresh_main(monkeypatch, tmp_path)
+        now = time.time()
+        qf.write_text(json.dumps([
+            {"market_id": "old", "token_id": "0xO", "confidence": 0.9,
+             "added_at": now - main._QUEUE_TTL_HOURS * 3600 - 10},
+            {"market_id": "fresh", "token_id": "0xF", "confidence": 0.8, "added_at": now},
+        ]), encoding="utf-8")
+        main._clean_queue()
+        ids = [it["market_id"] for it in main._load_queue()]
+        assert ids == ["fresh"]
+
+    def test_clean_noop_on_empty(self, monkeypatch, tmp_path):
+        main, _ = self._fresh_main(monkeypatch, tmp_path)
+        main._clean_queue()  # must not raise
+        assert main._load_queue() == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: _execute_trade enqueues ONLY when skipped for lack of funds
+# ---------------------------------------------------------------------------
+
+class TestExecuteTradeQueueing:
+    """Faza „Save": _execute_trade pune oportunitatea în coadă DOAR când ordinul e
+    sărit din lipsă de fonduri (nu și pentru slippage/duplicat/ordin reușit), și
+    niciodată când e apelat din re-procesarea cozii (from_queue=True)."""
+
+    def _market(self):
+        return {"id": "m1", "orderPriceMinTickSize": "0.01"}
+
+    def _decision(self):
+        return {"trade": True, "outcome": "1", "confidence": 0.88, "reason": "t"}
+
+    def _call(self, state, *, token_id="0xTOK", price=0.50, live_ask=None, from_queue=False):
+        import main
+        with patch("main._live_best_ask", return_value=live_ask), \
+             patch("main.place_limit_order", return_value={"success": True, "order_id": "o"}), \
+             patch("main._enqueue_opportunity") as mock_enq:
+            main._execute_trade(
+                self._market(), state,
+                token_id=token_id, price=price, outcome_label="1 (Arsenal)",
+                decision=self._decision(), event_id="ev", title="Arsenal vs Chelsea",
+                from_queue=from_queue,
+            )
+        return mock_enq
+
+    def test_funds_wall_enqueues(self):
+        enq = self._call({"pusd_balance": 0.5, "active_positions": []})
+        enq.assert_called_once()
+        args, kwargs = enq.call_args
+        assert args[0] == "m1"               # market_id
+        assert args[1] == "0xTOK"            # token_id
+        assert args[3] == "1 (Arsenal)"      # outcome_label
+        assert kwargs["event_id"] == "ev"
+
+    def test_order_total_skip_enqueues(self):
+        # balanță $1.00, preț 0.46: după bufferul de 3% ordinul scade sub $1 → skip.
+        enq = self._call({"pusd_balance": 1.0, "active_positions": []}, price=0.46)
+        enq.assert_called_once()
+
+    def test_price_too_high_skip_enqueues(self):
+        # balanță $1.00, preț 0.98: bugetul nu acoperă o acțiune întreagă → skip.
+        enq = self._call({"pusd_balance": 1.0, "active_positions": []}, price=0.98)
+        enq.assert_called_once()
+
+    def test_slippage_skip_does_not_enqueue(self):
+        # ask live mult peste preț → slippage (NU lipsă de fonduri) → fără enqueue.
+        enq = self._call({"pusd_balance": 20.0, "active_positions": []}, price=0.50, live_ask=0.80)
+        enq.assert_not_called()
+
+    def test_duplicate_token_does_not_enqueue(self):
+        state = {"pusd_balance": 20.0, "active_positions": [{"token_id": "0xTOK"}]}
+        enq = self._call(state)
+        enq.assert_not_called()
+
+    def test_successful_order_does_not_enqueue(self):
+        enq = self._call({"pusd_balance": 20.0, "active_positions": []})
+        enq.assert_not_called()
+
+    def test_from_queue_does_not_reenqueue(self):
+        # chiar și pe funds wall, from_queue=True NU re-pune în coadă (anti-buclă).
+        enq = self._call({"pusd_balance": 0.5, "active_positions": []}, from_queue=True)
+        enq.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: priority queue processing / re-evaluation (_process_queue)
+# ---------------------------------------------------------------------------
+
+class TestProcessQueue:
+    """Faza „Execute": re-evaluare prioritară a cozii înainte de scanarea masivă."""
+
+    def _fresh_main(self, monkeypatch, tmp_path):
+        import importlib
+        import sys
+        if "main" not in sys.modules:
+            importlib.import_module("main")
+        import main
+        monkeypatch.setattr(main, "_QUEUE_FILE", str(tmp_path / "next_in_line.json"))
+        monkeypatch.setattr(main, "_INTER_ANALYSIS_DELAY", 0)  # fără throttle în teste
+        return main
+
+    def _item(self, market_id="m1", token_id="0xTOK", confidence=0.85,
+              title="Arsenal vs Chelsea", price=0.55):
+        import time
+        return {
+            "market_id": market_id, "token_id": token_id,
+            "market_title": title, "predicted_outcome": "1 (Arsenal)",
+            "original_price": price, "confidence": confidence,
+            "event_id": "ev", "tick_size": "0.01", "added_at": time.time(),
+        }
+
+    def test_empty_queue_noop(self, monkeypatch, tmp_path):
+        main = self._fresh_main(monkeypatch, tmp_path)
+        with patch("main.analyse_market") as am, patch("main.place_limit_order") as mo:
+            main._process_queue({"pusd_balance": 20.0, "active_positions": []})
+        am.assert_not_called()
+        mo.assert_not_called()
+
+    def test_trade_true_executes_and_removes(self, monkeypatch, tmp_path):
+        main = self._fresh_main(monkeypatch, tmp_path)
+        main._save_queue([self._item()])
+        decision = {"trade": True, "outcome": "YES", "confidence": 0.9, "reason": "r"}
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._live_best_ask", return_value=0.55), \
+             patch("main.analyse_market", return_value=decision) as am, \
+             patch("main._record_analyzed"), \
+             patch("main.place_limit_order", return_value={"success": True, "order_id": "o"}) as mo:
+            main._process_queue({"pusd_balance": 20.0, "active_positions": []})
+        am.assert_called_once()
+        mo.assert_called_once()
+        assert main._load_queue() == []   # eliminat după analiză (coada avansează)
+
+    def test_no_trade_removes_without_order(self, monkeypatch, tmp_path):
+        main = self._fresh_main(monkeypatch, tmp_path)
+        main._save_queue([self._item()])
+        decision = {"trade": False, "outcome": "NO", "confidence": 0.0, "reason": "r"}
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._live_best_ask", return_value=0.55), \
+             patch("main.analyse_market", return_value=decision), \
+             patch("main._record_analyzed"), \
+             patch("main.place_limit_order") as mo:
+            main._process_queue({"pusd_balance": 20.0, "active_positions": []})
+        mo.assert_not_called()
+        assert main._load_queue() == []   # eliminat oricum (cerința 4d)
+
+    def test_confidence_below_threshold_no_order(self, monkeypatch, tmp_path):
+        main = self._fresh_main(monkeypatch, tmp_path)
+        main._save_queue([self._item()])
+        decision = {"trade": True, "outcome": "YES", "confidence": 0.50, "reason": "r"}
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._live_best_ask", return_value=0.55), \
+             patch("main.analyse_market", return_value=decision), \
+             patch("main._record_analyzed"), \
+             patch("main.place_limit_order") as mo:
+            main._process_queue({"pusd_balance": 20.0, "active_positions": []})
+        mo.assert_not_called()
+        assert main._load_queue() == []
+
+    def test_outcome_no_does_not_buy(self, monkeypatch, tmp_path):
+        main = self._fresh_main(monkeypatch, tmp_path)
+        main._save_queue([self._item()])
+        decision = {"trade": True, "outcome": "NO", "confidence": 0.9, "reason": "r"}
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._live_best_ask", return_value=0.55), \
+             patch("main.analyse_market", return_value=decision), \
+             patch("main._record_analyzed"), \
+             patch("main.place_limit_order") as mo:
+            main._process_queue({"pusd_balance": 20.0, "active_positions": []})
+        mo.assert_not_called()
+
+    def test_fresh_price_from_orderbook_used(self, monkeypatch, tmp_path):
+        main = self._fresh_main(monkeypatch, tmp_path)
+        main._save_queue([self._item(price=0.55)])
+        decision = {"trade": True, "outcome": "YES", "confidence": 0.9, "reason": "r"}
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._live_best_ask", return_value=0.61), \
+             patch("main.analyse_market", return_value=decision) as am, \
+             patch("main._record_analyzed"), \
+             patch("main.place_limit_order", return_value={"success": True, "order_id": "o"}) as mo:
+            main._process_queue({"pusd_balance": 20.0, "active_positions": []})
+        # AI re-evaluat cu prețul proaspăt (0.61), nu cu cel salvat (0.55).
+        assert am.call_args.args[1] == pytest.approx(0.61)
+        assert mo.call_args.kwargs["price"] == pytest.approx(0.61)
+
+    def test_low_balance_stops_and_keeps_rest(self, monkeypatch, tmp_path):
+        main = self._fresh_main(monkeypatch, tmp_path)
+        # Două intrări; prima (confidence mai mare) golește balanța, a doua rămâne.
+        main._save_queue([self._item("m1", "0xA", 0.95), self._item("m2", "0xB", 0.80)])
+        decision = {"trade": True, "outcome": "YES", "confidence": 0.9, "reason": "r"}
+
+        def fake_execute(market, state, **kw):
+            state["pusd_balance"] = 0.5   # epuizează balanța la primul ordin
+
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._live_best_ask", return_value=0.55), \
+             patch("main.analyse_market", return_value=decision) as am, \
+             patch("main._record_analyzed"), \
+             patch("main._execute_trade", side_effect=fake_execute):
+            main._process_queue({"pusd_balance": 20.0, "active_positions": []})
+        assert am.call_count == 1   # doar prima a fost re-evaluată
+        remaining = [it["market_id"] for it in main._load_queue()]
+        assert remaining == ["m2"]  # restul rămâne pentru runda următoare (cerința 4e)
+
+    def test_max_positions_stops_processing(self, monkeypatch, tmp_path):
+        from config.settings import settings
+        main = self._fresh_main(monkeypatch, tmp_path)
+        main._save_queue([self._item()])
+        positions = [{"token_id": f"0x{i}"} for i in range(settings.MAX_ACTIVE_POSITIONS)]
+        with patch("main.analyse_market") as am, patch("main.place_limit_order") as mo:
+            main._process_queue({"pusd_balance": 20.0, "active_positions": positions})
+        am.assert_not_called()   # plin → coada nu se procesează
+        mo.assert_not_called()
+        assert len(main._load_queue()) == 1   # rămâne în coadă
+
+    def test_item_removed_even_if_reeval_raises(self, monkeypatch, tmp_path):
+        main = self._fresh_main(monkeypatch, tmp_path)
+        main._save_queue([self._item()])
+        with patch("main._reevaluate_queued", side_effect=RuntimeError("boom")):
+            main._process_queue({"pusd_balance": 20.0, "active_positions": []})
+        assert main._load_queue() == []   # scos înainte de re-evaluare → coada avansează
+
+    def test_higher_confidence_processed_first(self, monkeypatch, tmp_path):
+        main = self._fresh_main(monkeypatch, tmp_path)
+        main._save_queue([
+            self._item("low", "0xL", 0.72, title="LOW match"),
+            self._item("high", "0xH", 0.96, title="HIGH match"),
+        ])
+        seen = []
+        decision = {"trade": False, "outcome": "NO", "confidence": 0.0, "reason": "r"}
+
+        def spy_analyse(title, price, news):
+            seen.append(title)
+            return decision
+
+        with patch("main.fetch_free_news", return_value=[]), \
+             patch("main._live_best_ask", return_value=0.55), \
+             patch("main.analyse_market", side_effect=spy_analyse), \
+             patch("main._record_analyzed"), \
+             patch("main.place_limit_order"):
+            main._process_queue({"pusd_balance": 20.0, "active_positions": []})
+        # Prima re-evaluare e a intrării cu confidence mai mare (0.96 înaintea lui 0.72).
+        assert seen[0].startswith("HIGH match")
+        assert len(seen) == 2
