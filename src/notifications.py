@@ -70,14 +70,23 @@ def notify_trade(
     confidence: float | None = None,
     reason: str | None = None,
     order_id: str | None = None,
+    action: str | None = None,
 ) -> None:
-    """Notificare la o tranzacție executată (BUY sau SELL)."""
+    """Notificare la o tranzacție executată (BUY, SELL sau închidere de poziție).
+
+    `action` suprascrie eticheta afișată în titlu (ex. „CLOSE POSITION" la un
+    exit automat TP/SL); implicit e `side` (BUY/SELL). Pentru BUY se adaugă
+    automat payout-ul potențial și profitul net estimat: pe Polymarket un share
+    câștigător se decontează la exact $1, deci payout = size × $1 și
+    profit_net = payout − cost (vezi blocul `is_buy` de mai jos).
+    """
     if not _enabled():
         return
 
     is_buy = side.upper() == "BUY"
     emoji = "🟢" if is_buy else "🔴"
     color = _GREEN if is_buy else _RED
+    action_label = (action or side).upper()
 
     fields = []
     if outcome:
@@ -87,13 +96,25 @@ def notify_trade(
         {"name": "Size", "value": f"{size:.2f}", "inline": True},
         {"name": "Total", "value": _money(total), "inline": True},
     ]
+    if is_buy:
+        # Un share câștigător se decontează la exact $1.00 pe Polymarket, deci
+        # payout-ul maxim = nr. share-uri × $1, iar profitul net potențial =
+        # payout − costul plătit acum. Pentru price ∈ (0,1) iese mereu pozitiv.
+        payout = size * 1.0
+        net_profit = payout - total
+        net_pct = (net_profit / total * 100) if total else 0.0
+        fields += [
+            {"name": "💰 Payout potențial", "value": _money(payout), "inline": True},
+            {"name": "📈 Profit potențial",
+             "value": f"{_signed_money(net_profit)} ({_signed_pct(net_pct)})", "inline": True},
+        ]
     if confidence is not None:
         fields.append({"name": "Confidence", "value": f"{confidence * 100:.0f}%", "inline": True})
     if reason:
         fields.append({"name": "Motiv", "value": str(reason)[:1024], "inline": False})
 
     embed = {
-        "title": f"{emoji} {side.upper()} • {str(title)[:230]}",
+        "title": f"{emoji} {action_label} • {str(title)[:230]}",
         "color": color,
         "fields": fields,
         "timestamp": _now_iso(),

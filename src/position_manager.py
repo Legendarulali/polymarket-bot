@@ -62,9 +62,9 @@ def check_exit_conditions(account_state: dict) -> None:
 
         pnl_pct = (bid - avg_price) / avg_price
         if take_profit > 0 and pnl_pct >= take_profit:
-            reason = f"take-profit (+{pnl_pct * 100:.1f}%)"
+            reason = f"Take Profit atins (+{pnl_pct * 100:.1f}%)"
         elif stop_loss > 0 and pnl_pct <= -stop_loss:
-            reason = f"stop-loss ({pnl_pct * 100:.1f}%)"
+            reason = f"Stop Loss declanșat ({pnl_pct * 100:.1f}%)"
         else:
             continue
 
@@ -100,6 +100,7 @@ def check_exit_conditions(account_state: dict) -> None:
                 total=bid * size,
                 reason=reason,
                 order_id=result.get("order_id"),
+                action="CLOSE POSITION",
             )
         else:
             logger.error("[Exit] Ordin SELL respins: %s", result.get("error"))

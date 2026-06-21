@@ -878,6 +878,42 @@ class TestNotifications:
         names = [f["name"] for f in mock_post.call_args.kwargs["json"]["embeds"][0]["fields"]]
         assert "Outcome" not in names
 
+    def test_buy_notification_includes_potential_profit(self):
+        from src import notifications
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            # 6.17 share-uri la cost $5: payout = 6.17 × $1 = $6.17,
+            # profit net = $6.17 − $5.00 = $1.17 (+23.4%).
+            notifications.notify_trade("BUY", "Will X win?", 0.81, 6.17, 5.0)
+        embed = mock_post.call_args.kwargs["json"]["embeds"][0]
+        vals = {f["name"]: f["value"] for f in embed["fields"]}
+        assert vals["💰 Payout potențial"] == "$6.17"
+        assert "+$1.17" in vals["📈 Profit potențial"]
+        assert "+23.4%" in vals["📈 Profit potențial"]
+
+    def test_sell_has_no_potential_profit_fields(self):
+        from src import notifications
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_trade("SELL", "Market", 0.4, 10.0, 4.0)
+        names = [f["name"] for f in mock_post.call_args.kwargs["json"]["embeds"][0]["fields"]]
+        assert "💰 Payout potențial" not in names
+        assert "📈 Profit potențial" not in names
+
+    def test_close_position_action_label_and_reason(self):
+        from src import notifications
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_trade(
+                "SELL", "Arsenal vs Chelsea", 0.65, 10.0, 6.5,
+                reason="Take Profit atins (+30.0%)", action="CLOSE POSITION",
+            )
+        embed = mock_post.call_args.kwargs["json"]["embeds"][0]
+        assert "CLOSE POSITION" in embed["title"]
+        assert embed["color"] == 0xE74C3C  # roșu — e tot un SELL
+        vals = {f["name"]: f["value"] for f in embed["fields"]}
+        assert vals["Motiv"] == "Take Profit atins (+30.0%)"
+
 
 # ---------------------------------------------------------------------------
 # Tests: persistent analyzed-markets history (history.json)
