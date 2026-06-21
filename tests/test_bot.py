@@ -2609,6 +2609,35 @@ class TestNotificationTestMode:
         mock_order.assert_not_called()               # trade=False → niciun ordin real
         assert main._notif_test_forced is False
 
+    def test_dry_run_notif_test_skips_groq_call(self, monkeypatch):
+        # 429/TPD epuizat: în DRY_RUN + NOTIFICATION_TEST_MODE, _flush_batch NU cheamă Groq
+        # (analyse_batch) până la prima forțare → ocolim eroarea; prima piață declanșează simularea.
+        import main
+        monkeypatch.setattr(main, "_DRY_RUN", True)
+        monkeypatch.setattr(main, "_NOTIFICATION_TEST_MODE", True)
+        monkeypatch.setattr(main, "_notif_test_forced", False)
+        monkeypatch.setattr(main, "_BATCH_SIZE", 12)
+        monkeypatch.setattr(main, "_INTER_ANALYSIS_DELAY", 0)
+        monkeypatch.setattr(main.time, "sleep", lambda *a: None)
+        monkeypatch.setattr(main, "_interruptible_sleep", lambda *a, **k: None)
+        monkeypatch.setattr(main, "fetch_free_news", lambda *a, **k: [])
+        monkeypatch.setattr(main, "_record_analyzed", lambda *a, **k: None)
+        ab = MagicMock(side_effect=RuntimeError("429 tokens per day exceeded"))
+        monkeypatch.setattr(main, "analyse_batch", ab)
+        mock_order = MagicMock()
+        monkeypatch.setattr(main, "place_limit_order", mock_order)
+        notifs = []
+        monkeypatch.setattr(main, "notify_trade", lambda *a, **k: notifs.append(a[0]))
+        state = {"pusd_balance": 0.0, "active_positions": []}
+        mkt = {"id": "m1", "question": "Will Jesus return?", "slug": "jesus",
+               "volume": "60000", "outcomes": json.dumps(["Yes", "No"]),
+               "outcomePrices": json.dumps(["0.05", "0.95"]),
+               "clobTokenIds": json.dumps(["0xY", "0xN"])}
+        main._scan_markets([mkt], state)
+        ab.assert_not_called()                       # Groq NU a fost apelat (429 ocolit)
+        assert notifs == ["BUY", "SELL"]             # prima piață forțată → simulare completă
+        mock_order.assert_not_called()               # niciun ordin real
+
 
 # ---------------------------------------------------------------------------
 # Tests: DRY_RUN (mod simulare / stress test) — scanează & trimite loturi, dar

@@ -1400,23 +1400,40 @@ def _flush_batch(batch: list[dict], account_state: dict) -> None:
     balanța scade sub minim în timpul execuției."""
     if not batch:
         return
-    requests = [_batch_request(it) for it in batch]
-    try:
-        decisions = analyse_batch(requests)
-    except Exception as exc:
-        if _is_rate_limit_error(exc):
-            logger.warning(
-                "[Batch] Rate-limit Groq (HTTP 429) la %d piețe — backoff %ds înainte de a "
-                "reîncerca la scanarea următoare (protejăm bugetul zilnic de tokeni).",
-                len(batch), _RATE_LIMIT_BACKOFF,
-            )
-            _interruptible_sleep(_RATE_LIMIT_BACKOFF)
-        else:
-            logger.error(
-                "[Batch] Analiză batch eșuată (%d piețe) — reîncerc la scanarea următoare: %s",
-                len(batch), exc,
-            )
-        return  # nu marcăm nimic ca analizat → se reîncearcă
+
+    # TEMP: hack de test al notificărilor — DE ELIMINAT după validarea webhook-urilor.
+    # În DRY_RUN + NOTIFICATION_TEST_MODE, până la prima forțare, SĂRIM complet apelul Groq
+    # (analyse_batch) ca să ocolim un 429 / TPD epuizat care altfel ar opri lotul ÎNAINTE de
+    # _apply_decision. Sintetizăm decizii neutre (trade=False); _apply_decision forțează oricum
+    # prima piață → _simulate_notif_cycle declanșează webhook-urile. Caută „TEMP".
+    if _DRY_RUN and _NOTIFICATION_TEST_MODE and not _notif_test_forced:
+        logger.warning(
+            "[NOTIF-TEST][SIM] Sar apelul Groq pentru acest lot (DRY_RUN + NOTIFICATION_TEST_MODE) "
+            "ca să ocolesc un eventual 429/TPD epuizat; prima piață e forțată în _apply_decision."
+        )
+        decisions = {
+            str(it["market_id"]): {"trade": False, "outcome": "NONE", "confidence": 0.0,
+                                   "reason": "NOTIFICATION_TEST_MODE: Groq skipped"}
+            for it in batch
+        }
+    else:
+        requests = [_batch_request(it) for it in batch]
+        try:
+            decisions = analyse_batch(requests)
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                logger.warning(
+                    "[Batch] Rate-limit Groq (HTTP 429) la %d piețe — backoff %ds înainte de a "
+                    "reîncerca la scanarea următoare (protejăm bugetul zilnic de tokeni).",
+                    len(batch), _RATE_LIMIT_BACKOFF,
+                )
+                _interruptible_sleep(_RATE_LIMIT_BACKOFF)
+            else:
+                logger.error(
+                    "[Batch] Analiză batch eșuată (%d piețe) — reîncerc la scanarea următoare: %s",
+                    len(batch), exc,
+                )
+            return  # nu marcăm nimic ca analizat → se reîncearcă
 
     # Apelul LLM a acoperit tot lotul → marcăm fiecare piață ca analizată (cooldown 4h).
     for it in batch:
