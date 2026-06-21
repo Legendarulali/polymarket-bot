@@ -26,6 +26,11 @@ from src.notifications import notify_trade, notify_portfolio, notify_positions, 
 logger = logging.getLogger(__name__)
 
 RUNNING = True
+# TEMP: parte din hack-ul de test al notificărilor (vezi blocul „TEMP" din _apply_decision) —
+# de eliminat împreună cu el. Runtime one-shot: în DRY_RUN + NOTIFICATION_TEST_MODE forțăm
+# trade=True pe PRIMA piață analizată, ca să declanșăm o singură dată ciclul de notificări
+# simulat. Setat True după prima forțare; se resetează la repornirea procesului.
+_notif_test_forced = False
 _LOOP_INTERVAL = 60          # secunde între iterații normale
 _LOW_BALANCE_SLEEP = 15 * 60  # 15 minute sleep când balanța e insuficientă
 _CACHE_TTL_SECONDS = 4 * 3600 # cooldown: re-analizează o piață cel mult o dată la 4h (persistat în history.json)
@@ -872,6 +877,29 @@ def _apply_decision(item: dict, decision: dict, account_state: dict) -> None:
     market = item["market"]
     title = item["title"]
     event_id = item["event_id"]
+
+    # TEMP: hack de test al notificărilor — DE ELIMINAT după validarea webhook-urilor
+    # (împreună cu flag-ul global `_notif_test_forced`). Caută „TEMP" ca să-l găsești.
+    # NOTIFICATION_TEST_MODE + DRY_RUN: forțăm trade=True pe PRIMA piață analizată (o
+    # singură dată per proces) ca să atingem imediat _simulate_notif_cycle și să declanșăm
+    # webhook-urile, chiar dacă AI-ul a zis trade=False (ex. „Will Jesus return before 2027?").
+    # Outcome-ul forțat e ales VALID: primul leg eligibil (1X2) sau YES (binar), ca maparea
+    # outcome→token de mai jos să meargă. Gate DUBLU (și DRY_RUN) → niciun ordin real posibil.
+    global _notif_test_forced
+    if _DRY_RUN and _NOTIFICATION_TEST_MODE and not _notif_test_forced:
+        _notif_test_forced = True
+        forced_outcome = item["candidates"][0]["code"] if item["kind"] == "match" else "YES"
+        logger.warning(
+            "[NOTIF-TEST][SIM] Forțez trade=True pe prima piață ('%s', outcome=%s) — "
+            "suprascriu decizia AI (era trade=%s) ca să declanșez ciclul de notificări.",
+            title[:60], forced_outcome, decision.get("trade"),
+        )
+        decision = {
+            "trade": True,
+            "outcome": forced_outcome,
+            "confidence": max(_MIN_CONFIDENCE, float(decision.get("confidence", 0.0) or 0.0)),
+            "reason": "NOTIFICATION_TEST_MODE: forced trade (DRY_RUN simulation)",
+        }
 
     if item["kind"] == "match":
         logger.info(
