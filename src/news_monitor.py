@@ -88,8 +88,9 @@ def fetch_free_news(query: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Serializare știri → Markdown compact pentru prompt (curăță textul → modelul
-# Instant procesează input mai curat și dă un confidence mai precis).
+# Serializare știri → Markdown compact pentru prompt: curăță și comprimă textul ca
+# să taie tokeni (evită 429 TPD) ȘI să dea modelului un input mai curat (confidence
+# mai precis). Aceeași funcție servește ambele scopuri.
 # ---------------------------------------------------------------------------
 _MD_MAX_ARTICLES = 5      # maximum articole/snippet-uri păstrate per piață
 _MD_MAX_TITLE = 140       # plafon caractere titlu (după curățare)
@@ -142,7 +143,7 @@ def serialize_news_to_markdown(news_list, market_title: str) -> str:
     """Comprimă lista brută de știri într-un Markdown curat și compact pentru prompt.
 
     - păstrează maximum _MD_MAX_ARTICLES (5) cele mai relevante articole/snippet-uri;
-    - curăță fiecare fragment (entități + tag-uri HTML, spații) → text mai curat;
+    - curăță fiecare fragment (entități + tag-uri HTML, spații) → input mai curat și mai puțini tokeni;
     - emite structura:
         ### Context News for: <market_title>
         1. **[TITLE] <titlu>**
