@@ -2290,11 +2290,29 @@ class TestBatchScan:
              patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
              patch("main.fetch_free_news", return_value=[]), \
              patch("main._record_analyzed") as mock_rec, \
-             patch("main.analyse_batch", side_effect=RuntimeError("429")), \
+             patch("main.analyse_batch", side_effect=RuntimeError("boom")), \
+             patch("main._interruptible_sleep"), \
              patch("main.place_limit_order") as mock_order:
             main._scan_markets([self._match_market("m1")], state)
         mock_rec.assert_not_called()                # eșec total → se reîncearcă, nu marcăm
         mock_order.assert_not_called()
+
+    def test_rate_limit_429_triggers_backoff(self):
+        # Un 429 la lot → backoff defensiv (_interruptible_sleep(_RATE_LIMIT_BACKOFF)) și
+        # NU marchează nimic ca analizat (lotul se reîncearcă la scanarea următoare).
+        import main
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        with patch.object(main, "_BATCH_SIZE", 5), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch("main.fetch_free_news", return_value=[]), \
+             patch("main._record_analyzed") as mock_rec, \
+             patch("main.analyse_batch", side_effect=RuntimeError("Error code: 429 rate limit")), \
+             patch("main._interruptible_sleep") as mock_sleep, \
+             patch("main.place_limit_order") as mock_order:
+            main._scan_markets([self._match_market("m1")], state)
+        mock_rec.assert_not_called()
+        mock_order.assert_not_called()
+        assert any(c.args[:1] == (main._RATE_LIMIT_BACKOFF,) for c in mock_sleep.call_args_list)
 
     def test_low_balance_skips_scan_entirely(self):
         # Sub gate-ul de 1.05: nu pregătim/analizăm nimic (bariera de balanță intactă).
@@ -2319,6 +2337,148 @@ class TestBatchScan:
             main._scan_markets([self._match_market("m1"), self._match_market("m2")], state)
         mock_ab.assert_not_called()                 # nu se folosește batch-ul
         assert mock_am.call_count == 2              # analiză individuală per piață
+
+
+# ---------------------------------------------------------------------------
+# Tests: STEP 2 — filtru STRICT anti-429 + detecție rate-limit
+# ---------------------------------------------------------------------------
+
+class TestStrictPrefilter:
+    """_strict_prefilter reduce drastic câte piețe ajung la Groq: volum mare / keyword /
+    poziție deschisă, apoi plafonat la _MAX_MARKETS_PER_SCAN (volum desc)."""
+
+    def _mkt(self, mid, volume, title="Some market", slug="some-market", tokens=("0xA", "0xB")):
+        return {"id": mid, "question": title, "slug": slug,
+                "volume": str(volume), "clobTokenIds": json.dumps(list(tokens))}
+
+    def _cfg(self, monkeypatch, **kw):
+        import main
+        defaults = {"_STRICT_FILTER": True, "_STRICT_MIN_VOLUME_USD": 50000.0,
+                    "_MAX_MARKETS_PER_SCAN": 40, "_STRICT_KEYWORDS": []}
+        defaults.update(kw)
+        for k, v in defaults.items():
+            monkeypatch.setattr(main, k, v)
+        return main
+
+    def test_keeps_high_volume_drops_low(self, monkeypatch):
+        main = self._cfg(monkeypatch)
+        out = main._strict_prefilter(
+            [self._mkt("hi", 80000), self._mkt("lo", 1000)], {"active_positions": []})
+        assert [m["id"] for m in out] == ["hi"]
+
+    def test_caps_to_max_by_volume(self, monkeypatch):
+        main = self._cfg(monkeypatch, _MAX_MARKETS_PER_SCAN=3)
+        markets = [self._mkt(f"m{i}", 60000 + i) for i in range(10)]
+        out = main._strict_prefilter(markets, {"active_positions": []})
+        assert len(out) == 3
+        assert {m["id"] for m in out} == {"m9", "m8", "m7"}   # cele mai lichide
+
+    def test_keyword_keeps_low_volume(self, monkeypatch):
+        main = self._cfg(monkeypatch, _STRICT_KEYWORDS=["arsenal"])
+        out = main._strict_prefilter(
+            [self._mkt("kw", 1000, title="Arsenal vs Chelsea", slug="arsenal-vs-chelsea")],
+            {"active_positions": []})
+        assert [m["id"] for m in out] == ["kw"]
+
+    def test_open_position_always_kept(self, monkeypatch):
+        main = self._cfg(monkeypatch)
+        state = {"active_positions": [{"token_id": "0xHELD"}]}
+        out = main._strict_prefilter([self._mkt("held", 100, tokens=("0xHELD", "0xZ"))], state)
+        assert [m["id"] for m in out] == ["held"]
+
+    def test_disabled_is_noop(self, monkeypatch):
+        main = self._cfg(monkeypatch, _STRICT_FILTER=False)
+        markets = [self._mkt("lo", 10)]
+        assert main._strict_prefilter(markets, {"active_positions": []}) is markets
+
+
+class TestRateLimitDetection:
+    def test_detects_429_and_phrases(self):
+        import main
+        assert main._is_rate_limit_error(RuntimeError("Error code: 429"))
+        assert main._is_rate_limit_error(RuntimeError("rate limit exceeded"))
+        assert main._is_rate_limit_error(Exception("Too Many Requests"))
+
+    def test_non_rate_limit_is_false(self):
+        import main
+        assert not main._is_rate_limit_error(RuntimeError("connection reset"))
+
+    def test_detects_wrapped_cause(self):
+        import main
+        outer = RuntimeError("batch failed")
+        outer.__cause__ = RuntimeError("HTTP 429")
+        assert main._is_rate_limit_error(outer)
+
+
+# ---------------------------------------------------------------------------
+# Tests: STEP 3 — NOTIFICATION_TEST_MODE (ciclu live BUY→SELL imediat)
+# ---------------------------------------------------------------------------
+
+class TestNotificationTestMode:
+    def _market(self):
+        return {"id": "m1", "orderPriceMinTickSize": "0.01"}
+
+    def _decision(self):
+        return {"trade": True, "outcome": "1", "confidence": 0.9, "reason": "t"}
+
+    def test_default_is_false(self):
+        import main
+        assert main._NOTIFICATION_TEST_MODE is False
+
+    def test_buy_then_immediate_sell_cycle(self, monkeypatch):
+        import main
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        orders, notifs = [], []
+
+        def fake_order(*, token_id, price, side, tick_size=None, size=None):
+            orders.append({"side": side, "size": size, "price": price})
+            return {"success": True, "order_id": f"o{len(orders)}"}
+
+        monkeypatch.setattr(main, "_NOTIFICATION_TEST_MODE", True)
+        monkeypatch.setattr(main.time, "sleep", lambda *a: None)
+        monkeypatch.setattr(main, "_live_best_ask", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_live_best_bid", lambda *a, **k: 0.60)
+        monkeypatch.setattr(main, "place_limit_order", fake_order)
+        monkeypatch.setattr(main, "notify_trade", lambda *a, **k: notifs.append((a, k)))
+        main._execute_trade(
+            self._market(), state,
+            token_id="0xTOK", price=0.50, outcome_label="1 (Arsenal)",
+            decision=self._decision(), event_id="ev", title="Arsenal vs Chelsea",
+        )
+        # Două ordine REALE: BUY apoi SELL imediat, pe exact aceeași cantitate.
+        assert [o["side"] for o in orders] == [main.Side.BUY, main.Side.SELL]
+        buy, sell = orders
+        assert sell["size"] == buy["size"]
+        assert sell["price"] == pytest.approx(0.60)        # vândut la best bid
+        # Webhook-uri: BUY și SELL (SELL marcat CLOSE POSITION).
+        sides = [a[0] for (a, k) in notifs]
+        assert "BUY" in sides and "SELL" in sides
+        sell_kwargs = [k for (a, k) in notifs if a[0] == "SELL"][0]
+        assert sell_kwargs.get("action") == "CLOSE POSITION"
+        assert state["active_positions"] == []             # poziția închisă local
+
+    def test_no_sell_when_bid_unavailable(self, monkeypatch):
+        import main
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        sides = []
+
+        def fake_order(*, token_id, price, side, tick_size=None, size=None):
+            sides.append(side)
+            return {"success": True, "order_id": "o"}
+
+        monkeypatch.setattr(main, "_NOTIFICATION_TEST_MODE", True)
+        monkeypatch.setattr(main.time, "sleep", lambda *a: None)
+        monkeypatch.setattr(main, "_live_best_ask", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_live_best_bid", lambda *a, **k: None)   # fără bid
+        monkeypatch.setattr(main, "place_limit_order", fake_order)
+        monkeypatch.setattr(main, "notify_trade", lambda *a, **k: None)
+        main._execute_trade(
+            self._market(), state,
+            token_id="0xTOK", price=0.50, outcome_label="1",
+            decision=self._decision(), event_id="ev", title="M",
+        )
+        assert sides == [main.Side.BUY]                    # SELL anulat (fără bid)
+        assert len(state["active_positions"]) == 1          # poziția BUY rămâne deschisă
 
 
 # ---------------------------------------------------------------------------

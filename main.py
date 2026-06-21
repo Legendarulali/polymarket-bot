@@ -56,6 +56,19 @@ _INTER_ANALYSIS_DELAY = 3                                        # secunde throt
 # fără a lovi rate-limit-urile (429). Implicit 12 (recomandat 10-15). BATCH_SIZE<=1
 # revine la analiza individuală (o cerere per piață, prin process_market).
 _BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "12")))
+# Backoff defensiv (secunde) când Groq întoarce 429 (rate-limit) la un lot: așteptăm
+# înainte de a reîncerca la scanarea următoare, ca să nu ardem bugetul zilnic de tokeni.
+_RATE_LIMIT_BACKOFF = int(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "60"))
+# --- Filtru STRICT anti-429 (STEP 2) ---
+# llama-3.3-70b pe ~100k tokeni/zi NU poate înghiți ~2100 piețe/scanare. Înainte de
+# orice apel Groq reducem DRASTIC setul: păstrăm piețele cu poziție deschisă, cele cu
+# volum ≥ _STRICT_MIN_VOLUME_USD și (dacă _STRICT_KEYWORDS e setat) cele al căror titlu/
+# slug conține un keyword de interes; apoi sortăm după volum desc și tăiem la
+# _MAX_MARKETS_PER_SCAN. STRICT_FILTER=false revine la „scanează tot".
+_STRICT_FILTER = os.getenv("STRICT_FILTER", "true").strip().lower() in ("1", "true", "yes", "on")
+_STRICT_MIN_VOLUME_USD = float(os.getenv("STRICT_MIN_VOLUME_USD", "50000"))
+_MAX_MARKETS_PER_SCAN = int(os.getenv("MAX_MARKETS_PER_SCAN", "40"))
+_STRICT_KEYWORDS = [k.strip().lower() for k in os.getenv("STRICT_KEYWORDS", "").split(",") if k.strip()]
 # Mod SIMULARE (stress test Groq). IMPLICIT False. Când e True: botul trece peste
 # gate-urile de balanță (1.05 pUSD) și de expunere ca să scaneze și să trimită loturile
 # către Groq (testăm rate-limit-urile), dar NU plasează NICIUN ordin real — `_execute_trade`
@@ -63,6 +76,12 @@ _BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "12")))
 # history.json (ca să nu polueze cooldown-ul real) și sare verificările de exit TP/SL (care
 # plasează ordine SELL reale prin position_manager). Folosește DRY_RUN=true DOAR pentru teste.
 _DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in ("1", "true", "yes", "on")
+# Mod TEST NOTIFICĂRI (STEP 3). IMPLICIT False. Când e True: după un BUY REAL reușit,
+# botul așteaptă exact 1s și plasează imediat un SELL REAL pentru exact câte share-uri a
+# cumpărat (la best bid), ca să verifice end-to-end ambele webhook-uri (BUY + SELL) cu
+# ordine reale. Suprascrie orice strategie de holding/rezoluție. NU rulează în DRY_RUN
+# (acolo nu pleacă niciun ordin real). Loguri „[NOTIF-TEST]". Folosește-l DOAR pentru teste.
+_NOTIFICATION_TEST_MODE = os.getenv("NOTIFICATION_TEST_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
 # Balanța minimă (pUSD) sub care nu mai analizăm/tranzacționăm. 1.05 (nu 1.00) ca
 # să acopere bufferul de siguranță de 3% din dimensionare: în „zona moartă"
 # 1.00–1.04, safe_balance = balanță*0.97 produce un ordin sub minimul Polymarket de
@@ -382,6 +401,21 @@ def _live_best_ask(token_id: str) -> float | None:
         return None
 
 
+def _live_best_bid(token_id: str) -> float | None:
+    """Best bid live din orderbook CLOB (prețul la care se poate vinde acum), sau None."""
+    try:
+        ob = get_clob_client().get_order_book(token_id=token_id)
+        bids = ob.bids if hasattr(ob, "bids") else ob.get("bids", [])
+        if not bids:
+            return None
+        return max(
+            float(b.price if hasattr(b, "price") else b["price"]) for b in bids
+        )
+    except Exception as exc:
+        logger.warning("[Agent] Orderbook indisponibil pentru token=%s: %s", token_id, exc)
+        return None
+
+
 def _load_history() -> None:
     """Încarcă istoricul piețelor analizate din history.json (prima instrucțiune la rulare).
 
@@ -683,11 +717,7 @@ def _prepare_market(market: dict, account_state: dict) -> dict | None:
         return None
 
     # --- FILTRU 1: Volum minim ---
-    volume = 0.0
-    try:
-        volume = float(market.get("volume") or market.get("volumeNum") or 0)
-    except (ValueError, TypeError):
-        pass
+    volume = _market_volume(market)
     if volume < _MIN_VOLUME_USD:
         _scan_stats["volum mic"] += 1
         logger.debug(
@@ -1078,8 +1108,67 @@ def _execute_trade(
             reason=decision.get("reason"),
             order_id=result.get("order_id"),
         )
+        # STEP 3 — NOTIFICATION_TEST_MODE: după un BUY REAL reușit, închide IMEDIAT poziția
+        # (SELL real la best bid) ca să declanșeze și webhook-ul de vânzare. Suprascrie
+        # orice holding/TP/SL. Nu se atinge în DRY_RUN (ieșit mai sus, fără ordin real).
+        if _NOTIFICATION_TEST_MODE:
+            _notif_test_close(token_id, estimated_size, tick_size, title, outcome_label, account_state)
     else:
         logger.error("[Agent] Ordin respins de CLOB: %s", result.get("error"))
+
+
+def _notif_test_close(
+    token_id: str,
+    size: float,
+    tick_size: str,
+    title: str,
+    outcome_label: str,
+    account_state: dict,
+) -> None:
+    """STEP 3 (NOTIFICATION_TEST_MODE): după un BUY REAL reușit, vinde IMEDIAT exact `size`
+    share-uri la best bid (SELL real → „market sell" pe CLOB = ordin limită la cel mai bun
+    bid), ca să declanșeze webhook-ul de vânzare și să testăm ciclul complet BUY→SELL cu
+    ordine reale. Suprascrie orice strategie de holding/rezoluție. Loguri „[NOTIF-TEST]".
+
+    Caveat: BUY-ul e un ordin limită; dacă nu s-a umplut în 1s, SELL-ul (pe share-uri încă
+    nedeținute) poate fi respins de CLOB — îl logăm și lăsăm poziția deschisă pentru verificare."""
+    logger.warning(
+        "[NOTIF-TEST] BUY reușit pe '%s' (%s). Aștept 1s, apoi vând imediat %.2f share-uri "
+        "pentru a testa ciclul complet de notificări.", title[:60], outcome_label, size,
+    )
+    time.sleep(1)  # cerință: exact 1 secundă între BUY și SELL
+
+    bid = _live_best_bid(token_id)
+    if bid is None or bid <= 0:
+        logger.error(
+            "[NOTIF-TEST] Best bid indisponibil pentru token=%s — SELL de test anulat. "
+            "Poziția rămâne deschisă, verific-o manual.", token_id,
+        )
+        return
+
+    result = place_limit_order(
+        token_id=token_id, price=bid, side=Side.SELL, tick_size=tick_size, size=size,
+    )
+    if result.get("success"):
+        logger.warning(
+            "[NOTIF-TEST] SELL de test plasat | order_id=%s | size=%.2f | price=$%.4f — "
+            "ciclul de notificări BUY→SELL e complet.",
+            result.get("order_id"), size, bid,
+        )
+        # Reflectă închiderea în starea locală: scoate poziția și recreditează (aprox) balanța.
+        positions = account_state.get("active_positions", [])
+        account_state["active_positions"] = [p for p in positions if p.get("token_id") != token_id]
+        account_state["pusd_balance"] = round(account_state.get("pusd_balance", 0.0) + bid * size, 6)
+        notify_trade(
+            "SELL", title, price=bid, size=size, total=bid * size,
+            outcome=outcome_label, reason="NOTIFICATION_TEST_MODE: vânzare imediată de test",
+            order_id=result.get("order_id"), action="CLOSE POSITION",
+        )
+    else:
+        logger.error(
+            "[NOTIF-TEST] SELL de test RESPINS de CLOB: %s. Poziția rămâne deschisă — "
+            "verific-o manual.", result.get("error"),
+        )
 
 
 def _reevaluate_queued(item: dict, account_state: dict) -> None:
@@ -1200,6 +1289,24 @@ def _batch_request(item: dict) -> dict:
     }
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """True dacă excepția pare un rate-limit Groq (HTTP 429). Inspectează mesajul, iar dacă
+    e un RetryError tenacity (retry epuizat) și ultima încercare învelită + __cause__, ca să
+    prindem 429-ul chiar și când e împachetat."""
+    parts = [str(exc)]
+    last = getattr(exc, "last_attempt", None)  # tenacity.RetryError
+    if last is not None:
+        try:
+            parts.append(str(last.exception()))
+        except Exception:
+            pass
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        parts.append(str(cause))
+    blob = " ".join(parts).lower()
+    return any(s in blob for s in ("429", "rate limit", "rate_limit", "too many requests"))
+
+
 def _flush_batch(batch: list[dict], account_state: dict) -> None:
     """Trimite un lot de piețe pregătite la Groq într-UN singur apel (analyse_batch),
     apoi aplică deciziile. Toate piețele din lot sunt marcate ca analizate (apelul LLM
@@ -1215,10 +1322,18 @@ def _flush_batch(batch: list[dict], account_state: dict) -> None:
     try:
         decisions = analyse_batch(requests)
     except Exception as exc:
-        logger.error(
-            "[Batch] Analiză batch eșuată (%d piețe) — reîncerc la scanarea următoare: %s",
-            len(batch), exc,
-        )
+        if _is_rate_limit_error(exc):
+            logger.warning(
+                "[Batch] Rate-limit Groq (HTTP 429) la %d piețe — backoff %ds înainte de a "
+                "reîncerca la scanarea următoare (protejăm bugetul zilnic de tokeni).",
+                len(batch), _RATE_LIMIT_BACKOFF,
+            )
+            _interruptible_sleep(_RATE_LIMIT_BACKOFF)
+        else:
+            logger.error(
+                "[Batch] Analiză batch eșuată (%d piețe) — reîncerc la scanarea următoare: %s",
+                len(batch), exc,
+            )
         return  # nu marcăm nimic ca analizat → se reîncearcă
 
     # Apelul LLM a acoperit tot lotul → marcăm fiecare piață ca analizată (cooldown 4h).
@@ -1243,6 +1358,62 @@ def _flush_batch(batch: list[dict], account_state: dict) -> None:
             break
 
     _interruptible_sleep(_INTER_ANALYSIS_DELAY)  # throttle după apelul LLM (per lot)
+
+
+def _market_volume(market: dict) -> float:
+    """Volumul ($) al unei piețe Gamma (`volume` sau `volumeNum`); 0.0 dacă lipsește/invalid."""
+    try:
+        return float(market.get("volume") or market.get("volumeNum") or 0)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _market_token_ids(market: dict) -> list[str]:
+    """clobTokenIds pieței (string JSON sau listă) → listă de string-uri; [] la lipsă/eroare."""
+    raw = market.get("clobTokenIds") or market.get("clob_token_ids") or "[]"
+    try:
+        ids = json.loads(raw) if isinstance(raw, str) else raw
+        return [str(t) for t in ids]
+    except (ValueError, TypeError):
+        return []
+
+
+def _strict_prefilter(markets: list[dict], account_state: dict) -> list[dict]:
+    """STEP 2 (anti-429): reduce DRASTIC câte piețe ajung la Groq, ca modelul mare
+    (llama-3.3-70b) să nu depășească bugetul zilnic de tokeni.
+
+    Păstrează o piață dacă: avem deja o poziție deschisă pe ea, SAU volumul ≥
+    _STRICT_MIN_VOLUME_USD, SAU (când _STRICT_KEYWORDS e setat) titlul/slug-ul conține un
+    keyword de interes. Apoi sortează după volum desc și taie la _MAX_MARKETS_PER_SCAN
+    (cele mai lichide întâi). STRICT_FILTER=false → no-op (revine la „scanează tot").
+
+    ATENȚIE: filtrarea pe volum poate elimina meciuri de azi (volum mic la creare) —
+    coboară STRICT_MIN_VOLUME_USD sau adaugă echipele în STRICT_KEYWORDS ca să le prinzi."""
+    if not _STRICT_FILTER:
+        return markets
+
+    held = {p.get("token_id") for p in account_state.get("active_positions", [])}
+    held.discard(None)
+
+    def _keep(m: dict) -> bool:
+        if held and any(t in held for t in _market_token_ids(m)):
+            return True
+        if _STRICT_KEYWORDS:
+            text = f"{m.get('question') or m.get('title') or ''} {m.get('slug', '')}".lower()
+            if any(kw in text for kw in _STRICT_KEYWORDS):
+                return True
+        return _market_volume(m) >= _STRICT_MIN_VOLUME_USD
+
+    kept = [m for m in markets if _keep(m)]
+    kept.sort(key=_market_volume, reverse=True)
+    capped = kept[:_MAX_MARKETS_PER_SCAN] if _MAX_MARKETS_PER_SCAN > 0 else kept
+    logger.info(
+        "[StrictFilter] %d → %d piețe după filtru (volum≥$%.0f / %d keywords / poziții "
+        "deschise), apoi tăiat la %d (plafon %d).",
+        len(markets), len(kept), _STRICT_MIN_VOLUME_USD, len(_STRICT_KEYWORDS),
+        len(capped), _MAX_MARKETS_PER_SCAN,
+    )
+    return capped
 
 
 def _scan_markets(markets: list[dict], account_state: dict) -> None:
@@ -1334,6 +1505,14 @@ def main() -> None:
             "expunere ca să scanez și să trimit loturi către Groq, dar NU plasez NICIUN ordin "
             "real și sar verificările TP/SL. Dezactivează DRY_RUN pentru tranzacționare reală.",
             _MIN_BALANCE_PUSD,
+        )
+
+    if _NOTIFICATION_TEST_MODE:
+        logger.warning(
+            "[NOTIF-TEST] MOD TEST NOTIFICĂRI ACTIV: după fiecare BUY REAL reușit, botul vinde "
+            "imediat (după 1s) exact câte share-uri a cumpărat — ordine REALE pe ambele direcții, "
+            "ca să verifice webhook-urile BUY+SELL. Suprascrie holding-ul/TP/SL. Dezactivează "
+            "NOTIFICATION_TEST_MODE pentru operare normală."
         )
 
     if settings.OVERRIDE_BALANCE > 0:
@@ -1506,6 +1685,15 @@ def main() -> None:
                 )
             if not markets:
                 logger.info("[Agent] Toate piețele active au fost analizate recent. Aștept...")
+                _interruptible_sleep(_LOOP_INTERVAL)
+                continue
+
+            # STEP 2 (anti-429): filtru STRICT — reduce DRASTIC câte piețe ajung la Groq
+            # (poziție deschisă / volum mare / keyword de interes, apoi plafonat). Vezi
+            # _strict_prefilter. STRICT_FILTER=false dezactivează complet acest pas.
+            markets = _strict_prefilter(markets, account_state)
+            if not markets:
+                logger.info("[StrictFilter] Nicio piață nu trece filtrul strict în această rundă. Aștept...")
                 _interruptible_sleep(_LOOP_INTERVAL)
                 continue
 
