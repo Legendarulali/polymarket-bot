@@ -2480,6 +2480,70 @@ class TestNotificationTestMode:
         assert sides == [main.Side.BUY]                    # SELL anulat (fără bid)
         assert len(state["active_positions"]) == 1          # poziția BUY rămâne deschisă
 
+    def test_dry_run_plus_notif_test_fires_both_webhooks(self, monkeypatch):
+        # DRY_RUN + NOTIFICATION_TEST_MODE, FĂRĂ balanță: simulează BUY→SELL și declanșează
+        # ambele webhook-uri, FĂRĂ ordin real și fără a atinge balanța/pozițiile.
+        import main
+        state = {"pusd_balance": 0.0, "active_positions": []}
+        notifs = []
+        mock_order = MagicMock()
+        monkeypatch.setattr(main, "_DRY_RUN", True)
+        monkeypatch.setattr(main, "_NOTIFICATION_TEST_MODE", True)
+        monkeypatch.setattr(main.time, "sleep", lambda *a: None)
+        monkeypatch.setattr(main, "place_limit_order", mock_order)
+        monkeypatch.setattr(main, "notify_trade", lambda *a, **k: notifs.append((a, k)))
+        main._execute_trade(
+            self._market(), state,
+            token_id="0xTOK", price=0.50, outcome_label="1 (Arsenal)",
+            decision=self._decision(), event_id="ev", title="Arsenal vs Chelsea",
+        )
+        assert [a[0] for (a, k) in notifs] == ["BUY", "SELL"]   # ambele webhook-uri, în ordine
+        mock_order.assert_not_called()                          # niciun apel CLOB / ordin real
+        assert state["pusd_balance"] == 0.0                     # balanța neatinsă (fără fonduri)
+        assert state["active_positions"] == []                  # pozițiile neatinse
+        assert next(k for (a, k) in notifs if a[0] == "SELL")["action"] == "CLOSE POSITION"
+
+    def test_dry_run_alone_does_not_notify(self, monkeypatch):
+        # DRY_RUN fără NOTIFICATION_TEST_MODE: comportament neschimbat — doar log, fără webhook.
+        import main
+        state = {"pusd_balance": 0.0, "active_positions": []}
+        notifs = []
+        monkeypatch.setattr(main, "_DRY_RUN", True)
+        monkeypatch.setattr(main, "_NOTIFICATION_TEST_MODE", False)
+        monkeypatch.setattr(main, "place_limit_order", MagicMock())
+        monkeypatch.setattr(main, "notify_trade", lambda *a, **k: notifs.append(a))
+        main._execute_trade(
+            self._market(), state,
+            token_id="0xTOK", price=0.50, outcome_label="1",
+            decision=self._decision(), event_id="ev", title="M",
+        )
+        assert notifs == []                                     # niciun webhook în DRY_RUN simplu
+
+    def test_prob_window_loosened_only_in_notif_test(self, monkeypatch):
+        import main
+        monkeypatch.setattr(main, "_MIN_PROBABILITY", 0.45)
+        monkeypatch.setattr(main, "_MAX_PROBABILITY", 0.95)
+        monkeypatch.setattr(main, "_NOTIFICATION_TEST_MODE", False)
+        assert main._prob_window() == (0.45, 0.95)              # normal: pragurile reale
+        monkeypatch.setattr(main, "_NOTIFICATION_TEST_MODE", True)
+        lo, hi = main._prob_window()
+        assert lo < 0.45 and hi > 0.95                          # lărgit în NOTIF-TEST
+
+    def test_loosened_window_passes_low_prob_market(self, monkeypatch):
+        # YES=0.10: filtrat la fereastra normală, dar ACCEPTAT în NOTIFICATION_TEST_MODE.
+        import main
+        mkt = {"id": "b1", "question": "Will it rain tomorrow?", "slug": "will-it-rain",
+               "volume": "50000", "outcomes": json.dumps(["Yes", "No"]),
+               "outcomePrices": json.dumps(["0.10", "0.90"]),
+               "clobTokenIds": json.dumps(["0xY", "0xN"])}
+        state = {"pusd_balance": 0.0, "active_positions": []}
+        monkeypatch.setattr(main, "fetch_free_news", lambda *a, **k: [])
+        monkeypatch.setattr(main, "_NOTIFICATION_TEST_MODE", False)
+        assert main._prepare_market(mkt, state) is None         # 0.10 < 0.45 → filtrat
+        monkeypatch.setattr(main, "_NOTIFICATION_TEST_MODE", True)
+        item = main._prepare_market(mkt, state)
+        assert item is not None and item["kind"] == "binary"    # acum trece fereastra lărgită
+
 
 # ---------------------------------------------------------------------------
 # Tests: DRY_RUN (mod simulare / stress test) — scanează & trimite loturi, dar

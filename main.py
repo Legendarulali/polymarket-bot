@@ -104,6 +104,11 @@ _MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "10000"))  # Ignoră piețel
 # Configurabilă din mediu (PROBABILITY_MIN / PROBABILITY_MAX).
 _MIN_PROBABILITY = float(os.getenv("PROBABILITY_MIN", "0.45"))  # Ignoră probabilitățile YES prea mici (zgomot)
 _MAX_PROBABILITY = float(os.getenv("PROBABILITY_MAX", "0.95"))  # Ignoră dacă probabilitatea YES e quasi-certă
+# În NOTIFICATION_TEST_MODE lărgim fereastra de probabilitate la (0.01, 0.99) — vezi
+# _prob_window — ca testul de notificări să prindă UȘOR o piață eligibilă. Pragurile reale
+# de mai sus rămân neatinse pentru operarea normală.
+_NOTIF_TEST_PROB_MIN = 0.01
+_NOTIF_TEST_PROB_MAX = 0.99
 _MAX_POSITIONS_PER_EVENT = 2     # Max poziții per event_id (piețe generale)
 _MAX_OUTRIGHT_PER_EVENT = 1      # Max poziții pe piețe de tip "outright winner"
 # Mod universal (IMPLICIT): botul evaluează TOATE piețele active — politice,
@@ -661,6 +666,15 @@ def _maybe_send_pnl_report(account_state: dict) -> None:
     _last_pnl_report_ts = now
 
 
+def _prob_window() -> tuple[float, float]:
+    """Fereastra de probabilitate efectivă pentru filtre: lărgită (0.01, 0.99) în
+    NOTIFICATION_TEST_MODE ca testul de notificări să găsească ușor o piață; altfel
+    pragurile reale PROBABILITY_MIN/MAX. NU afectează calea live normală (flag off)."""
+    if _NOTIFICATION_TEST_MODE:
+        return _NOTIF_TEST_PROB_MIN, _NOTIF_TEST_PROB_MAX
+    return _MIN_PROBABILITY, _MAX_PROBABILITY
+
+
 def _prepare_market(market: dict, account_state: dict) -> dict | None:
     """Aplică TOATE filtrele ieftine (fără apel LLM) și, dacă piața merită analizată,
     culege știrile și construiește un „item" de analiză. Întoarce None dacă piața e
@@ -758,16 +772,17 @@ def _prepare_match_1x2(
     # Cerință de produs: logurile arată clar meciul + cotele 1/X/2.
     logger.info("[Meci] %s | %s", parsed["label"], format_legs(parsed))
 
-    # --- FILTRU 2: Fereastra de probabilitate [0.45, 0.95] pe fiecare leg 1X2 ---
+    # --- FILTRU 2: Fereastra de probabilitate pe fiecare leg 1X2 (lărgită în NOTIF-TEST) ---
+    prob_min, prob_max = _prob_window()
     candidates = [
         leg for leg in parsed["legs"]
-        if _MIN_PROBABILITY < leg["price"] < _MAX_PROBABILITY
+        if prob_min < leg["price"] < prob_max
     ]
     if not candidates:
         _scan_stats["probabilitate în afara ferestrei"] += 1
         logger.debug(
             "[FILTER] Ignor meciul '%s' — niciun rezultat 1X2 în fereastra [%.2f, %.2f] (%s).",
-            parsed["label"], _MIN_PROBABILITY, _MAX_PROBABILITY, format_legs(parsed),
+            parsed["label"], prob_min, prob_max, format_legs(parsed),
         )
         return None
 
@@ -802,13 +817,14 @@ def _prepare_legacy_binary(
     (sau None). Flux moștenit pentru piețe non-1X2 (sau focus pe fotbal dezactivat)."""
     active_positions: list[dict] = account_state.setdefault("active_positions", [])
 
-    # --- FILTRU 2: Fereastra de probabilitate pe YES ---
+    # --- FILTRU 2: Fereastra de probabilitate pe YES (lărgită în NOTIF-TEST) ---
     yes_price_raw = _current_price(market, "YES")
-    if not (_MIN_PROBABILITY < yes_price_raw < _MAX_PROBABILITY):
+    prob_min, prob_max = _prob_window()
+    if not (prob_min < yes_price_raw < prob_max):
         _scan_stats["probabilitate în afara ferestrei"] += 1
         logger.debug(
             "[FILTER] Ignor piața '%s' [%s] (Probabilitate YES=%.2f în afara ferestrei [%.2f, %.2f]).",
-            title[:60], type_label, yes_price_raw, _MIN_PROBABILITY, _MAX_PROBABILITY,
+            title[:60], type_label, yes_price_raw, prob_min, prob_max,
         )
         return None
 
@@ -958,6 +974,12 @@ def _execute_trade(
     # real, nu atingem balanța/pozițiile/coada — doar logăm. E plasă de siguranță finală:
     # indiferent ce gate-uri ar trece în amonte, niciun ordin real nu pleacă în DRY_RUN.
     if _DRY_RUN:
+        # NOTIFICATION_TEST_MODE peste DRY_RUN: testăm lanțul de notificări Discord FĂRĂ
+        # balanță reală și FĂRĂ ordine reale — simulăm un ciclu complet BUY→1s→SELL și
+        # declanșăm AMBELE webhook-uri. Niciun apel CLOB; balanța/pozițiile rămân neatinse.
+        if _NOTIFICATION_TEST_MODE:
+            _simulate_notif_cycle(price, title, outcome_label, decision)
+            return
         logger.warning(
             "[DRY_RUN] Simulare: Piața '%s' a fost aprobată de AI (outcome=%s, confidence=%.2f), "
             "dar nu plasăm ordin real.",
@@ -1169,6 +1191,38 @@ def _notif_test_close(
             "[NOTIF-TEST] SELL de test RESPINS de CLOB: %s. Poziția rămâne deschisă — "
             "verific-o manual.", result.get("error"),
         )
+
+
+def _simulate_notif_cycle(price: float, title: str, outcome_label: str, decision: dict) -> None:
+    """DRY_RUN + NOTIFICATION_TEST_MODE: simulează un ciclu COMPLET BUY→SELL și declanșează
+    AMBELE webhook-uri Discord, FĂRĂ ordine reale și FĂRĂ balanță reală (niciun apel CLOB,
+    starea locală neatinsă). Pentru a testa notificările fără fonduri. Loguri „[NOTIF-TEST][SIM]".
+
+    Dimensionarea e nominală ($5 țintă, ca în producție) doar ca cifrele din webhook să arate
+    realist; nu se cumpără/vinde nimic real, deci nu hrănim P/L-ul cu un round-trip fictiv."""
+    size = compute_order_size(price)            # ~$5 nominal (fără buget/balanță reală)
+    total = round(size * price, 4)
+    logger.warning(
+        "[NOTIF-TEST][SIM] BUY simulat: '%s' (%s) | size≈%.2f | price=$%.4f | total≈$%.2f "
+        "→ declanșez webhook BUY.", title[:60], outcome_label, size, price, total,
+    )
+    notify_trade(
+        "BUY", title, price=price, size=size, total=total,
+        outcome=outcome_label, confidence=decision.get("confidence"),
+        reason="DRY_RUN + NOTIFICATION_TEST_MODE: BUY simulat (fără ordin real)",
+        order_id="SIMULATED-BUY",
+    )
+    time.sleep(1)  # cerință: exact 1 secundă între BUY și SELL
+    logger.warning(
+        "[NOTIF-TEST][SIM] SELL simulat: '%s' (%s) | size≈%.2f | price=$%.4f "
+        "→ declanșez webhook SELL.", title[:60], outcome_label, size, price,
+    )
+    notify_trade(
+        "SELL", title, price=price, size=size, total=total,
+        outcome=outcome_label,
+        reason="DRY_RUN + NOTIFICATION_TEST_MODE: SELL simulat (fără ordin real)",
+        order_id="SIMULATED-SELL", action="CLOSE POSITION",
+    )
 
 
 def _reevaluate_queued(item: dict, account_state: dict) -> None:
