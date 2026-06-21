@@ -59,6 +59,21 @@ def _post(embed: dict) -> None:
         logger.warning("[Discord] Trimitere notificare eșuată: %s", exc)
 
 
+def notify_startup() -> None:
+    """Ping de pornire: confirmă INDEPENDENT (înainte de orice tranzacție) că
+    webhook-ul Discord e funcțional. No-op fără webhook configurat; trece prin
+    `_post`, deci nu ridică niciodată — orice eroare de rețea e prinsă și logată."""
+    if not _enabled():
+        return
+    _post({
+        "title": "🤖 Bot pornit",
+        "description": "Bot successfully initialized and monitoring markets",
+        "color": _BLUE,
+        "timestamp": _now_iso(),
+        "footer": _FOOTER,
+    })
+
+
 def notify_trade(
     side: str,
     title: str,

@@ -21,7 +21,7 @@ from src.ai_analyser import analyse_market, analyse_match, analyse_batch
 from src.football import parse_match_market, format_legs, extract_teams
 from src.allowance import ensure_collateral_approved
 from src.position_manager import check_exit_conditions
-from src.notifications import notify_trade, notify_portfolio, notify_positions
+from src.notifications import notify_trade, notify_portfolio, notify_positions, notify_startup
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,12 @@ _LOW_BALANCE_SLEEP = 15 * 60  # 15 minute sleep când balanța e insuficientă
 _CACHE_TTL_SECONDS = 4 * 3600 # cooldown: re-analizează o piață cel mult o dată la 4h (persistat în history.json)
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 _GAMMA_PAGE_SIZE = 100                                           # piețe per pagină la paginare Gamma
+# Gamma respinge paginarea dincolo de o adâncime maximă (offset prea mare, ex.
+# offset=2100) cu HTTP 422. NU e o eroare, ci capătul rezultatelor permise: la 422
+# oprim paginarea curat, păstrând tot ce am preluat. `_MAX_PAGINATION_DEPTH` e
+# sentinelul intern prin care `_fetch_markets_page` semnalează acest caz buclei.
+_GAMMA_MAX_DEPTH_STATUS = 422
+_MAX_PAGINATION_DEPTH = object()
 # Plafon OPȚIONAL de siguranță pe câte piețe se preiau per buclă. 0 (implicit) =
 # fără plafon → paginarea dinamică preia TOATE piețele active până când API-ul
 # întoarce o pagină goală/parțială. Setează-l (ex. 2000) doar ca să limitezi
@@ -212,10 +218,21 @@ def _interruptible_sleep(seconds: int) -> None:
         time.sleep(1)
 
 
-def _fetch_markets_page(params: dict) -> list | None:
-    """Un singur GET la Gamma /markets. Lista (poate fi goală) sau None la eroare/non-200."""
+def _fetch_markets_page(params: dict) -> list | object | None:
+    """Un singur GET la Gamma /markets.
+
+    Întoarce:
+      - lista de piețe (poate fi goală) la HTTP 200;
+      - `_MAX_PAGINATION_DEPTH` la HTTP 422 — am atins adâncimea maximă de paginare
+        permisă de Polymarket (ex. offset=2100). NU e o eroare, ci capătul
+        rezultatelor: apelantul oprește paginarea curat, cu ce a strâns;
+      - `None` la orice altă eroare / non-200 / excepție de rețea.
+    """
     try:
         response = httpx.get(_GAMMA_MARKETS_URL, params=params, timeout=10)
+        # 422 = adâncime maximă de paginare atinsă → semnalăm distinct, nu ca eroare.
+        if response.status_code == _GAMMA_MAX_DEPTH_STATUS:
+            return _MAX_PAGINATION_DEPTH
         if response.status_code != 200:
             logger.warning("[Agent] Gamma a răspuns %s (params=%s).", response.status_code, params)
             return None
@@ -244,9 +261,19 @@ def _collect_active_markets(extra_params: dict, seen_ids: set, out: list, cap: i
         base = {"active": "true", "closed": "false",
                 "limit": _GAMMA_PAGE_SIZE, "offset": offset, **extra_params}
         page = _fetch_markets_page({**base, **order_params})
+        # Fallback: dacă 'order' e respins (non-200, dar NU 422), reia pagina fără sortare.
         if page is None and order_params:
             logger.warning("[Agent] Reîncerc fără 'order=%s' (posibil nesuportat de Gamma).", _GAMMA_ORDER)
             page = _fetch_markets_page(base)
+        # HTTP 422 = adâncimea maximă de paginare permisă de Polymarket (ex. offset=2100):
+        # nu e eroare, ci capătul rezultatelor. Oprim curat, păstrând piețele deja strânse.
+        if page is _MAX_PAGINATION_DEPTH:
+            logger.info(
+                "[Agent] Adâncime maximă de paginare atinsă (offset=%d, HTTP 422). "
+                "Continui cu cele %d piețe preluate.",
+                offset, len(out),
+            )
+            return
         if not page:
             return  # eroare sau listă goală → gata
 
@@ -1336,6 +1363,11 @@ def main() -> None:
         "Entering autonomous AI agent loop (interval=%ds). Send SIGTERM/SIGINT to stop.",
         _LOOP_INTERVAL,
     )
+
+    # Ping de pornire pe Discord: confirmă INDEPENDENT că webhook-ul e funcțional,
+    # înainte de orice tranzacție. No-op fără webhook configurat; nu ridică niciodată
+    # (trece prin `_post`, care prinde orice eroare de rețea).
+    notify_startup()
 
     try:
         while RUNNING:

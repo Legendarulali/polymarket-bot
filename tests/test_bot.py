@@ -914,6 +914,28 @@ class TestNotifications:
         vals = {f["name"]: f["value"] for f in embed["fields"]}
         assert vals["Motiv"] == "Take Profit atins (+30.0%)"
 
+    def test_startup_notification_payload(self):
+        from src import notifications
+        with self._patch(), patch("src.notifications.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=204)
+            notifications.notify_startup()
+        mock_post.assert_called_once()
+        embed = mock_post.call_args.kwargs["json"]["embeds"][0]
+        assert "monitoring markets" in embed["description"]
+
+    def test_startup_notification_no_webhook_is_noop(self):
+        from src import notifications
+        with self._patch(webhook=""), patch("src.notifications.requests.post") as mock_post:
+            notifications.notify_startup()
+        mock_post.assert_not_called()
+
+    def test_startup_notification_never_raises_on_network_error(self):
+        from src import notifications
+        with self._patch(), \
+             patch("src.notifications.requests.post", side_effect=Exception("boom")):
+            # Webhook-ul de pornire nu trebuie să dărâme niciodată bootul botului.
+            notifications.notify_startup()
+
 
 # ---------------------------------------------------------------------------
 # Tests: persistent analyzed-markets history (history.json)
@@ -1243,6 +1265,32 @@ class TestFetchActiveMarkets:
         out = main.fetch_active_markets(limit=150)     # plafon de siguranță
         assert len(out) == 200                          # se oprește la pagina care atinge ≥150
         assert calls["n"] == 2                          # doar 2 cereri, nu a treia
+
+    def test_stops_gracefully_on_422_max_depth(self, monkeypatch):
+        # HTTP 422 = adâncimea maximă de paginare permisă de Polymarket (ex. offset=2100):
+        # NU crash / excepție, ci break curat care PĂSTREAZĂ piețele deja preluate.
+        import main
+        monkeypatch.setattr(main.time, "sleep", lambda *a: None)
+        page1 = [{"id": str(i)} for i in range(100)]   # prima pagină plină → continuă
+        calls = {"n": 0}
+
+        def fake_get(url, params=None, timeout=None):
+            i = calls["n"]
+            calls["n"] += 1
+            if i == 0:
+                return self._resp(page1)
+            return self._resp(None, status=422)        # a doua cerere lovește limita de adâncime
+
+        monkeypatch.setattr(main.httpx, "get", fake_get)
+        out = main.fetch_active_markets()              # limit=0 → fără plafon
+        assert len(out) == 100                          # piețele de dinainte de 422 sunt păstrate
+        assert calls["n"] == 2                          # s-a oprit la 422, fără a treia cerere
+
+    def test_422_on_first_page_returns_empty_without_crash(self, monkeypatch):
+        # 422 chiar de la prima pagină → 0 piețe, dar tot fără excepție.
+        import main
+        monkeypatch.setattr(main.httpx, "get", lambda *a, **k: self._resp(None, status=422))
+        assert main.fetch_active_markets(limit=50) == []
 
 
 # ---------------------------------------------------------------------------
