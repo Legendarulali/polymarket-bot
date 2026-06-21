@@ -26,11 +26,6 @@ from src.notifications import notify_trade, notify_portfolio, notify_positions, 
 logger = logging.getLogger(__name__)
 
 RUNNING = True
-# TEMP: parte din hack-ul de test al notificărilor (vezi blocul „TEMP" din _apply_decision) —
-# de eliminat împreună cu el. Runtime one-shot: în DRY_RUN + NOTIFICATION_TEST_MODE forțăm
-# trade=True pe PRIMA piață analizată, ca să declanșăm o singură dată ciclul de notificări
-# simulat. Setat True după prima forțare; se resetează la repornirea procesului.
-_notif_test_forced = False
 _LOOP_INTERVAL = 60          # secunde între iterații normale
 _LOW_BALANCE_SLEEP = 15 * 60  # 15 minute sleep când balanța e insuficientă
 _CACHE_TTL_SECONDS = 4 * 3600 # cooldown: re-analizează o piață cel mult o dată la 4h (persistat în history.json)
@@ -878,29 +873,6 @@ def _apply_decision(item: dict, decision: dict, account_state: dict) -> None:
     title = item["title"]
     event_id = item["event_id"]
 
-    # TEMP: hack de test al notificărilor — DE ELIMINAT după validarea webhook-urilor
-    # (împreună cu flag-ul global `_notif_test_forced`). Caută „TEMP" ca să-l găsești.
-    # NOTIFICATION_TEST_MODE + DRY_RUN: forțăm trade=True pe PRIMA piață analizată (o
-    # singură dată per proces) ca să atingem imediat _simulate_notif_cycle și să declanșăm
-    # webhook-urile, chiar dacă AI-ul a zis trade=False (ex. „Will Jesus return before 2027?").
-    # Outcome-ul forțat e ales VALID: primul leg eligibil (1X2) sau YES (binar), ca maparea
-    # outcome→token de mai jos să meargă. Gate DUBLU (și DRY_RUN) → niciun ordin real posibil.
-    global _notif_test_forced
-    if _DRY_RUN and _NOTIFICATION_TEST_MODE and not _notif_test_forced:
-        _notif_test_forced = True
-        forced_outcome = item["candidates"][0]["code"] if item["kind"] == "match" else "YES"
-        logger.warning(
-            "[NOTIF-TEST][SIM] Forțez trade=True pe prima piață ('%s', outcome=%s) — "
-            "suprascriu decizia AI (era trade=%s) ca să declanșez ciclul de notificări.",
-            title[:60], forced_outcome, decision.get("trade"),
-        )
-        decision = {
-            "trade": True,
-            "outcome": forced_outcome,
-            "confidence": max(_MIN_CONFIDENCE, float(decision.get("confidence", 0.0) or 0.0)),
-            "reason": "NOTIFICATION_TEST_MODE: forced trade (DRY_RUN simulation)",
-        }
-
     if item["kind"] == "match":
         logger.info(
             "[Agent] Decizie AI 1X2: trade=%s | outcome=%s | confidence=%.2f | reason=%s",
@@ -1400,40 +1372,23 @@ def _flush_batch(batch: list[dict], account_state: dict) -> None:
     balanța scade sub minim în timpul execuției."""
     if not batch:
         return
-
-    # TEMP: hack de test al notificărilor — DE ELIMINAT după validarea webhook-urilor.
-    # În DRY_RUN + NOTIFICATION_TEST_MODE, până la prima forțare, SĂRIM complet apelul Groq
-    # (analyse_batch) ca să ocolim un 429 / TPD epuizat care altfel ar opri lotul ÎNAINTE de
-    # _apply_decision. Sintetizăm decizii neutre (trade=False); _apply_decision forțează oricum
-    # prima piață → _simulate_notif_cycle declanșează webhook-urile. Caută „TEMP".
-    if _DRY_RUN and _NOTIFICATION_TEST_MODE and not _notif_test_forced:
-        logger.warning(
-            "[NOTIF-TEST][SIM] Sar apelul Groq pentru acest lot (DRY_RUN + NOTIFICATION_TEST_MODE) "
-            "ca să ocolesc un eventual 429/TPD epuizat; prima piață e forțată în _apply_decision."
-        )
-        decisions = {
-            str(it["market_id"]): {"trade": False, "outcome": "NONE", "confidence": 0.0,
-                                   "reason": "NOTIFICATION_TEST_MODE: Groq skipped"}
-            for it in batch
-        }
-    else:
-        requests = [_batch_request(it) for it in batch]
-        try:
-            decisions = analyse_batch(requests)
-        except Exception as exc:
-            if _is_rate_limit_error(exc):
-                logger.warning(
-                    "[Batch] Rate-limit Groq (HTTP 429) la %d piețe — backoff %ds înainte de a "
-                    "reîncerca la scanarea următoare (protejăm bugetul zilnic de tokeni).",
-                    len(batch), _RATE_LIMIT_BACKOFF,
-                )
-                _interruptible_sleep(_RATE_LIMIT_BACKOFF)
-            else:
-                logger.error(
-                    "[Batch] Analiză batch eșuată (%d piețe) — reîncerc la scanarea următoare: %s",
-                    len(batch), exc,
-                )
-            return  # nu marcăm nimic ca analizat → se reîncearcă
+    requests = [_batch_request(it) for it in batch]
+    try:
+        decisions = analyse_batch(requests)
+    except Exception as exc:
+        if _is_rate_limit_error(exc):
+            logger.warning(
+                "[Batch] Rate-limit Groq (HTTP 429) la %d piețe — backoff %ds înainte de a "
+                "reîncerca la scanarea următoare (protejăm bugetul zilnic de tokeni).",
+                len(batch), _RATE_LIMIT_BACKOFF,
+            )
+            _interruptible_sleep(_RATE_LIMIT_BACKOFF)
+        else:
+            logger.error(
+                "[Batch] Analiză batch eșuată (%d piețe) — reîncerc la scanarea următoare: %s",
+                len(batch), exc,
+            )
+        return  # nu marcăm nimic ca analizat → se reîncearcă
 
     # Apelul LLM a acoperit tot lotul → marcăm fiecare piață ca analizată (cooldown 4h).
     for it in batch:
