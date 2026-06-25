@@ -9,6 +9,16 @@ from collections import Counter
 
 import httpx
 
+# PolyApiException — ridicată de SDK-ul CLOB la răspunsuri non-2xx (ex. 401
+# Unauthorized dintr-un glitch API Polymarket / desincronizare de ceas). O prindem în
+# bucla principală ca un astfel de glitch tranzitoriu să nu mai omoare tot procesul.
+# Import defensiv: stub local dacă fork-ul nu expune modulul (importul nu trebuie să pice).
+try:
+    from py_clob_client_v2.exceptions import PolyApiException
+except ImportError:  # pragma: no cover
+    class PolyApiException(Exception):  # type: ignore[no-redef]
+        status_code = None
+
 from config.settings import settings
 from src.reconciliation import log_reconciliation_report, get_account_state, compute_portfolio_summary
 from src.execution import (
@@ -1604,7 +1614,40 @@ def main() -> None:
 
     try:
         while RUNNING:
-            account_state = get_account_state()
+            # Reconciliere stare cont — apel critic de rețea (CLOB get_balance_allowance
+            # + Data API positions). Îl izolăm într-un try/except: un glitch temporar al
+            # API-ului Polymarket (ex. 401 Unauthorized dintr-o desincronizare de ceas sau
+            # o cheie respinsă tranzitoriu) NU trebuie să trântească tot procesul. Funcția
+            # are deja un retry intern (3×); dacă tot eșuează, intrăm în standby și reîncercăm
+            # runda următoare cu `continue`, în loc să propagăm eroarea în handler-ul fatal.
+            try:
+                account_state = get_account_state()
+            except PolyApiException as exc:
+                status = getattr(exc, "status_code", None)
+                if status == 401:
+                    logger.error(
+                        "[Agent] Eroare temporară de autentificare 401 (Unauthorized/"
+                        "Invalid api key). Posibil glitch API Polymarket sau desincronizare "
+                        "de ceas (clock drift). Reîncerc după standby de %d min...",
+                        _LOW_BALANCE_SLEEP // 60,
+                    )
+                else:
+                    logger.error(
+                        "[Agent] Eroare API Polymarket la reconciliere (status=%s): %s. "
+                        "Reîncerc după standby de %d min...",
+                        status, exc, _LOW_BALANCE_SLEEP // 60,
+                    )
+                _interruptible_sleep(_LOW_BALANCE_SLEEP)
+                continue
+            except Exception as exc:
+                logger.error(
+                    "[Agent] Reconcilierea stării contului a eșuat (eroare tranzitorie de "
+                    "rețea?): %s. Reîncerc după standby de %d min...",
+                    exc, _LOW_BALANCE_SLEEP // 60, exc_info=True,
+                )
+                _interruptible_sleep(_LOW_BALANCE_SLEEP)
+                continue
+
             pusd_balance: float = account_state.get("pusd_balance", 0.0)
 
             # Conturile proxy returnează 0 de la /balance-allowance chiar dacă au fonduri.

@@ -1,6 +1,19 @@
 import logging
+import time
+
 import requests
 from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+
+# PolyApiException e ridicată de SDK la răspunsuri non-2xx (ex. 401 Unauthorized
+# dintr-o desincronizare de ceas sau un glitch temporar al API-ului Polymarket).
+# Import defensiv: dacă fork-ul nu expune modulul, cădem pe un stub local, ca un
+# import greșit să nu doboare botul la pornire (mai rău decât eroarea originală).
+try:
+    from py_clob_client_v2.exceptions import PolyApiException
+except ImportError:  # pragma: no cover
+    class PolyApiException(Exception):  # type: ignore[no-redef]
+        status_code = None
+
 from src.clob_client import get_clob_client, get_signature_type
 from config.settings import settings
 
@@ -9,6 +22,11 @@ logger = logging.getLogger(__name__)
 _POSITIONS_URL = "https://data-api.polymarket.com/positions"
 _MICRO_PUSD = 1e6
 _ALLOWANCE_WARN_THRESHOLD = 100.0
+# Retry pe apelul critic de balanță: un glitch tranzitoriu de rețea sau un 401 de o
+# secundă (ex. desincronizare de ceas) nu trebuie să propage eroarea din prima spre
+# main. Reîncercăm de câteva ori, la interval scurt, înainte de a renunța.
+_BALANCE_RETRY_ATTEMPTS = 3
+_BALANCE_RETRY_DELAY_SECONDS = 3
 
 
 def _f(pos: dict, *keys: str, default: float = 0.0) -> float:
@@ -23,12 +41,45 @@ def _f(pos: dict, *keys: str, default: float = 0.0) -> float:
     return default
 
 
+def _get_balance_allowance_with_retry(client):
+    """`client.get_balance_allowance(...)` cu reîncercări pe erori tranzitorii.
+
+    Polymarket poate întoarce sporadic 401 (Unauthorized/Invalid api key) dintr-o
+    desincronizare de ceas sau un glitch de API, ori apelul poate pica pe o eroare de
+    rețea de o secundă. Reîncercăm de `_BALANCE_RETRY_ATTEMPTS` ori, la interval de
+    `_BALANCE_RETRY_DELAY_SECONDS`; dacă tot eșuează, re-aruncăm ultima excepție spre
+    apelant (main o prinde și intră în standby, fără să trântească procesul)."""
+    params = BalanceAllowanceParams(
+        asset_type=AssetType.COLLATERAL, signature_type=get_signature_type()
+    )
+    last_exc: Exception | None = None
+    for attempt in range(1, _BALANCE_RETRY_ATTEMPTS + 1):
+        try:
+            return client.get_balance_allowance(params)
+        except PolyApiException as exc:
+            last_exc = exc
+            logger.warning(
+                "get_balance_allowance a eșuat (încercarea %d/%d): PolyApiException "
+                "status_code=%s — %s",
+                attempt, _BALANCE_RETRY_ATTEMPTS, getattr(exc, "status_code", None),
+                "reîncerc..." if attempt < _BALANCE_RETRY_ATTEMPTS else "renunț și propag eroarea.",
+            )
+        except Exception as exc:  # erori tranzitorii de rețea din SDK (requests/httpx/etc.)
+            last_exc = exc
+            logger.warning(
+                "get_balance_allowance a eșuat (încercarea %d/%d): %s — %s",
+                attempt, _BALANCE_RETRY_ATTEMPTS, exc,
+                "reîncerc..." if attempt < _BALANCE_RETRY_ATTEMPTS else "renunț și propag eroarea.",
+            )
+        if attempt < _BALANCE_RETRY_ATTEMPTS:
+            time.sleep(_BALANCE_RETRY_DELAY_SECONDS)
+    raise last_exc  # toate încercările au eșuat → propagăm ultima excepție
+
+
 def get_account_state() -> dict:
     client = get_clob_client()
 
-    bal_data = client.get_balance_allowance(
-        BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=get_signature_type())
-    )
+    bal_data = _get_balance_allowance_with_retry(client)
     if hasattr(bal_data, "balance"):
         raw_balance = bal_data.balance
     elif isinstance(bal_data, dict):

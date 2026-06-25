@@ -53,8 +53,23 @@ except ImportError:
     _mock_clob_types = MagicMock()
     _mock_clob_types.ApiCreds = MagicMock()
 
+    class PolyApiException(Exception):
+        """Stub al excepției SDK pentru teste — păstrează `status_code`/`error_msg` ca
+        în fork-ul real (forma string e cea pe care o loghează botul la un 401)."""
+
+        def __init__(self, status_code=None, error_msg=None):
+            self.status_code = status_code
+            self.error_msg = error_msg
+            super().__init__(
+                f"PolyApiException[status_code={status_code}, error_message={error_msg}]"
+            )
+
+    _mock_exceptions = MagicMock()
+    _mock_exceptions.PolyApiException = PolyApiException
+
     sys.modules["py_clob_client_v2"] = _mock_clob
     sys.modules["py_clob_client_v2.clob_types"] = _mock_clob_types
+    sys.modules["py_clob_client_v2.exceptions"] = _mock_exceptions
 
 # ---------------------------------------------------------------------------
 # Mock openai (used by ai_analyser.py)

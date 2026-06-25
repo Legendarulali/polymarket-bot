@@ -636,6 +636,62 @@ class TestBalanceParsing:
 
 
 # ---------------------------------------------------------------------------
+# Tests: balance-call retry (anti-401 / glitch tranzitoriu)
+# ---------------------------------------------------------------------------
+
+class TestBalanceRetry:
+    """get_balance_allowance reîncearcă pe erori tranzitorii (ex. 401 din clock drift)
+    înainte de a propaga eroarea spre main; main o prinde apoi și intră în standby."""
+
+    @staticmethod
+    def _api_401():
+        # Construit ca `src.reconciliation.PolyApiException` — exact clasa pe care o
+        # prinde retry-ul. `status_code` setat pe instanță (portabil real/stub).
+        from src.reconciliation import PolyApiException
+        err = PolyApiException()
+        err.status_code = 401
+        return err
+
+    def test_retries_then_succeeds_after_transient_401(self):
+        from src.reconciliation import get_account_state
+
+        mock_client = MagicMock()
+        mock_client.get_balance_allowance.side_effect = [
+            self._api_401(),                          # primul apel: 401 tranzitoriu
+            {"balance": 7_000_000, "allowance": 0},   # al doilea: succes
+        ]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = []
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("src.reconciliation.get_clob_client", return_value=mock_client), \
+             patch("src.reconciliation.requests.get", return_value=mock_resp), \
+             patch("src.reconciliation.time.sleep"):  # nu așteptăm real în teste
+            state = get_account_state()
+
+        assert state["pusd_balance"] == pytest.approx(7.0)
+        assert mock_client.get_balance_allowance.call_count == 2
+
+    def test_raises_after_all_attempts_fail(self):
+        from src.reconciliation import (
+            get_account_state, PolyApiException, _BALANCE_RETRY_ATTEMPTS,
+        )
+
+        mock_client = MagicMock()
+        mock_client.get_balance_allowance.side_effect = [
+            self._api_401() for _ in range(_BALANCE_RETRY_ATTEMPTS)
+        ]
+
+        with patch("src.reconciliation.get_clob_client", return_value=mock_client), \
+             patch("src.reconciliation.time.sleep"):
+            with pytest.raises(PolyApiException):
+                get_account_state()
+
+        # Toate încercările consumate → eroarea ajunge la main (care intră în standby).
+        assert mock_client.get_balance_allowance.call_count == _BALANCE_RETRY_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
 # Tests: settings loading
 # ---------------------------------------------------------------------------
 
