@@ -6,6 +6,7 @@ import sys
 import signal
 import logging
 from collections import Counter
+from datetime import datetime, timedelta
 
 import httpx
 
@@ -154,8 +155,11 @@ _QUEUE_MAX_SIZE = 10    # plafon coadă: păstrăm intrările cu cel mai mare co
 # le re-evaluează prioritar când se eliberează un slot. NU atinge regula de balanță 1.05.
 _ACTIVATE_QUEUE = os.getenv("ACTIVATE_QUEUE", "false").strip().lower() in ("1", "true", "yes", "on")
 
-# Stare raport orar P/L pe Discord (ts=0 → primul raport e trimis imediat la pornire)
-_last_pnl_report_ts: float = 0.0
+# Stare raport orar P/L pe Discord. `_next_pnl_report_ts` = momentul (epoch) al
+# următorului raport, ALINIAT la ceas (oră fixă xx:00, ca resetul de metrici Polymarket),
+# NU la un interval relativ de pornire. None = încă neprogramat (se setează la prima
+# buclă, pe următoarea graniță orară — deci NU se trimite un raport parțial la pornire).
+_next_pnl_report_ts: float | None = None
 _last_report_value: float | None = None
 _session_start_value: float | None = None
 
@@ -638,23 +642,56 @@ def _extract_event_id(market: dict) -> str:
     )
 
 
+def _next_report_time(interval_h: float, now: datetime | None = None) -> datetime:
+    """Următoarea graniță de raportare ALINIATĂ la ceas, strict după `now`.
+
+    Granițele sunt ancorate la miezul nopții și pășesc din `interval_h` în `interval_h`
+    ore: pentru interval_h=1 → fix la oră întreagă (00:00, 01:00, …, 23:00); pentru 0.5 →
+    xx:00 și xx:30; pentru 2 → orele pare. Astfel raportul iese la ORĂ FIXĂ (ca resetul
+    orar de metrici/orderbook Polymarket), nu la un interval relativ de pornirea botului.
+
+    Notă fus orar: folosim ceasul local (`datetime.now()`); pe Railway containerul rulează
+    în UTC, deci granițele coincid cu vârful orei UTC (când Polymarket își resetează ora)."""
+    now = now or datetime.now()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    interval = timedelta(hours=interval_h)
+    # int() == floor aici (diferența e mereu ≥ 0); +1 ⇒ prima graniță STRICT după `now`.
+    steps = int((now - midnight) / interval) + 1
+    return midnight + steps * interval
+
+
 def _maybe_send_pnl_report(account_state: dict) -> None:
-    """Raportul periodic de portofoliu pe Discord, în 2 mesaje grupate, trimise
-    o singură dată la fiecare PNL_REPORT_INTERVAL_HOURS (NU la fiecare buclă):
+    """Raportul periodic de portofoliu pe Discord, în 2 mesaje grupate:
       1) status financiar (cash, P/L, valoare totală),
       2) inventarul pozițiilor deschise (sau „Niciuna").
-    Ambele se trimit la fiecare interval, ca raportarea să fie predictibilă."""
-    global _last_pnl_report_ts, _last_report_value, _session_start_value
+    Trimise o singură dată la fiecare graniță orară ALINIATĂ la ceas (xx:00, pas de
+    PNL_REPORT_INTERVAL_HOURS), NU la fiecare buclă și NU la interval relativ de pornire.
+    Prima rulare DOAR programează următoarea graniță (fără raport parțial instant)."""
+    global _next_pnl_report_ts, _last_report_value, _session_start_value
 
     interval_h = settings.PNL_REPORT_INTERVAL_HOURS
     if interval_h <= 0 or not settings.DISCORD_WEBHOOK_URL:
         return
     now = time.time()
-    if now - _last_pnl_report_ts < interval_h * 3600:
+
+    # Prima rulare: ancorăm raportul la următoarea oră fixă și reținem valoarea de pornire
+    # ca bază pentru P/L-ul „de la pornirea sesiunii". NU trimitem nimic acum — dacă botul
+    # pornește la 14:45, primul raport iese la 15:00, nu un raport parțial instant.
+    if _next_pnl_report_ts is None:
+        _next_pnl_report_ts = _next_report_time(interval_h).timestamp()
+        if _session_start_value is None:
+            _session_start_value = compute_portfolio_summary(account_state)["total_value"]
+        logger.info(
+            "[P/L] Primul raport aliniat la ora fixă următoare (în ~%.1f min).",
+            max(0.0, (_next_pnl_report_ts - now) / 60),
+        )
+        return
+
+    if now < _next_pnl_report_ts:
         return
 
     summary = compute_portfolio_summary(account_state)
-    if _session_start_value is None:
+    if _session_start_value is None:  # plasă de siguranță
         _session_start_value = summary["total_value"]
 
     logger.info(
@@ -673,7 +710,10 @@ def _maybe_send_pnl_report(account_state: dict) -> None:
     notify_positions(summary.get("positions", []))
 
     _last_report_value = summary["total_value"]
-    _last_pnl_report_ts = now
+    # Reprogramează la următoarea graniță aliniată la ceas. Recalculat din `now`, deci
+    # dacă o iterație a întârziat și am sărit o graniță, programăm direct următoarea —
+    # fără rafală de rapoarte restante.
+    _next_pnl_report_ts = _next_report_time(interval_h).timestamp()
 
 
 def _prob_window() -> tuple[float, float]:

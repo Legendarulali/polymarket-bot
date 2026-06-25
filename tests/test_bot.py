@@ -6,6 +6,8 @@ All external dependencies (py_clob_client_v2, openai, web3, httpx, …) are
 mocked in conftest.py so no production environment is required.
 """
 import json
+import time
+from datetime import datetime
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -689,6 +691,84 @@ class TestBalanceRetry:
 
         # Toate încercările consumate → eroarea ajunge la main (care intră în standby).
         assert mock_client.get_balance_allowance.call_count == _BALANCE_RETRY_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# Tests: hourly P/L report clock alignment (oră fixă xx:00, nu relativ la pornire)
+# ---------------------------------------------------------------------------
+
+class TestReportClockAlignment:
+    """Raportul orar trebuie aliniat la ceasul pieței (xx:00), nu la intervalul scurs
+    de la pornirea containerului."""
+
+    def test_aligns_to_top_of_hour(self):
+        import main
+        now = datetime(2026, 6, 25, 14, 45, 30, 123456)
+        assert main._next_report_time(1.0, now=now) == datetime(2026, 6, 25, 15, 0, 0)
+
+    def test_strictly_after_now_when_on_boundary(self):
+        import main
+        # Fix pe graniță ⇒ următoarea oră (nu re-trimite instant aceeași oră).
+        now = datetime(2026, 6, 25, 14, 0, 0)
+        assert main._next_report_time(1.0, now=now) == datetime(2026, 6, 25, 15, 0, 0)
+
+    def test_rolls_over_to_next_day(self):
+        import main
+        now = datetime(2026, 6, 25, 23, 30, 0)
+        assert main._next_report_time(1.0, now=now) == datetime(2026, 6, 26, 0, 0, 0)
+
+    def test_half_hour_interval(self):
+        import main
+        now = datetime(2026, 6, 25, 14, 15, 0)
+        assert main._next_report_time(0.5, now=now) == datetime(2026, 6, 25, 14, 30, 0)
+
+    def test_two_hour_interval_anchors_to_even_hours(self):
+        import main
+        now = datetime(2026, 6, 25, 15, 10, 0)
+        assert main._next_report_time(2.0, now=now) == datetime(2026, 6, 25, 16, 0, 0)
+
+    def test_first_call_schedules_without_sending_instant_report(self, monkeypatch):
+        import main
+        monkeypatch.setattr(main, "_next_pnl_report_ts", None)
+        monkeypatch.setattr(main, "_session_start_value", None)
+        monkeypatch.setattr(main, "_last_report_value", None)
+        monkeypatch.setattr(main.settings, "PNL_REPORT_INTERVAL_HOURS", 1.0)
+        monkeypatch.setattr(main.settings, "DISCORD_WEBHOOK_URL", "https://example/webhook")
+        sent = []
+        monkeypatch.setattr(main, "notify_portfolio", lambda *a, **k: sent.append("portfolio"))
+        monkeypatch.setattr(main, "notify_positions", lambda *a, **k: sent.append("positions"))
+
+        main._maybe_send_pnl_report({"pusd_balance": 10.0, "active_positions": []})
+
+        assert sent == []                            # fără raport parțial instant la pornire
+        assert main._next_pnl_report_ts is not None  # graniță orară programată
+        assert main._session_start_value == pytest.approx(10.0)  # bază capturată la pornire
+
+    def test_fires_once_boundary_passed_then_reschedules(self, monkeypatch):
+        import main
+        monkeypatch.setattr(main, "_next_pnl_report_ts", datetime(2000, 1, 1).timestamp())
+        monkeypatch.setattr(main, "_session_start_value", 10.0)
+        monkeypatch.setattr(main, "_last_report_value", None)
+        monkeypatch.setattr(main.settings, "PNL_REPORT_INTERVAL_HOURS", 1.0)
+        monkeypatch.setattr(main.settings, "DISCORD_WEBHOOK_URL", "https://example/webhook")
+        sent = []
+        monkeypatch.setattr(main, "notify_portfolio", lambda *a, **k: sent.append("portfolio"))
+        monkeypatch.setattr(main, "notify_positions", lambda *a, **k: sent.append("positions"))
+
+        main._maybe_send_pnl_report({"pusd_balance": 10.0, "active_positions": []})
+
+        assert sent == ["portfolio", "positions"]      # ambele mesaje trimise
+        assert main._next_pnl_report_ts > time.time()  # reprogramat la viitoarea oră fixă
+
+    def test_disabled_when_interval_non_positive(self, monkeypatch):
+        import main
+        monkeypatch.setattr(main, "_next_pnl_report_ts", None)
+        monkeypatch.setattr(main.settings, "PNL_REPORT_INTERVAL_HOURS", 0.0)
+        monkeypatch.setattr(main.settings, "DISCORD_WEBHOOK_URL", "https://example/webhook")
+
+        main._maybe_send_pnl_report({"pusd_balance": 10.0, "active_positions": []})
+
+        assert main._next_pnl_report_ts is None  # raportul dezactivat → nimic programat
 
 
 # ---------------------------------------------------------------------------
