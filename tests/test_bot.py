@@ -2233,9 +2233,11 @@ class TestAnalyseBatch:
              patch("src.ai_analyser._call_groq", return_value=raw):
             return ai_analyser.analyse_batch(requests)
 
-    def test_model_is_70b(self):
+    def test_model_is_gpt_oss_20b(self):
+        # Migrat de pe llama-3.1-8b-instant (depreciat 16 aug 2026) la modelul de
+        # înlocuire recomandat de Groq, gpt-oss-20b.
         from src import ai_analyser
-        assert ai_analyser._MODEL == "llama-3.3-70b-versatile"
+        assert ai_analyser._MODEL == "gpt-oss-20b"
 
     def test_parses_array_keyed_by_market_id(self):
         raw = ('[{"market_id":"m1","trade":true,"outcome":"YES","confidence":0.8,"reason":"a"},'
@@ -2871,3 +2873,346 @@ class TestSerializeNewsToMarkdown:
 
     def test_truncates_overlong_title(self):
         assert "…" in self._s(["Z" * 300], "M")
+
+
+# ---------------------------------------------------------------------------
+# Tests: separare Cumpărare vs. Vânzare la cash insuficient (allow_new_trades)
+# ---------------------------------------------------------------------------
+
+class TestBuySellSeparation:
+    """Cash sub prag → `allow_new_trades=False`: BUY-urile sunt blocate STRICT în
+    `_execute_trade` (deci și prin `_apply_decision` / scanare / coadă), dar SELL-urile
+    (TP/SL/exit din position_manager, în afara acestui flux) rămân active chiar și cu
+    balanță ZERO — pentru a vinde avem nevoie doar de token-urile deja deținute, nu de
+    cash. Garantează că un agent fără fonduri își poate închide pozițiile."""
+
+    def _market(self):
+        return {"id": "m1", "orderPriceMinTickSize": "0.01"}
+
+    def _decision(self):
+        return {"trade": True, "outcome": "1", "confidence": 0.9, "reason": "t"}
+
+    def test_execute_trade_blocks_buy_when_new_trades_disabled(self):
+        # Balanță AMPLĂ ($20), dar allow_new_trades=False → niciun ordin BUY, indiferent
+        # de fonduri (modul de cumpărare e dezactivat), fără modificări de stare.
+        import main
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        with patch("main._live_best_ask", return_value=None), \
+             patch("main._enqueue_opportunity") as mock_enq, \
+             patch("main.place_limit_order") as mock_order:
+            main._execute_trade(
+                self._market(), state,
+                token_id="0xTOK", price=0.50, outcome_label="1 (Arsenal)",
+                decision=self._decision(), event_id="ev", title="Arsenal vs Chelsea",
+                allow_new_trades=False,
+            )
+        mock_order.assert_not_called()
+        mock_enq.assert_not_called()
+        assert state["pusd_balance"] == pytest.approx(20.0)   # balanța neatinsă
+        assert state["active_positions"] == []
+
+    def test_execute_trade_allows_buy_when_new_trades_enabled(self):
+        # Control: aceeași piață/balanță, allow_new_trades=True → ordin plasat normal.
+        import main
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        with patch("main._live_best_ask", return_value=None), \
+             patch("main._enqueue_opportunity"), \
+             patch("main.place_limit_order",
+                   return_value={"success": True, "order_id": "o"}) as mock_order:
+            main._execute_trade(
+                self._market(), state,
+                token_id="0xTOK", price=0.50, outcome_label="1 (Arsenal)",
+                decision=self._decision(), event_id="ev", title="Arsenal vs Chelsea",
+                allow_new_trades=True,
+            )
+        mock_order.assert_called_once()
+
+    def test_execute_trade_buy_enabled_is_the_default(self):
+        # Apelul implicit (fără argument) păstrează comportamentul vechi: BUY permis.
+        import main
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        with patch("main._live_best_ask", return_value=None), \
+             patch("main._enqueue_opportunity"), \
+             patch("main.place_limit_order",
+                   return_value={"success": True, "order_id": "o"}) as mock_order:
+            main._execute_trade(
+                self._market(), state,
+                token_id="0xTOK", price=0.50, outcome_label="1 (Arsenal)",
+                decision=self._decision(), event_id="ev", title="Arsenal vs Chelsea",
+            )
+        mock_order.assert_called_once()
+
+    def test_apply_decision_propagates_flag_and_blocks_buy(self):
+        # Flagul curge prin stratul de decizie: _apply_decision(allow_new_trades=False)
+        # nu trebuie să ajungă la un ordin BUY (gardul din _execute_trade, neptchuit aici).
+        import main
+        item = {
+            "kind": "binary",
+            "market": {
+                "id": "m1",
+                "clobTokenIds": json.dumps(["0xY", "0xN"]),
+                "outcomePrices": json.dumps(["0.60", "0.40"]),
+            },
+            "market_id": "m1", "title": "Some market", "event_id": "ev", "yes_price": 0.60,
+        }
+        decision = {"trade": True, "outcome": "YES", "confidence": 0.9, "reason": "r"}
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        with patch("main._live_best_ask", return_value=None), \
+             patch("main.place_limit_order") as mock_order:
+            main._apply_decision(item, decision, state, allow_new_trades=False)
+        mock_order.assert_not_called()
+
+    def test_scan_markets_blocks_buys_when_new_trades_disabled(self):
+        # Chiar dacă scanarea ajunge la _execute_trade cu o decizie de BUY, flagul dus
+        # prin _scan_markets → _flush_batch → _apply_decision blochează ordinul.
+        import main
+        market = {
+            "id": "m1", "question": "Arsenal vs Chelsea", "volume": "50000",
+            "outcomes": json.dumps(["Arsenal", "Draw", "Chelsea"]),
+            "outcomePrices": json.dumps(["0.55", "0.25", "0.20"]),
+            "clobTokenIds": json.dumps(["0xA", "0xX", "0xC"]),
+            "events": [{"slug": "ev-1"}],
+        }
+        decision = {"trade": True, "outcome": "1", "confidence": 0.9, "reason": "r"}
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        with patch.object(main, "_BATCH_SIZE", 5), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch("main.fetch_free_news", return_value=[]), \
+             patch("main._record_analyzed"), \
+             patch("main.analyse_batch", return_value={"m1": decision}), \
+             patch("main._live_best_ask", return_value=None), \
+             patch("main.place_limit_order") as mock_order:
+            main._scan_markets([market], state, allow_new_trades=False)
+        mock_order.assert_not_called()
+        assert state["pusd_balance"] == pytest.approx(20.0)   # nimic cumpărat
+
+    def test_sell_exit_works_with_zero_cash(self):
+        # Cerința centrală: un agent cu cash ZERO poate încă procesa o decizie de SELL.
+        # Stop-loss pe o poziție deschisă → check_exit_conditions plasează SELL, fără a
+        # depinde de balanță (vânzarea folosește token-urile deținute, nu cash).
+        from src import position_manager
+        from src.execution import Side
+        from config.settings import settings
+
+        position_manager._exit_attempts.clear()
+        state = {
+            "pusd_balance": 0.0,   # ZERO cash
+            "active_positions": [{
+                "asset_name": "Arsenal vs Chelsea",
+                "token_id": "0xPOS",
+                "side": "BUY",
+                "size": 10.0,
+                "avg_price": 0.50,
+            }],
+        }
+        # avg 0.50, bid 0.30 → -40% ≤ -30% SL → vinde.
+        with patch.object(settings, "TAKE_PROFIT_PCT", 0.0), \
+             patch.object(settings, "STOP_LOSS_PCT", 0.30), \
+             patch("src.position_manager._best_bid", return_value=0.30), \
+             patch("src.position_manager.place_limit_order",
+                   return_value={"success": True, "order_id": "exit-1"}) as mock_order:
+            position_manager.check_exit_conditions(state)
+        mock_order.assert_called_once()
+        kwargs = mock_order.call_args.kwargs
+        assert kwargs["side"] == Side.SELL
+        assert kwargs["token_id"] == "0xPOS"
+        assert kwargs["size"] == pytest.approx(10.0)
+        assert state["pusd_balance"] == pytest.approx(0.0)   # vânzarea nu cere cash
+
+
+# ---------------------------------------------------------------------------
+# Tests: Panic Sell — re-evaluarea pe știri a unei poziții DEȚINUTE (analyse_position_exit)
+# ---------------------------------------------------------------------------
+
+class TestAnalysePositionExit:
+    """`analyse_position_exit`: HOLD/PANIC_SELL pe baza știrilor. Conservator — orice
+    răspuns invalid / lipsă cheie API → HOLD (nu lichidăm pe zgomot). Patch _call_groq
+    cu raw JSON, exact ca TestAnalyseMatch."""
+
+    def _run(self, raw):
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "GROQ_API_KEY", "test-key"), \
+             patch("src.ai_analyser._call_groq", return_value=raw):
+            return ai_analyser.analyse_position_exit(
+                "Arsenal vs Chelsea", "1 (Arsenal)", 0.55, 0.30, ["bad news"]
+            )
+
+    def test_panic_sell_parsed(self):
+        d = self._run('{"action": "PANIC_SELL", "confidence": 0.92, "reason": "key injury"}')
+        assert d["action"] == "PANIC_SELL" and d["confidence"] == pytest.approx(0.92)
+
+    def test_hold_parsed(self):
+        d = self._run('{"action": "HOLD", "confidence": 0.8, "reason": "nothing major"}')
+        assert d["action"] == "HOLD"
+
+    def test_lowercase_action_normalized(self):
+        d = self._run('{"action": "panic_sell", "confidence": 0.9, "reason": "r"}')
+        assert d["action"] == "PANIC_SELL"
+
+    def test_invalid_action_defaults_to_hold(self):
+        # Acțiune necunoscută (inclusiv output manipulat prin prompt injection) → HOLD, conf 0.
+        d = self._run('{"action": "SELL_EVERYTHING", "confidence": 0.99, "reason": "x"}')
+        assert d["action"] == "HOLD" and d["confidence"] == pytest.approx(0.0)
+
+    def test_confidence_clamped(self):
+        d = self._run('{"action": "PANIC_SELL", "confidence": 5.0, "reason": "r"}')
+        assert d["confidence"] == pytest.approx(1.0)
+
+    def test_malformed_json_defaults_to_hold(self):
+        d = self._run("not json at all")
+        assert d["action"] == "HOLD" and d["confidence"] == pytest.approx(0.0)
+
+    def test_no_api_key_holds(self):
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "GROQ_API_KEY", ""):
+            d = ai_analyser.analyse_position_exit("M", "YES", 0.5, 0.5, [])
+        assert d["action"] == "HOLD"
+
+    def test_api_error_reraises(self):
+        # Rate-limit / eroare API se propagă (apelantul sare poziția, reîncearcă următorul ciclu).
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "GROQ_API_KEY", "test-key"), \
+             patch("src.ai_analyser._call_groq", side_effect=RuntimeError("Error 429 rate limit")):
+            with pytest.raises(RuntimeError):
+                ai_analyser.analyse_position_exit("M", "YES", 0.5, 0.5, [])
+
+
+# ---------------------------------------------------------------------------
+# Tests: Panic Sell loop routine (_reevaluate_active_positions)
+# ---------------------------------------------------------------------------
+
+class TestPanicSell:
+    """`_reevaluate_active_positions`: re-evaluează pozițiile deținute pe știri și lichidează
+    (SELL la best bid) cele invalidate de Groq, INDEPENDENT de cash și ocolind `_execute_trade`.
+    Opt-in (PANIC_SELL_ENABLED), cu throttle pe interval și cooldown partajat cu TP/SL."""
+
+    def _state(self, balance=5.0, token_id="0xPOS", size=10.0, avg=0.50):
+        return {
+            "pusd_balance": balance,
+            "active_positions": [{
+                "asset_name": "Arsenal vs Chelsea",
+                "token_id": token_id,
+                "outcome": "1 (Arsenal)",
+                "side": "BUY",
+                "size": size,
+                "avg_price": avg,
+            }],
+        }
+
+    def _panic(self, confidence=0.95):
+        return {"action": "PANIC_SELL", "confidence": confidence, "reason": "key player injured"}
+
+    def _hold(self):
+        return {"action": "HOLD", "confidence": 0.9, "reason": "nothing major"}
+
+    def _run(self, state, *, decision, bid=0.30, enabled=True, min_conf=0.70,
+             last_ts=0.0, interval=1800):
+        import main
+        from src import position_manager
+        position_manager._exit_attempts.clear()
+        with patch.object(main, "_PANIC_SELL_ENABLED", enabled), \
+             patch.object(main, "_PANIC_SELL_MIN_CONFIDENCE", min_conf), \
+             patch.object(main, "_POSITION_REEVAL_INTERVAL", interval), \
+             patch.object(main, "_last_position_reeval_ts", last_ts), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch("main.fetch_free_news", return_value=["bad news"]), \
+             patch("main._live_best_bid", return_value=bid), \
+             patch("main.analyse_position_exit", return_value=decision) as mock_ai, \
+             patch("main.place_limit_order",
+                   return_value={"success": True, "order_id": "sell-1"}) as mock_order, \
+             patch("main.notify_trade") as mock_notify:
+            main._reevaluate_active_positions(state)
+        return mock_ai, mock_order, mock_notify
+
+    def test_bad_news_triggers_panic_sell(self):
+        from src.execution import Side
+        state = self._state()
+        mock_ai, mock_order, mock_notify = self._run(state, decision=self._panic())
+        mock_ai.assert_called_once()
+        mock_order.assert_called_once()
+        kwargs = mock_order.call_args.kwargs
+        assert kwargs["side"] == Side.SELL
+        assert kwargs["token_id"] == "0xPOS"
+        assert kwargs["size"] == pytest.approx(10.0)
+        assert kwargs["price"] == pytest.approx(0.30)
+        # poziția scoasă din stare + balanță recreditată (≈ bid*size)
+        assert state["active_positions"] == []
+        assert state["pusd_balance"] == pytest.approx(5.0 + 0.30 * 10.0)
+        # notificare SELL cu eticheta PANIC SELL
+        assert mock_notify.call_args.args[0] == "SELL"
+        assert mock_notify.call_args.kwargs["action"] == "PANIC SELL"
+
+    def test_hold_keeps_position(self):
+        state = self._state()
+        _, mock_order, _ = self._run(state, decision=self._hold())
+        mock_order.assert_not_called()
+        assert len(state["active_positions"]) == 1
+
+    def test_low_confidence_panic_not_executed(self):
+        state = self._state()
+        _, mock_order, _ = self._run(state, decision=self._panic(confidence=0.50), min_conf=0.70)
+        mock_order.assert_not_called()
+        assert len(state["active_positions"]) == 1
+
+    def test_disabled_does_nothing(self):
+        state = self._state()
+        mock_ai, mock_order, _ = self._run(state, decision=self._panic(), enabled=False)
+        mock_ai.assert_not_called()
+        mock_order.assert_not_called()
+
+    def test_sell_works_with_zero_cash(self):
+        # Cerința 4: lichidarea de urgență NU depinde de cash (folosește token-urile deținute).
+        state = self._state(balance=0.0)
+        _, mock_order, _ = self._run(state, decision=self._panic())
+        mock_order.assert_called_once()
+        assert state["active_positions"] == []
+
+    def test_interval_throttle_skips_recent_run(self):
+        import time as _time
+        state = self._state()
+        # Ultima rulare = acum → în interval → nu re-evaluăm (niciun apel Groq).
+        mock_ai, mock_order, _ = self._run(
+            state, decision=self._panic(), last_ts=_time.time(), interval=1800,
+        )
+        mock_ai.assert_not_called()
+        mock_order.assert_not_called()
+
+    def test_no_positions_no_groq(self):
+        import main
+        state = {"pusd_balance": 5.0, "active_positions": []}
+        with patch.object(main, "_PANIC_SELL_ENABLED", True), \
+             patch.object(main, "_last_position_reeval_ts", 0.0), \
+             patch("main.analyse_position_exit") as mock_ai, \
+             patch("main.place_limit_order") as mock_order:
+            main._reevaluate_active_positions(state)
+        mock_ai.assert_not_called()
+        mock_order.assert_not_called()
+
+    def test_no_bid_skips_without_groq(self):
+        state = self._state()
+        mock_ai, mock_order, _ = self._run(state, decision=self._panic(), bid=None)
+        mock_ai.assert_not_called()    # fără best bid → nu cheltuim un apel Groq
+        mock_order.assert_not_called()
+
+    def test_exit_cooldown_shared_with_tpsl(self):
+        # Dacă TP/SL a marcat deja un exit pe token, panic-sell îl sare (cooldown partajat),
+        # ca aceeași poziție să nu fie vândută de două ori.
+        import main
+        from src import position_manager
+        state = self._state()
+        position_manager._exit_attempts.clear()
+        position_manager.record_exit_attempt("0xPOS")   # TP/SL „tocmai a încercat un exit"
+        with patch.object(main, "_PANIC_SELL_ENABLED", True), \
+             patch.object(main, "_last_position_reeval_ts", 0.0), \
+             patch.object(main, "_POSITION_REEVAL_INTERVAL", 1800), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch("main._live_best_bid", return_value=0.30), \
+             patch("main.fetch_free_news", return_value=[]), \
+             patch("main.analyse_position_exit", return_value=self._panic()) as mock_ai, \
+             patch("main.place_limit_order") as mock_order:
+            main._reevaluate_active_positions(state)
+        mock_ai.assert_not_called()    # token în cooldown → nici nu chemăm Groq
+        mock_order.assert_not_called()

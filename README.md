@@ -5,7 +5,7 @@ Bot autonom de trading pentru [Polymarket](https://polymarket.com) care:
 1. preia piețele active din Gamma API,
 2. le filtrează după volum, fereastră de probabilitate și clustering pe eveniment,
 3. culege știri recente (Google News RSS, opțional NewsAPI + X),
-4. cere o decizie de trading unui LLM (Groq / Llama 3.1),
+4. cere o decizie de trading unui LLM (Groq / gpt-oss-20b),
 5. plasează ordine limită BUY prin Polymarket CLOB, cu verificări de risc,
 6. opțional, închide pozițiile pe take-profit / stop-loss.
 

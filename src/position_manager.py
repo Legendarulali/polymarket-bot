@@ -33,6 +33,20 @@ def _best_bid(token_id: str) -> float | None:
         return None
 
 
+def should_attempt_exit(token_id: str) -> bool:
+    """True dacă pe acest token NU s-a încercat un exit în ultimele _EXIT_COOLDOWN_SECONDS.
+
+    Cooldown-ul (`_exit_attempts`) e PARTAJAT între TP/SL (`check_exit_conditions`) și
+    panic-sell (`main._reevaluate_active_positions`), ca aceeași poziție să nu fie vândută
+    de două ori în fereastra de cooldown (ex: stop-loss + știre proastă în aceeași rundă)."""
+    return time.time() - _exit_attempts.get(token_id, 0.0) >= _EXIT_COOLDOWN_SECONDS
+
+
+def record_exit_attempt(token_id: str) -> None:
+    """Marchează acum o încercare de exit pe `token_id` (anti-spam, partajat TP/SL + panic)."""
+    _exit_attempts[token_id] = time.time()
+
+
 def check_exit_conditions(account_state: dict) -> None:
     """
     Verifică take-profit / stop-loss pe toate pozițiile deschise și plasează
@@ -53,7 +67,7 @@ def check_exit_conditions(account_state: dict) -> None:
         if not token_id or avg_price <= 0 or size <= 0:
             continue
 
-        if time.time() - _exit_attempts.get(token_id, 0.0) < _EXIT_COOLDOWN_SECONDS:
+        if not should_attempt_exit(token_id):
             continue
 
         bid = _best_bid(token_id)
@@ -74,7 +88,7 @@ def check_exit_conditions(account_state: dict) -> None:
                 "nu poate fi închisă prin ordin; va rămâne până la rezoluție.",
                 _MIN_EXIT_VALUE_USD, token_id, bid * size,
             )
-            _exit_attempts[token_id] = time.time()
+            record_exit_attempt(token_id)
             continue
 
         logger.warning(
@@ -82,7 +96,7 @@ def check_exit_conditions(account_state: dict) -> None:
             reason, str(pos.get("asset_name", ""))[:60], token_id, avg_price, bid, size,
         )
 
-        _exit_attempts[token_id] = time.time()
+        record_exit_attempt(token_id)
         result = place_limit_order(
             token_id=token_id,
             price=bid,

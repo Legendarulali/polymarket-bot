@@ -28,17 +28,17 @@ from src.execution import (
 )
 from src.clob_client import get_clob_client
 from src.news_monitor import fetch_free_news
-from src.ai_analyser import analyse_market, analyse_match, analyse_batch
+from src.ai_analyser import analyse_market, analyse_match, analyse_batch, analyse_position_exit
 from src.football import parse_match_market, format_legs, extract_teams
 from src.allowance import ensure_collateral_approved
-from src.position_manager import check_exit_conditions
+from src.position_manager import check_exit_conditions, should_attempt_exit, record_exit_attempt
 from src.notifications import notify_trade, notify_portfolio, notify_positions, notify_startup
 
 logger = logging.getLogger(__name__)
 
 RUNNING = True
 _LOOP_INTERVAL = 60          # secunde între iterații normale
-_LOW_BALANCE_SLEEP = 15 * 60  # 15 minute sleep când balanța e insuficientă
+_LOW_BALANCE_SLEEP = 15 * 60  # standby 15 min la eșec de reconciliere (401/glitch API, fără stare de cont). NU se mai folosește la cash insuficient — acolo doar dezactivăm cumpărarea (allow_new_trades) și rămânem la 60s.
 _CACHE_TTL_SECONDS = 4 * 3600 # cooldown: re-analizează o piață cel mult o dată la 4h (persistat în history.json)
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 _GAMMA_PAGE_SIZE = 100                                           # piețe per pagină la paginare Gamma
@@ -63,7 +63,7 @@ _GAMMA_ASCENDING = os.getenv("GAMMA_ASCENDING", "false").strip()
 _GAMMA_TAG_IDS = [t.strip() for t in os.getenv("GAMMA_TAG_IDS", "").split(",") if t.strip()]
 _INTER_ANALYSIS_DELAY = 3                                        # secunde throttle între apeluri LLM (per lot)
 # Analiză în LOTURI (batching): câte piețe pregătite trimitem la Groq într-UN singur
-# apel. Reduce drastic numărul de cereri → permite modelul mare llama-3.3-70b-versatile
+# apel. Reduce drastic numărul de cereri → permite modelul gpt-oss-20b
 # fără a lovi rate-limit-urile (429). Implicit 12 (recomandat 10-15). BATCH_SIZE<=1
 # revine la analiza individuală (o cerere per piață, prin process_market).
 _BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "12")))
@@ -71,7 +71,7 @@ _BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "12")))
 # înainte de a reîncerca la scanarea următoare, ca să nu ardem bugetul zilnic de tokeni.
 _RATE_LIMIT_BACKOFF = int(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "60"))
 # --- Filtru STRICT anti-429 (STEP 2) ---
-# llama-3.3-70b pe ~100k tokeni/zi NU poate înghiți ~2100 piețe/scanare. Înainte de
+# gpt-oss-20b pe ~100k tokeni/zi NU poate înghiți ~2100 piețe/scanare. Înainte de
 # orice apel Groq reducem DRASTIC setul: păstrăm piețele cu poziție deschisă, cele cu
 # volum ≥ _STRICT_MIN_VOLUME_USD și (dacă _STRICT_KEYWORDS e setat) cele al căror titlu/
 # slug conține un keyword de interes; apoi sortăm după volum desc și tăiem la
@@ -154,6 +154,22 @@ _QUEUE_MAX_SIZE = 10    # plafon coadă: păstrăm intrările cu cel mai mare co
 # că s-a atins MAX_ACTIVE_POSITIONS (deși balanța e suficientă, ≥ _MIN_BALANCE_PUSD), și
 # le re-evaluează prioritar când se eliberează un slot. NU atinge regula de balanță 1.05.
 _ACTIVATE_QUEUE = os.getenv("ACTIVATE_QUEUE", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# --- Panic Sell (STEP 4): re-evaluare pe ȘTIRI a pozițiilor DEȚINUTE ---
+# IMPLICIT dezactivat (False): e o lichidare REALĂ declanșată de judecata unui LLM, deci
+# opt-in explicit (ca DRY_RUN / ACTIVATE_QUEUE). Când e ON, `_reevaluate_active_positions`
+# rulează periodic (independent de cash — vânzarea folosește token-urile deținute) și, dacă
+# Groq vede o știre care invalidează catastrofal teza de BUY, lichidează poziția la best bid
+# (SELL), ocolind `_execute_trade` (care e doar pentru BUY) și gate-ul de balanță.
+_PANIC_SELL_ENABLED = os.getenv("PANIC_SELL_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+# Cât de des re-evaluăm pozițiile (minute). Doar ≤ MAX_ACTIVE_POSITIONS poziții × 1 apel
+# Groq fiecare, o dată la acest interval → buget de tokeni minim (≠ scanarea masivă).
+_POSITION_REEVAL_INTERVAL = max(60, int(os.getenv("POSITION_REEVAL_INTERVAL_MINUTES", "30")) * 60)
+# Pragul de confidence peste care acționăm un PANIC_SELL (conservator — nu lichidăm pe semnale slabe).
+_PANIC_SELL_MIN_CONFIDENCE = float(os.getenv("PANIC_SELL_MIN_CONFIDENCE", "0.70"))
+# Momentul ultimei rulări a re-evaluării pozițiilor (throttle pe _POSITION_REEVAL_INTERVAL).
+# 0.0 = încă nerulat → prima iterație cu poziții deschise re-evaluează imediat (protecție la pornire).
+_last_position_reeval_ts: float = 0.0
 
 # Stare raport orar P/L pe Discord. `_next_pnl_report_ts` = momentul (epoch) al
 # următorului raport, ALINIAT la ceas (oră fixă xx:00, ca resetul de metrici Polymarket),
@@ -914,11 +930,17 @@ def _analyse_single(item: dict) -> dict:
     return analyse_market(item["title"], item["yes_price"], item["news"])
 
 
-def _apply_decision(item: dict, decision: dict, account_state: dict) -> None:
+def _apply_decision(
+    item: dict, decision: dict, account_state: dict, allow_new_trades: bool = True
+) -> None:
     """Aplică o decizie LLM peste un item pregătit: log + poarta de confidence +
     maparea outcome → token/preț → `_execute_trade` (care conține TOATE barierele de
     risc: gate 1.05 pUSD, dedup, slippage, dimensionare). Comun fluxului individual
-    (process_market) și celui în batch (_flush_batch)."""
+    (process_market) și celui în batch (_flush_batch).
+
+    `allow_new_trades` se propagă neschimbat în `_execute_trade`: când e False (cash
+    insuficient pentru achiziții noi), orice BUY e blocat strict acolo, fără a atinge
+    SELL-urile (TP/SL/exit rulează în afara acestui flux)."""
     market = item["market"]
     title = item["title"]
     event_id = item["event_id"]
@@ -957,6 +979,7 @@ def _apply_decision(item: dict, decision: dict, account_state: dict) -> None:
             decision=decision,
             event_id=event_id,
             title=title,
+            allow_new_trades=allow_new_trades,
         )
     else:
         outcome = decision["outcome"]
@@ -968,10 +991,11 @@ def _apply_decision(item: dict, decision: dict, account_state: dict) -> None:
             decision=decision,
             event_id=event_id,
             title=title,
+            allow_new_trades=allow_new_trades,
         )
 
 
-def process_market(market: dict, account_state: dict) -> None:
+def process_market(market: dict, account_state: dict, allow_new_trades: bool = True) -> None:
     """Procesează O singură piață end-to-end: filtre ieftine → știri → analiză LLM
     INDIVIDUALĂ → execuție.
 
@@ -989,7 +1013,7 @@ def process_market(market: dict, account_state: dict) -> None:
         "[Agent] Piață id=%s marcată ca analizată în history.json (cooldown=%dh).",
         item["market_id"], _CACHE_TTL_SECONDS // 3600,
     )
-    _apply_decision(item, decision, account_state)
+    _apply_decision(item, decision, account_state, allow_new_trades)
 
 
 def _execute_trade(
@@ -1003,12 +1027,17 @@ def _execute_trade(
     event_id: str,
     title: str,
     from_queue: bool = False,
+    allow_new_trades: bool = True,
 ) -> None:
     """Verificări de risc finale + plasare ordin BUY + actualizare stare locală.
 
     Comun fluxului 1X2 și celui binar: balanță minimă, token valid, dedup pe
     token, preț valid, protecție anti-slippage față de best ask live și
     dimensionare ordin în limita balanței.
+
+    `allow_new_trades=False` (cash insuficient pentru achiziții noi) blochează STRICT
+    orice BUY chiar la intrare, înaintea oricărei alte verificări — vezi „master-switch
+    BUY" mai jos. E independent de gate-ul de balanță și nu afectează SELL-urile.
 
     Wishlist (doar cu ACTIVATE_QUEUE): dacă balanța e suficientă (≥ _MIN_BALANCE_PUSD)
     dar s-a atins MAX_ACTIVE_POSITIONS, piața aprobată de AI nu se tranzacționează, ci
@@ -1034,6 +1063,19 @@ def _execute_trade(
             "[DRY_RUN] Simulare: Piața '%s' a fost aprobată de AI (outcome=%s, confidence=%.2f), "
             "dar nu plasăm ordin real.",
             title[:80], outcome_label, decision.get("confidence", 0.0),
+        )
+        return
+
+    # Master-switch BUY: când modul de cumpărare e dezactivat (cash insuficient pentru
+    # achiziții noi — vezi `allow_new_trades` în bucla principală), niciun ordin NOU nu
+    # pleacă, indiferent de restul verificărilor de mai jos. E gardul explicit, numit, pe
+    # chokepoint-ul prin care trec TOATE cumpărările (scanare + coadă). SELL-urile (TP/SL/
+    # exit din position_manager) NU trec pe aici, deci rămân active chiar și cu cash zero.
+    if not allow_new_trades:
+        logger.info(
+            "[Agent] BUY blocat pentru '%s' (%s): modul de cumpărare e dezactivat "
+            "(cash insuficient pentru achiziții noi).",
+            title[:60], outcome_label,
         )
         return
 
@@ -1275,7 +1317,126 @@ def _simulate_notif_cycle(price: float, title: str, outcome_label: str, decision
     )
 
 
-def _reevaluate_queued(item: dict, account_state: dict) -> None:
+# ---------------------------------------------------------------------------
+# Panic Sell (STEP 4): re-evaluare pe ȘTIRI a pozițiilor DEȚINUTE
+# ---------------------------------------------------------------------------
+def _reevaluate_active_positions(account_state: dict) -> None:
+    """STEP 4 — Panic Sell: re-evaluează PERIODIC pozițiile deținute pe baza știrilor recente
+    și lichidează (SELL la best bid) cele a căror teză de BUY a fost invalidată catastrofal de
+    Groq. Opt-in via `PANIC_SELL_ENABLED`.
+
+    Rulează INDEPENDENT de cash (vânzarea folosește token-urile deja deținute, nu fonduri) și
+    OCOLEȘTE `_execute_trade` (care e doar pentru BUY) — deci protejează portofoliul chiar și
+    cu balanță zero. Throttle pe `_POSITION_REEVAL_INTERVAL` (≤ MAX_ACTIVE_POSITIONS apeluri
+    Groq la fiecare interval → buget de tokeni minim, spre deosebire de scanarea masivă)."""
+    global _last_position_reeval_ts
+    if not _PANIC_SELL_ENABLED:
+        return
+    positions = account_state.get("active_positions", [])
+    if not positions:
+        return  # nimic de re-evaluat → nu pornim ceasul, nu cheltuim tokeni
+    now = time.time()
+    if now - _last_position_reeval_ts < _POSITION_REEVAL_INTERVAL:
+        return
+    _last_position_reeval_ts = now
+
+    logger.info(
+        "[PanicSell] Re-evaluez %d poziții deținute pe baza știrilor recente "
+        "(interval %d min).", len(positions), _POSITION_REEVAL_INTERVAL // 60,
+    )
+    # Iterăm pe un snapshot: _panic_sell_position rescrie lista de poziții la o lichidare reușită.
+    for pos in list(positions):
+        if not RUNNING:
+            break
+        try:
+            _reevaluate_one_position(pos, account_state)
+        except Exception as exc:
+            logger.error(
+                "[PanicSell] Eroare la re-evaluarea poziției token=%s: %s",
+                pos.get("token_id"), exc, exc_info=True,
+            )
+        _interruptible_sleep(_INTER_ANALYSIS_DELAY)  # throttle după apelul Groq
+
+
+def _reevaluate_one_position(pos: dict, account_state: dict) -> None:
+    """Re-evaluează O poziție: best bid live → știri → Groq (`analyse_position_exit`). Dacă
+    verdictul e PANIC_SELL cu confidence ≥ prag, lichidează poziția. Cooldown-ul de exit e
+    partajat cu TP/SL (`should_attempt_exit`) ca să nu vindem același token de două ori."""
+    token_id = str(pos.get("token_id") or "")
+    size = float(pos.get("size") or 0)
+    avg_price = float(pos.get("avg_price") or 0)
+    title = str(pos.get("asset_name") or "")
+    outcome_label = str(pos.get("outcome") or "")
+    if not token_id or size <= 0:
+        return
+
+    # Anti-dublă-vânzare: dacă TP/SL (sau o rundă anterioară de panic) a încercat deja un
+    # exit pe acest token recent, sărim — cooldown comun în position_manager.
+    if not should_attempt_exit(token_id):
+        logger.debug("[PanicSell] Token %s în cooldown de exit — skip.", token_id)
+        return
+
+    bid = _live_best_bid(token_id)
+    if bid is None or bid <= 0:
+        logger.info("[PanicSell] Best bid indisponibil pentru '%s' — skip.", title[:50])
+        return
+
+    news = fetch_free_news(query=title[:100])
+    decision = analyse_position_exit(title, outcome_label, avg_price, bid, news)
+    logger.info(
+        "[PanicSell] '%s' (%s) | entry=$%.4f bid=$%.4f → action=%s | confidence=%.2f | reason=%s",
+        title[:50], outcome_label, avg_price, bid,
+        decision["action"], decision["confidence"], decision["reason"],
+    )
+
+    if decision["action"] != "PANIC_SELL":
+        return
+    if decision["confidence"] < _PANIC_SELL_MIN_CONFIDENCE:
+        logger.info(
+            "[PanicSell] PANIC_SELL pentru '%s' sub pragul de confidence %.2f (%.2f) — păstrez poziția.",
+            title[:50], _PANIC_SELL_MIN_CONFIDENCE, decision["confidence"],
+        )
+        return
+
+    _panic_sell_position(pos, bid, decision, account_state)
+
+
+def _panic_sell_position(pos: dict, bid: float, decision: dict, account_state: dict) -> None:
+    """Lichidează o poziție DEȚINUTĂ: SELL la best bid (ocolește `_execute_trade` / cash gate),
+    apoi actualizează starea locală și notifică pe Discord cu eticheta „PANIC SELL"."""
+    token_id = str(pos.get("token_id") or "")
+    size = float(pos.get("size") or 0)
+    title = str(pos.get("asset_name") or "")
+    outcome_label = str(pos.get("outcome") or "")
+    reason = f"PANIC SELL (AI): {decision.get('reason', '')}"[:200]
+
+    logger.warning(
+        "[PanicSell] LICHIDEZ '%s' (%s) | token=%s | bid=$%.4f | size=%.2f | confidence=%.2f | %s",
+        title[:60], outcome_label, token_id, bid, size,
+        decision.get("confidence", 0.0), decision.get("reason", ""),
+    )
+    # Marchează încercarea de exit ÎNAINTE de plasare (cooldown partajat cu TP/SL → fără dublă vânzare).
+    record_exit_attempt(token_id)
+    result = place_limit_order(token_id=token_id, price=bid, side=Side.SELL, size=size)
+
+    if result.get("success"):
+        logger.info("[PanicSell] Ordin SELL plasat | order_id=%s", result.get("order_id"))
+        # Reflectă închiderea în starea locală: scoate poziția și recreditează (aprox) balanța,
+        # ca restul iterației (dedup, raport) să vadă portofoliul actualizat.
+        account_state["active_positions"] = [
+            p for p in account_state.get("active_positions", []) if p.get("token_id") != token_id
+        ]
+        account_state["pusd_balance"] = round(account_state.get("pusd_balance", 0.0) + bid * size, 6)
+        notify_trade(
+            "SELL", title or token_id, price=bid, size=size, total=bid * size,
+            outcome=outcome_label, reason=reason,
+            order_id=result.get("order_id"), action="PANIC SELL",
+        )
+    else:
+        logger.error("[PanicSell] Ordin SELL respins de CLOB: %s", result.get("error"))
+
+
+def _reevaluate_queued(item: dict, account_state: dict, allow_new_trades: bool = True) -> None:
     """Re-evaluează o oportunitate din coadă cu preț proaspăt + re-apel Groq.
 
     (a) ia best-ask-ul live din orderbook (fallback la prețul salvat); (b) re-cheamă
@@ -1330,10 +1491,11 @@ def _reevaluate_queued(item: dict, account_state: dict) -> None:
         event_id=event_id,
         title=title,
         from_queue=True,
+        allow_new_trades=allow_new_trades,
     )
 
 
-def _process_queue(account_state: dict) -> None:
+def _process_queue(account_state: dict, allow_new_trades: bool = True) -> None:
     """Procesează PRIORITAR coada next_in_line.json înainte de scanarea masivă.
 
     Oportunitățile cu confidence mai mare se evaluează întâi. Fiecare e scoasă din
@@ -1368,7 +1530,7 @@ def _process_queue(account_state: dict) -> None:
         item = queue.pop(0)
         _save_queue(queue)  # eliminare imediată: coada avansează chiar dacă re-evaluarea eșuează
         try:
-            _reevaluate_queued(item, account_state)
+            _reevaluate_queued(item, account_state, allow_new_trades)
         except Exception as exc:
             logger.error(
                 "[Queue] Eroare la reevaluarea '%s': %s",
@@ -1411,7 +1573,7 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return any(s in blob for s in ("429", "rate limit", "rate_limit", "too many requests"))
 
 
-def _flush_batch(batch: list[dict], account_state: dict) -> None:
+def _flush_batch(batch: list[dict], account_state: dict, allow_new_trades: bool = True) -> None:
     """Trimite un lot de piețe pregătite la Groq într-UN singur apel (analyse_batch),
     apoi aplică deciziile. Toate piețele din lot sunt marcate ca analizate (apelul LLM
     le-a acoperit pe toate). Un eșec total al apelului (rate-limit/API) NU marchează
@@ -1451,7 +1613,7 @@ def _flush_batch(batch: list[dict], account_state: dict) -> None:
             "trade": False, "outcome": "NONE", "confidence": 0.0, "reason": "lipsă din răspunsul batch",
         }
         try:
-            _apply_decision(it, decision, account_state)
+            _apply_decision(it, decision, account_state, allow_new_trades)
         except Exception as exc:
             logger.error("[Batch] Eroare la aplicarea deciziei pentru id=%s: %s", mid, exc, exc_info=True)
         if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
@@ -1484,7 +1646,7 @@ def _market_token_ids(market: dict) -> list[str]:
 
 def _strict_prefilter(markets: list[dict], account_state: dict) -> list[dict]:
     """STEP 2 (anti-429): reduce DRASTIC câte piețe ajung la Groq, ca modelul mare
-    (llama-3.3-70b) să nu depășească bugetul zilnic de tokeni.
+    (gpt-oss-20b) să nu depășească bugetul zilnic de tokeni.
 
     Păstrează o piață dacă: avem deja o poziție deschisă pe ea, SAU volumul ≥
     _STRICT_MIN_VOLUME_USD, SAU (când _STRICT_KEYWORDS e setat) titlul/slug-ul conține un
@@ -1520,10 +1682,10 @@ def _strict_prefilter(markets: list[dict], account_state: dict) -> list[dict]:
     return capped
 
 
-def _scan_markets(markets: list[dict], account_state: dict) -> None:
+def _scan_markets(markets: list[dict], account_state: dict, allow_new_trades: bool = True) -> None:
     """Scanează piețele deja filtrate pe istoric. IMPLICIT acumulează piețele în loturi
     de _BATCH_SIZE și le trimite la Groq într-un SINGUR apel (economisind cereri →
-    modelul mare 70b fără rate-limit). BATCH_SIZE<=1 revine la analiza individuală
+    modelul gpt-oss-20b fără rate-limit). BATCH_SIZE<=1 revine la analiza individuală
     (process_market, o cerere per piață).
 
     Gate de balanță intra-scanare: dacă un ordin epuizează balanța, abandonăm restul
@@ -1543,7 +1705,7 @@ def _scan_markets(markets: list[dict], account_state: dict) -> None:
                 break
             hist_before = len(_analyzed_history)
             try:
-                process_market(market, account_state)
+                process_market(market, account_state, allow_new_trades)
             except Exception as exc:
                 logger.error(
                     "[Agent] Eroare la procesarea pieței id=%s: %s",
@@ -1578,7 +1740,7 @@ def _scan_markets(markets: list[dict], account_state: dict) -> None:
 
         batch.append(item)
         if len(batch) >= _BATCH_SIZE:
-            _flush_batch(batch, account_state)
+            _flush_batch(batch, account_state, allow_new_trades)
             batch = []
             if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
                 logger.info("[Agent] Balanța a fost epuizată după un lot. Abandonez restul rundei.")
@@ -1586,7 +1748,7 @@ def _scan_markets(markets: list[dict], account_state: dict) -> None:
 
     # Lotul parțial rămas la finalul scanării.
     if batch and RUNNING:
-        _flush_batch(batch, account_state)
+        _flush_batch(batch, account_state, allow_new_trades)
 
 
 def main() -> None:
@@ -1617,6 +1779,14 @@ def main() -> None:
             "imediat (după 1s) exact câte share-uri a cumpărat — ordine REALE pe ambele direcții, "
             "ca să verifice webhook-urile BUY+SELL. Suprascrie holding-ul/TP/SL. Dezactivează "
             "NOTIFICATION_TEST_MODE pentru operare normală."
+        )
+
+    if _PANIC_SELL_ENABLED:
+        logger.warning(
+            "[PanicSell] PANIC SELL ACTIV: re-evaluez pozițiile deținute pe baza știrilor o dată "
+            "la %d min și LICHIDEZ (SELL real la best bid) cele invalidate catastrofal de Groq "
+            "(confidence ≥ %.2f), independent de cash. Dezactivează PANIC_SELL_ENABLED pentru a opri.",
+            _POSITION_REEVAL_INTERVAL // 60, _PANIC_SELL_MIN_CONFIDENCE,
         )
 
     if settings.OVERRIDE_BALANCE > 0:
@@ -1710,39 +1880,67 @@ def main() -> None:
                     logger.error("[Queue] Curățarea cozii a eșuat: %s", exc, exc_info=True)
 
             # Raport orar P/L pe Discord. Rulează înaintea verificării de balanță
-            # ca să continue și când fondurile sunt insuficiente (bucla doarme
-            # 15 min în acel caz, dar raportul tot iese la timp).
+            # ca să continue și când fondurile sunt insuficiente (cu cash insuficient
+            # se dezactivează doar cumpărarea, dar bucla rulează în continuare la 60s,
+            # deci raportul tot iese la timp).
             try:
                 _maybe_send_pnl_report(account_state)
             except Exception as exc:
                 logger.error("[Agent] Raport P/L eșuat: %s", exc, exc_info=True)
 
             # Verifică TP/SL pe pozițiile deschise (opt-in via TAKE_PROFIT_PCT /
-            # STOP_LOSS_PCT). Rulează înainte de verificarea de balanță: vânzarea
-            # trebuie să funcționeze și când nu mai sunt fonduri de cumpărare.
-            # În DRY_RUN sărim complet: TP/SL plasează ordine SELL REALE (prin
-            # position_manager, nu prin _execute_trade) → nimic nu trebuie să ajungă pe lanț.
+            # STOP_LOSS_PCT). Rulează înainte de verificarea de balanță: vânzarea (SELL)
+            # trebuie să funcționeze și când nu mai sunt fonduri de cumpărare — pentru a
+            # vinde avem nevoie doar de token-urile deja deținute. Cu cash insuficient
+            # bucla NU mai doarme 15 min, deci acest check (protecția pozițiilor) se reia
+            # la fiecare 60s, nu o dată pe sfert de oră. În DRY_RUN sărim complet: TP/SL
+            # plasează ordine SELL REALE (prin position_manager, nu prin _execute_trade)
+            # → nimic nu trebuie să ajungă pe lanț.
             if not _DRY_RUN:
                 try:
                     check_exit_conditions(account_state)
                 except Exception as exc:
                     logger.error("[Agent] Exit check eșuat: %s", exc, exc_info=True)
 
-            # Verificare balanță înainte de orice apel LLM (Groq) sau scanare de
-            # piețe: cu balanța epuizată orice analiză ar irosi API calls degeaba.
-            # P/L report + exit checks (TP/SL) au rulat deja mai sus — niciunul nu
-            # apelează Groq — ca raportul să iasă la timp și pozițiile să poată fi
-            # închise chiar și fără fonduri de cumpărare.
-            if pusd_balance < _MIN_BALANCE_PUSD:
-                if not _DRY_RUN:
-                    logger.warning(
-                        "[Agent] Balanță insuficientă (%.4f pUSD). Intru în standby timp "
-                        "de %d minute pentru a economisi API calls.",
-                        pusd_balance,
-                        _LOW_BALANCE_SLEEP // 60,
-                    )
-                    _interruptible_sleep(_LOW_BALANCE_SLEEP)
-                    continue
+            # STEP 4 — Panic Sell: re-evaluare pe ȘTIRI a pozițiilor deținute (opt-in via
+            # PANIC_SELL_ENABLED, throttle intern pe interval). La fel ca TP/SL: rulează ÎNAINTE
+            # de gate-ul de balanță (SELL nu cere cash) și e sărit în DRY_RUN (plasează SELL-uri
+            # REALE prin place_limit_order, nu prin _execute_trade interceptat).
+            if not _DRY_RUN:
+                try:
+                    _reevaluate_active_positions(account_state)
+                except Exception as exc:
+                    logger.error("[PanicSell] Re-evaluarea pozițiilor a eșuat: %s", exc, exc_info=True)
+
+            # --- Separare Cumpărare vs. Vânzare la cash insuficient ---
+            # Sub pragul minim de cash NU mai putem deschide poziții NOI (BUY) — un ordin
+            # ar fi oricum blocat în `_execute_trade`. DAR pozițiile deschise rămân expuse:
+            # pentru a le ÎNCHIDE (SELL / TP / SL) avem nevoie doar de token-urile deja
+            # deținute, nu de cash. De aceea NU mai intrăm în standby 15 min cu `continue`
+            # (ne-ar lăsa pozițiile nemonitorizate un sfert de oră); doar DEZACTIVĂM modul
+            # de cumpărare (`allow_new_trades=False`) și păstrăm bucla la cadența normală
+            # de 60s, ca reconcilierea + check_exit_conditions (deja rulate mai sus, fără
+            # cash) să se reia la fiecare minut.
+            #
+            # `allow_new_trades` e firul roșu care, dus în _process_queue / _scan_markets /
+            # _apply_decision → _execute_trade, blochează STRICT orice BUY, lăsând SELL-urile
+            # (check_exit_conditions, în afara acestui flux) neatinse. În DRY_RUN rămâne True
+            # (oricum nu pleacă niciun ordin real — _execute_trade e interceptat la intrare).
+            allow_new_trades = _DRY_RUN or pusd_balance >= _MIN_BALANCE_PUSD
+            if not allow_new_trades:
+                logger.warning(
+                    "[Agent] Cash insuficient pentru achiziții noi (%.4f pUSD < $%.2f). "
+                    "Modul de cumpărare este dezactivat — continui să monitorizez și pot "
+                    "vinde pozițiile existente (TP/SL/exit rămân active).",
+                    pusd_balance, _MIN_BALANCE_PUSD,
+                )
+                # Scanarea masivă produce DOAR decizii de cumpărare (BUY) pe piețe noi —
+                # toate ar fi blocate acum → ar irosi degeaba bugetul de tokeni Groq (vezi
+                # filtrul STRICT/batching). O sărim; protecția pozițiilor vine din exit
+                # checks (SELL), rulate deja mai sus și reluate la următoarea iterație (60s).
+                _interruptible_sleep(_LOOP_INTERVAL)
+                continue
+            if _DRY_RUN and pusd_balance < _MIN_BALANCE_PUSD:
                 logger.info(
                     "[DRY_RUN] Balanță %.4f sub $%.2f — ignor gate-ul de balanță și "
                     "continui scanarea (simulare).", pusd_balance, _MIN_BALANCE_PUSD,
@@ -1776,18 +1974,21 @@ def main() -> None:
             # sărim execuția și mergem direct la scanare (care doar va alimenta wishlist-ul).
             if _ACTIVATE_QUEUE and not maxed:
                 try:
-                    _process_queue(account_state)
+                    _process_queue(account_state, allow_new_trades=allow_new_trades)
                 except Exception as exc:
                     logger.error("[Queue] Procesarea cozii a eșuat: %s", exc, exc_info=True)
 
-                # Coada poate epuiza fondurile: dacă balanța a scăzut sub minim, sărim
-                # scanarea masivă (economisim fetch-ul costisitor) și intrăm în standby.
+                # Coada poate epuiza fondurile: dacă balanța a scăzut sub minim, dezactivăm
+                # cumpărarea și sărim scanarea masivă (ar produce doar BUY-uri blocate). NU
+                # dormim 15 min — păstrăm cadența de 60s ca pozițiile să rămână monitorizate
+                # (exit/SELL se reia la următoarea iterație).
                 if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
-                    logger.info(
-                        "[Agent] Fonduri epuizate la procesarea cozii — sar scanarea, standby %d min.",
-                        _LOW_BALANCE_SLEEP // 60,
+                    allow_new_trades = False
+                    logger.warning(
+                        "[Agent] Fonduri epuizate la procesarea cozii — modul de cumpărare "
+                        "dezactivat; sar scanarea, dar continui monitorizarea pozițiilor.",
                     )
-                    _interruptible_sleep(_LOW_BALANCE_SLEEP)
+                    _interruptible_sleep(_LOOP_INTERVAL)
                     continue
 
             if maxed:  # _ACTIVATE_QUEUE sau _DRY_RUN (altfel am fi făcut deja continue)
@@ -1848,7 +2049,9 @@ def main() -> None:
             # Scanare cu analiză în LOTURI (sau individual dacă BATCH_SIZE<=1). Gate-ul
             # de balanță intra-scanare și throttle-ul (un singur sleep per lot/analiză)
             # sunt încapsulate în `_scan_markets`, care resetează și `_scan_stats`.
-            _scan_markets(markets, account_state)
+            # `allow_new_trades` (True aici — altfel am fi făcut deja continue, exceptând
+            # DRY_RUN) e dus până la `_execute_trade`, gardul comun de blocare a BUY-urilor.
+            _scan_markets(markets, account_state, allow_new_trades=allow_new_trades)
 
             # Sumar de filtrare: ce a oprit piețele. Cheia pentru a vedea DE CE
             # „ignoră" botul tot — ex: {'volum mic': 195, 'analizate (LLM)': 3}.
