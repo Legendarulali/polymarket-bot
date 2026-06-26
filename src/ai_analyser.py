@@ -16,7 +16,7 @@ _MAX_TITLE_LEN = 150
 # închis pe 16 august 2026). Batching-ul (vezi analyse_batch) reduce numărul de cereri ca
 # să nu lovim rate-limit-urile (429). Modelul întoarce tot JSON strict, deci parsarea de mai
 # jos (extragerea substring-ului {…} / […]) rămâne neschimbată.
-_MODEL = "gpt-oss-20b"
+_MODEL = "openai/gpt-oss-20b"
 # Câte articole de știri includem PER piață în promptul de BATCH (după serializarea
 # Markdown). Mai puține decât în analiza individuală ca promptul agregat (10-15 piețe)
 # să rămână mic ca tokeni — important pentru limita TPD (tokens-per-day) a modelului.
