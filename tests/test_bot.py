@@ -3180,6 +3180,17 @@ class TestPanicSell:
         mock_ai.assert_not_called()
         mock_order.assert_not_called()
 
+    def test_boot_runs_immediately_without_waiting_interval(self):
+        # Cerința: la PORNIRE (_last_position_reeval_ts == 0.0) prima analiză AI rulează
+        # IMEDIAT, fără să aștepte _POSITION_REEVAL_INTERVAL. interval=3600 (1h) ca să fie
+        # clar că nu se așteaptă scurgerea lui; decizie HOLD ca să izolăm „analiza a rulat".
+        state = self._state()
+        mock_ai, mock_order, _ = self._run(
+            state, decision=self._hold(), last_ts=0.0, interval=3600,
+        )
+        mock_ai.assert_called_once()    # Groq apelat la boot, deși intervalul e 1h
+        mock_order.assert_not_called()  # HOLD → nicio lichidare
+
     def test_no_positions_no_groq(self):
         import main
         state = {"pusd_balance": 5.0, "active_positions": []}

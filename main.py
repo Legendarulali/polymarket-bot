@@ -168,7 +168,8 @@ _POSITION_REEVAL_INTERVAL = max(60, int(os.getenv("POSITION_REEVAL_INTERVAL_MINU
 # Pragul de confidence peste care acționăm un PANIC_SELL (conservator — nu lichidăm pe semnale slabe).
 _PANIC_SELL_MIN_CONFIDENCE = float(os.getenv("PANIC_SELL_MIN_CONFIDENCE", "0.70"))
 # Momentul ultimei rulări a re-evaluării pozițiilor (throttle pe _POSITION_REEVAL_INTERVAL).
-# 0.0 = încă nerulat → prima iterație cu poziții deschise re-evaluează imediat (protecție la pornire).
+# Sentinel 0.0 = încă nerulat → detectat explicit ca `is_boot` în _reevaluate_active_positions,
+# care rulează prima analiză IMEDIAT la pornire (nu așteaptă scurgerea unui interval întreg).
 _last_position_reeval_ts: float = 0.0
 
 # Stare raport orar P/L pe Discord. `_next_pnl_report_ts` = momentul (epoch) al
@@ -1327,8 +1328,9 @@ def _reevaluate_active_positions(account_state: dict) -> None:
 
     Rulează INDEPENDENT de cash (vânzarea folosește token-urile deja deținute, nu fonduri) și
     OCOLEȘTE `_execute_trade` (care e doar pentru BUY) — deci protejează portofoliul chiar și
-    cu balanță zero. Throttle pe `_POSITION_REEVAL_INTERVAL` (≤ MAX_ACTIVE_POSITIONS apeluri
-    Groq la fiecare interval → buget de tokeni minim, spre deosebire de scanarea masivă)."""
+    cu balanță zero. La PORNIRE (boot) rulează o primă analiză IMEDIAT (vezi `is_boot` mai jos),
+    apoi throttle pe `_POSITION_REEVAL_INTERVAL` (≤ MAX_ACTIVE_POSITIONS apeluri Groq la fiecare
+    interval → buget de tokeni minim, spre deosebire de scanarea masivă)."""
     global _last_position_reeval_ts
     if not _PANIC_SELL_ENABLED:
         return
@@ -1336,13 +1338,21 @@ def _reevaluate_active_positions(account_state: dict) -> None:
     if not positions:
         return  # nimic de re-evaluat → nu pornim ceasul, nu cheltuim tokeni
     now = time.time()
-    if now - _last_position_reeval_ts < _POSITION_REEVAL_INTERVAL:
+    # La PORNIRE (boot) `_last_position_reeval_ts` e încă 0.0 (sentinel „nerulat") → rulăm o
+    # primă analiză AI IMEDIAT, fără să așteptăm un interval întreg. Abia DUPĂ prima rulare se
+    # aplică throttle-ul `_POSITION_REEVAL_INTERVAL`. Așa, la fiecare (re)pornire pe Railway,
+    # pozițiile deținute sunt verificate pe loc, nu peste ~30 min. (Detectarea boot-ului e
+    # explicită — nu mai depinde de „now - 0.0 e uriaș", deci rămâne corectă chiar dacă
+    # cineva schimbă inițializarea sentinelului.)
+    is_boot = _last_position_reeval_ts == 0.0
+    if not is_boot and now - _last_position_reeval_ts < _POSITION_REEVAL_INTERVAL:
         return
     _last_position_reeval_ts = now
 
     logger.info(
-        "[PanicSell] Re-evaluez %d poziții deținute pe baza știrilor recente "
-        "(interval %d min).", len(positions), _POSITION_REEVAL_INTERVAL // 60,
+        "[PanicSell] %s: re-evaluez %d poziții deținute pe baza știrilor recente (interval %d min).",
+        "Analiză INIȚIALĂ la pornire" if is_boot else "Re-evaluare periodică",
+        len(positions), _POSITION_REEVAL_INTERVAL // 60,
     )
     # Iterăm pe un snapshot: _panic_sell_position rescrie lista de poziții la o lichidare reușită.
     for pos in list(positions):
