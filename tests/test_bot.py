@@ -3227,3 +3227,77 @@ class TestPanicSell:
             main._reevaluate_active_positions(state)
         mock_ai.assert_not_called()    # token în cooldown → nici nu chemăm Groq
         mock_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: _call_groq robustețe pe gpt-oss-20b (model de reasoning) — JSON Mode,
+# reasoning_effort=low, buget de tokeni, content gol/None tratat defensiv
+# ---------------------------------------------------------------------------
+
+class TestCallGroqRobustness:
+    """gpt-oss-20b e un model de RAȚIONAMENT: reasoning-ul consumă din bugetul de tokeni,
+    iar cu max_tokens prea mic `content` venea GOL → eroarea de parsare raportată. _call_groq
+    trimite acum reasoning_effort=low + JSON Mode (la apelurile pe obiect) + buget generos, și
+    tratează content=None ca string gol ca să nu crape `.strip()`/`json.loads`."""
+
+    def _client(self, content="{}"):
+        client = MagicMock()
+        msg = MagicMock()
+        msg.content = content
+        choice = MagicMock()
+        choice.message = msg
+        resp = MagicMock()
+        resp.choices = [choice]
+        resp.usage = None
+        client.chat.completions.create.return_value = resp
+        return client
+
+    def test_json_mode_and_reasoning_effort_sent_on_object_calls(self):
+        from src import ai_analyser
+        client = self._client('{"action":"HOLD"}')
+        ai_analyser._call_groq(client, "decide and answer in JSON", max_tokens=300)
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["response_format"] == {"type": "json_object"}   # JSON Mode pornit
+        assert kwargs["extra_body"]["reasoning_effort"] == "low"      # reasoning scurt
+        assert kwargs["max_tokens"] == 300
+
+    def test_batch_mode_omits_json_object_but_keeps_reasoning_effort(self):
+        from src import ai_analyser
+        client = self._client("[]")
+        ai_analyser._call_groq(client, "answer with a JSON array", json_object=False)
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert "response_format" not in kwargs                        # array → fără json_object
+        assert kwargs["extra_body"]["reasoning_effort"] == "low"
+
+    def test_default_max_tokens_increased_for_reasoning_headroom(self):
+        from src import ai_analyser
+        client = self._client("{}")
+        ai_analyser._call_groq(client, "JSON")
+        # Mult peste vechiul 150 ca răspunsul să nu fie tăiat după reasoning.
+        assert client.chat.completions.create.call_args.kwargs["max_tokens"] >= 512
+
+    def test_none_content_returns_empty_string_no_crash(self):
+        # gpt-oss poate întoarce content=None dacă reasoning a consumat tot bugetul →
+        # _call_groq întoarce "" în loc să crape pe .strip().
+        from src import ai_analyser
+        assert ai_analyser._call_groq(self._client(content=None), "JSON") == ""
+
+    def test_position_exit_empty_response_holds_safely(self):
+        # Scenariul EXACT raportat: model întoarce content gol → JSONDecodeError prins →
+        # decizie sigură HOLD, fără excepție propagată.
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "GROQ_API_KEY", "test-key"), \
+             patch("src.ai_analyser._call_groq", return_value=""):
+            d = ai_analyser.analyse_position_exit("Arsenal vs Chelsea", "1 (Arsenal)", 0.55, 0.30, [])
+        assert d["action"] == "HOLD" and d["confidence"] == pytest.approx(0.0)
+
+    def test_batch_empty_response_all_false(self):
+        # Și pe calea de batch, content gol → toate deciziile False (sigur), nu excepție.
+        from src import ai_analyser
+        from config.settings import settings
+        requests = [{"market_id": "m1", "kind": "binary", "title": "X?", "price": 0.6, "news": []}]
+        with patch.object(settings, "GROQ_API_KEY", "test-key"), \
+             patch("src.ai_analyser._call_groq", return_value=""):
+            res = ai_analyser.analyse_batch(requests)
+        assert res["m1"]["trade"] is False

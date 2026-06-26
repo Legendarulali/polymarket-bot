@@ -121,17 +121,33 @@ def _build_match_prompt(home: str, away: str, candidates: list[dict], news_items
     stop=stop_after_attempt(4),
     reraise=True,
 )
-def _call_groq(client: OpenAI, prompt: str, max_tokens: int = 150) -> str:
+def _call_groq(client: OpenAI, prompt: str, max_tokens: int = 768, *, json_object: bool = True) -> str:
     """Apelează Groq API cu retry exponential. Ridică excepția dacă toate încercările eșuează.
 
-    `max_tokens` e parametrizat: analiza individuală folosește puțini tokeni (150),
-    iar analiza în batch (analyse_batch) cere mai mulți ca să încapă un array întreg."""
-    response = client.chat.completions.create(
-        model=_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        max_tokens=max_tokens,
-    )
+    Reglat pentru gpt-oss-20b, care e un model de RAȚIONAMENT (generează tokeni de „reasoning"
+    ÎNAINTE de răspunsul final, scăzuți din bugetul `max_tokens`):
+      - `reasoning_effort='low'` (via extra_body, independent de versiunea SDK) ține reasoning-ul
+        scurt → răspunsul JSON încape în buget (nu mai vine `content` GOL, cauza erorii de parsare
+        la reevaluarea pozițiilor) ȘI consumă mult mai puțini tokeni (esențial pentru limita TPD
+        a Groq pe un model de reasoning).
+      - `max_tokens` e PLAFON, nu consum (modelul se oprește când termină); mai generos decât la
+        vechiul model non-reasoning (150) ca răspunsul final să nu fie tăiat după reasoning.
+      - JSON Mode (`response_format={'type':'json_object'}`, doar când `json_object=True`) forțează
+        `content` să fie un OBIECT JSON valid, fără text liber în jur. Promptul conține deja „JSON"
+        (cerut de Groq pentru acest mod). NU se folosește la batch, care cere un ARRAY de top-level
+        (`json_object=False`) → acolo ne bazăm pe extragerea robustă din `_extract_json_array`."""
+    create_kwargs: dict = {
+        "model": _MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        # reasoning_effort e specific gpt-oss; prin extra_body ajunge în corpul cererii
+        # indiferent de versiunea SDK-ului OpenAI.
+        "extra_body": {"reasoning_effort": "low"},
+    }
+    if json_object:
+        create_kwargs["response_format"] = {"type": "json_object"}
+    response = client.chat.completions.create(**create_kwargs)
     # Loghează consumul de tokeni raportat de Groq → ca să verificăm reducerea în loguri
     # (după compresia Markdown a știrilor) și să urmărim apropierea de limita TPD.
     usage = getattr(response, "usage", None)
@@ -143,7 +159,15 @@ def _call_groq(client: OpenAI, prompt: str, max_tokens: int = 150) -> str:
             getattr(usage, "completion_tokens", "?"),
             getattr(usage, "total_tokens", "?"),
         )
-    return response.choices[0].message.content.strip()
+    # Defensiv: gpt-oss poate întoarce content=None dacă tot bugetul s-a dus pe reasoning →
+    # tratăm ca string gol (apelantul cade pe decizia sigură în loc să crape pe .strip()).
+    content = (response.choices[0].message.content or "").strip()
+    if not content:
+        logger.warning(
+            "[Groq] model=%s a întors content GOL (probabil reasoning a consumat tot bugetul) "
+            "— crește max_tokens sau verifică reasoning_effort.", _MODEL,
+        )
+    return content
 
 
 def analyse_market(market_title: str, current_price: float, news_items: list[str]) -> dict:
@@ -498,9 +522,12 @@ def analyse_batch(requests: list[dict]) -> dict[str, dict]:
     raw = ""
     try:
         client = _get_groq_client()
-        # Bugetul de tokeni crește cu mărimea lotului ca array-ul întreg să încapă.
-        max_tokens = min(4096, 120 * len(requests) + 256)
-        raw = _call_groq(client, prompt, max_tokens=max_tokens)
+        # Buget generos: pe un model de reasoning lotul are nevoie de loc pentru reasoning-ul
+        # (scurt, reasoning_effort=low) + array-ul JSON întreg, ca răspunsul să nu fie tăiat
+        # (content gol/trunchiat). json_object=False: batch-ul cere un ARRAY de top-level (JSON
+        # Mode ar forța un OBIECT) → ne bazăm pe extragerea robustă din _extract_json_array.
+        max_tokens = min(8192, 256 * len(requests) + 512)
+        raw = _call_groq(client, prompt, max_tokens=max_tokens, json_object=False)
         arr = _extract_json_array(raw)
         by_id = {
             str(o.get("market_id")): o
