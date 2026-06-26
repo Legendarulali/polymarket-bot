@@ -2235,9 +2235,10 @@ class TestAnalyseBatch:
 
     def test_model_is_gpt_oss_20b(self):
         # Migrat de pe llama-3.1-8b-instant (depreciat 16 aug 2026) la modelul de
-        # înlocuire recomandat de Groq, gpt-oss-20b.
+        # înlocuire recomandat de Groq. ID-ul complet, calificat cu namespace-ul Groq:
+        # "openai/gpt-oss-20b".
         from src import ai_analyser
-        assert ai_analyser._MODEL == "gpt-oss-20b"
+        assert ai_analyser._MODEL == "openai/gpt-oss-20b"
 
     def test_parses_array_keyed_by_market_id(self):
         raw = ('[{"market_id":"m1","trade":true,"outcome":"YES","confidence":0.8,"reason":"a"},'
