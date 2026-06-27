@@ -37,7 +37,17 @@ from src.notifications import notify_trade, notify_portfolio, notify_positions, 
 logger = logging.getLogger(__name__)
 
 RUNNING = True
-_LOOP_INTERVAL = 60          # secunde între iterații normale
+# Heartbeat-ul buclei (secunde între iterații). RĂMÂNE mic (60s) ca reconcilierea,
+# exit-urile TP/SL, Panic Sell, raportul P/L și coada să fie verificate des și să poată
+# vinde prompt. Scanarea masivă (costisitoare) e throttle-ată SEPARAT prin
+# _SCAN_INTERVAL_SECONDS — deci poți încetini scanarea fără să încetinești protecția pozițiilor.
+_LOOP_INTERVAL = float(os.getenv("LOOP_INTERVAL_SECONDS", "60"))
+# Cadența SCANĂRII masive (fetch Gamma + analiză Groq pe sute de piețe), DECUPLATĂ de
+# heartbeat: scanarea rulează cel mult o dată la acest interval (IMPLICIT 15 min — vezi
+# SCAN_INTERVAL_MINUTES), ca să nu lovim Gamma/Groq în fiecare minut, în timp ce restul
+# buclei (monitorizarea + vânzarea pozițiilor) rămâne la _LOOP_INTERVAL. 0 = scanează la
+# fiecare buclă (vechiul comportament). În DRY_RUN gate-ul e ignorat (stress-test).
+_SCAN_INTERVAL_SECONDS = max(0.0, float(os.getenv("SCAN_INTERVAL_MINUTES", "15"))) * 60
 _LOW_BALANCE_SLEEP = 15 * 60  # standby 15 min la eșec de reconciliere (401/glitch API, fără stare de cont). NU se mai folosește la cash insuficient — acolo doar dezactivăm cumpărarea (allow_new_trades) și rămânem la 60s.
 _CACHE_TTL_SECONDS = 4 * 3600 # cooldown: re-analizează o piață cel mult o dată la 4h (persistat în history.json)
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
@@ -61,7 +71,10 @@ _GAMMA_ASCENDING = os.getenv("GAMMA_ASCENDING", "false").strip()
 # Deep-scan opțional pe tag-uri Gamma specifice (ex: fotbal / FIFA World Cup).
 # Gol = dezactivat. Necesită tag_id-urile NUMERICE reale (vezi .env.example).
 _GAMMA_TAG_IDS = [t.strip() for t in os.getenv("GAMMA_TAG_IDS", "").split(",") if t.strip()]
-_INTER_ANALYSIS_DELAY = 3                                        # secunde throttle între apeluri LLM (per lot)
+# Throttle (secunde) DUPĂ fiecare apel Groq — o dată per LOT (sau per piață când
+# BATCH_SIZE<=1). Spațiază cererile ca să nu lovim rate-limit-ul Groq când scanăm sute
+# de piețe într-o rundă. Configurabil (acceptă și fracțiuni, ex. 1.5).
+_INTER_ANALYSIS_DELAY = float(os.getenv("INTER_ANALYSIS_DELAY_SECONDS", "3"))
 # Analiză în LOTURI (batching): câte piețe pregătite trimitem la Groq într-UN singur
 # apel. Reduce drastic numărul de cereri → permite modelul gpt-oss-20b
 # fără a lovi rate-limit-urile (429). Implicit 12 (recomandat 10-15). BATCH_SIZE<=1
@@ -71,14 +84,17 @@ _BATCH_SIZE = max(1, int(os.getenv("BATCH_SIZE", "12")))
 # înainte de a reîncerca la scanarea următoare, ca să nu ardem bugetul zilnic de tokeni.
 _RATE_LIMIT_BACKOFF = int(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "60"))
 # --- Filtru STRICT anti-429 (STEP 2) ---
-# gpt-oss-20b pe ~100k tokeni/zi NU poate înghiți ~2100 piețe/scanare. Înainte de
-# orice apel Groq reducem DRASTIC setul: păstrăm piețele cu poziție deschisă, cele cu
+# Înainte de apelurile Groq reducem setul: păstrăm piețele cu poziție deschisă, cele cu
 # volum ≥ _STRICT_MIN_VOLUME_USD și (dacă _STRICT_KEYWORDS e setat) cele al căror titlu/
-# slug conține un keyword de interes; apoi sortăm după volum desc și tăiem la
-# _MAX_MARKETS_PER_SCAN. STRICT_FILTER=false revine la „scanează tot".
+# slug conține un keyword de interes; apoi sortăm după volum desc.
+# _MAX_MARKETS_PER_SCAN plafonează câte piețe ajung la analiză: IMPLICIT 0 = FĂRĂ plafon
+# → analizăm TOT ce trece de filtrul de volum (~900 piețe, ca înainte). Protecția anti-429
+# se bazează acum pe: filtrul de volum + batching (_BATCH_SIZE) + throttle per lot
+# (_INTER_ANALYSIS_DELAY) + cadența de scanare (_SCAN_INTERVAL_SECONDS) + cooldown-ul de 4h
+# din history.json. Setează MAX_MARKETS_PER_SCAN>0 (ex. 500) DOAR ca să re-impui un plafon dur.
 _STRICT_FILTER = os.getenv("STRICT_FILTER", "true").strip().lower() in ("1", "true", "yes", "on")
 _STRICT_MIN_VOLUME_USD = float(os.getenv("STRICT_MIN_VOLUME_USD", "50000"))
-_MAX_MARKETS_PER_SCAN = int(os.getenv("MAX_MARKETS_PER_SCAN", "40"))
+_MAX_MARKETS_PER_SCAN = int(os.getenv("MAX_MARKETS_PER_SCAN", "0"))
 _STRICT_KEYWORDS = [k.strip().lower() for k in os.getenv("STRICT_KEYWORDS", "").split(",") if k.strip()]
 # Mod SIMULARE (stress test Groq). IMPLICIT False. Când e True: botul trece peste
 # gate-urile de balanță (1.05 pUSD) și de expunere ca să scaneze și să trimită loturile
@@ -265,12 +281,14 @@ signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 
-def _interruptible_sleep(seconds: int) -> None:
-    """Sleep în incremente de 1s astfel încât SIGTERM e onorat prompt."""
-    for _ in range(seconds):
-        if not RUNNING:
-            break
-        time.sleep(1)
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep în incremente de ≤1s astfel încât SIGTERM e onorat prompt. Acceptă și
+    valori fracționare (ex. throttle de 1.5s) sau 0 (no-op)."""
+    remaining = float(seconds)
+    while remaining > 0 and RUNNING:
+        chunk = 1.0 if remaining > 1.0 else remaining
+        time.sleep(chunk)
+        remaining -= chunk
 
 
 def _fetch_markets_page(params: dict) -> list | object | None:
@@ -1683,11 +1701,12 @@ def _strict_prefilter(markets: list[dict], account_state: dict) -> list[dict]:
     kept = [m for m in markets if _keep(m)]
     kept.sort(key=_market_volume, reverse=True)
     capped = kept[:_MAX_MARKETS_PER_SCAN] if _MAX_MARKETS_PER_SCAN > 0 else kept
+    cap_label = f"plafon {_MAX_MARKETS_PER_SCAN}" if _MAX_MARKETS_PER_SCAN > 0 else "fără plafon"
     logger.info(
         "[StrictFilter] %d → %d piețe după filtru (volum≥$%.0f / %d keywords / poziții "
-        "deschise), apoi tăiat la %d (plafon %d).",
+        "deschise) → %d trimise spre analiză (%s).",
         len(markets), len(kept), _STRICT_MIN_VOLUME_USD, len(_STRICT_KEYWORDS),
-        len(capped), _MAX_MARKETS_PER_SCAN,
+        len(capped), cap_label,
     )
     return capped
 
@@ -1823,8 +1842,9 @@ def main() -> None:
         logger.error("Allowance check eșuat (bot continuă oricum): %s", exc)
 
     logger.info(
-        "Entering autonomous AI agent loop (interval=%ds). Send SIGTERM/SIGINT to stop.",
-        _LOOP_INTERVAL,
+        "Entering autonomous AI agent loop (heartbeat=%.0fs, scanare la fiecare %.0fs). "
+        "Send SIGTERM/SIGINT to stop.",
+        _LOOP_INTERVAL, _SCAN_INTERVAL_SECONDS,
     )
 
     # Ping de pornire pe Discord: confirmă INDEPENDENT că webhook-ul e funcțional,
@@ -1833,6 +1853,11 @@ def main() -> None:
     notify_startup()
 
     try:
+        # Scanarea masivă (fetch Gamma + Groq) e decuplată de heartbeat: reținem când am
+        # scanat ultima oară ca să o rulăm cel mult o dată la _SCAN_INTERVAL_SECONDS, în timp
+        # ce restul buclei (reconciliere, TP/SL, Panic Sell, raport, coadă) rulează la fiecare
+        # _LOOP_INTERVAL. Pornim de la 0.0 → prima iterație scanează imediat.
+        last_scan_time = 0.0
         while RUNNING:
             # Reconciliere stare cont — apel critic de rețea (CLOB get_balance_allowance
             # + Data API positions). Îl izolăm într-un try/except: un glitch temporar al
@@ -2000,6 +2025,27 @@ def main() -> None:
                     )
                     _interruptible_sleep(_LOOP_INTERVAL)
                     continue
+
+            # --- Cadența scanării masive (decuplată de heartbeat) ---
+            # Reconcilierea + exit-urile (TP/SL/Panic Sell) + coada au rulat deja la acest
+            # heartbeat (60s). Scanarea masivă (fetch Gamma + Groq pe sute de piețe) e însă
+            # costisitoare → o rulăm cel mult o dată la _SCAN_INTERVAL_SECONDS. În DRY_RUN o
+            # rulăm la fiecare buclă (stress-test de rate-limit); 0 = dezactivat (scanează mereu).
+            now = time.time()
+            scan_due = (
+                _DRY_RUN
+                or _SCAN_INTERVAL_SECONDS <= 0
+                or (now - last_scan_time) >= _SCAN_INTERVAL_SECONDS
+            )
+            if not scan_due:
+                logger.debug(
+                    "[Agent] Scanare amânată: %.0f/%.0fs scurse. Heartbeat la %.0fs — "
+                    "monitorizez și pot vinde pozițiile existente între scanări.",
+                    now - last_scan_time, _SCAN_INTERVAL_SECONDS, _LOOP_INTERVAL,
+                )
+                _interruptible_sleep(_LOOP_INTERVAL)
+                continue
+            last_scan_time = now
 
             if maxed:  # _ACTIVATE_QUEUE sau _DRY_RUN (altfel am fi făcut deja continue)
                 if _DRY_RUN:
