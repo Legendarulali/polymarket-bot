@@ -1141,6 +1141,116 @@ class TestAnalyzedHistory:
 
 
 # ---------------------------------------------------------------------------
+# Tests: persistarea deciziilor AI în history.json (last_ai_decisions)
+# ---------------------------------------------------------------------------
+
+class TestAiDecisionPersistence:
+    """`_last_ai_decision` e persistat în history.json (cheia `last_ai_decisions`) și
+    restaurat la pornire, ca o poziție preexistentă să NU reapară drept „Pending initial
+    AI sync" după un restart de proces/container. Formatul e „învelit": {"analyzed": {...},
+    "last_ai_decisions": {...}}, compatibil înapoi cu formatele vechi (dict plat / listă)."""
+
+    def _fresh(self, monkeypatch, tmp_path):
+        import main
+        hist_file = tmp_path / "history.json"
+        monkeypatch.setattr(main, "_HISTORY_FILE", str(hist_file))
+        monkeypatch.setattr(main, "_analyzed_history", {})
+        monkeypatch.setattr(main, "_last_ai_decision", {})
+        return main, hist_file
+
+    def test_record_persists_wrapped_format(self, monkeypatch, tmp_path):
+        main, hist_file = self._fresh(monkeypatch, tmp_path)
+        main._record_ai_decision("0xA", "BUY (intrare)", 0.82, "strong thesis")
+        assert hist_file.exists()
+        data = json.loads(hist_file.read_text(encoding="utf-8"))
+        assert "analyzed" in data and "last_ai_decisions" in data      # format „învelit"
+        dec = data["last_ai_decisions"]["0xA"]
+        assert dec["action"] == "BUY (intrare)"
+        assert dec["confidence"] == pytest.approx(0.82)
+        assert isinstance(dec["ts"], (int, float))                     # ts numeric
+
+    def test_decision_survives_restart(self, monkeypatch, tmp_path):
+        main, _ = self._fresh(monkeypatch, tmp_path)
+        main._record_ai_decision("0xA", "HOLD", 0.90, "no major development")
+        # Simulează restartul: golește memoria (ca la un proces nou) și reîncarcă din fișier.
+        monkeypatch.setattr(main, "_last_ai_decision", {})
+        monkeypatch.setattr(main, "_analyzed_history", {})
+        assert main._format_ai_decision("0xA") == "AI: Pending initial AI sync"   # memorie goală
+        main._load_history()
+        text = main._format_ai_decision("0xA")
+        assert "Pending initial AI sync" not in text                   # ESENȚA cerinței
+        assert "AI: HOLD conf 0.90" in text and "no major development" in text
+
+    def test_analyzed_and_decisions_coexist(self, monkeypatch, tmp_path):
+        main, _ = self._fresh(monkeypatch, tmp_path)
+        main._record_analyzed("m1")                          # scrie sub „analyzed"
+        main._record_ai_decision("0xA", "HOLD", 0.7, "ok")   # scrie sub „last_ai_decisions"
+        monkeypatch.setattr(main, "_last_ai_decision", {})
+        monkeypatch.setattr(main, "_analyzed_history", {})
+        main._load_history()
+        assert main._is_recently_analyzed("m1") is True      # cooldown restaurat
+        assert "0xA" in main._last_ai_decision               # decizie restaurată
+
+    def test_expired_analyzed_pruned_decisions_kept(self, monkeypatch, tmp_path):
+        import time
+        main, hist_file = self._fresh(monkeypatch, tmp_path)
+        now = time.time()
+        hist_file.write_text(json.dumps({
+            "analyzed": {"old": now - main._CACHE_TTL_SECONDS - 10, "fresh": now},
+            "last_ai_decisions": {"0xA": {"action": "HOLD", "confidence": 0.8,
+                                          "reason": "r", "ts": now}},
+        }), encoding="utf-8")
+        main._load_history()
+        assert main._is_recently_analyzed("fresh") is True
+        assert main._is_recently_analyzed("old") is False
+        assert "0xA" in main._last_ai_decision   # decizia păstrată deși o analiză a expirat
+
+    def test_string_timestamp_and_confidence_deserialized(self, monkeypatch, tmp_path):
+        # Cerința 3: ts/confidence salvate ca STRING sunt readuse la float, fără crash în (acum Xm).
+        import time
+        main, hist_file = self._fresh(monkeypatch, tmp_path)
+        five_min_ago = time.time() - 300
+        hist_file.write_text(json.dumps({
+            "analyzed": {},
+            "last_ai_decisions": {"0xA": {"action": "HOLD", "confidence": "0.75",
+                                          "reason": "r", "ts": str(five_min_ago)}},
+        }), encoding="utf-8")
+        main._load_history()
+        dec = main._last_ai_decision["0xA"]
+        assert dec["ts"] == pytest.approx(five_min_ago)      # string → float
+        assert dec["confidence"] == pytest.approx(0.75)      # string → float
+        text = main._format_ai_decision("0xA")
+        assert "Pending initial AI sync" not in text and "conf 0.75" in text
+
+    def test_legacy_flat_format_loads_without_decisions(self, monkeypatch, tmp_path):
+        import time
+        main, hist_file = self._fresh(monkeypatch, tmp_path)
+        hist_file.write_text(json.dumps({"m1": time.time()}), encoding="utf-8")  # format vechi plat
+        main._load_history()
+        assert main._is_recently_analyzed("m1") is True
+        assert main._last_ai_decision == {}                  # fără decizii → memorie goală, fără crash
+
+    def test_corrupt_file_clears_decisions(self, monkeypatch, tmp_path):
+        main, hist_file = self._fresh(monkeypatch, tmp_path)
+        monkeypatch.setattr(main, "_last_ai_decision", {"stale": {"action": "X", "ts": 0.0}})
+        hist_file.write_text("{bad json", encoding="utf-8")
+        main._load_history()
+        assert main._last_ai_decision == {}
+
+    def test_parse_ai_decisions_skips_non_dict_entries(self):
+        import main
+        parsed = main._parse_ai_decisions({"0xA": "not-a-dict", "0xB": {"action": "HOLD"}})
+        assert "0xA" not in parsed                            # intrare invalidă ignorată
+        assert parsed["0xB"]["action"] == "HOLD"
+        assert parsed["0xB"]["ts"] == 0.0                     # ts lipsă → 0.0 (fără crash)
+
+    def test_parse_ai_decisions_non_dict_input(self):
+        import main
+        assert main._parse_ai_decisions(["not", "a", "dict"]) == {}
+        assert main._parse_ai_decisions(None) == {}
+
+
+# ---------------------------------------------------------------------------
 # Tests: match-market classification (title + slug)
 # ---------------------------------------------------------------------------
 

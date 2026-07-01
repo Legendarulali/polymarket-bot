@@ -165,7 +165,10 @@ _FOOTBALL_ONLY = os.getenv("FOOTBALL_ONLY", "false").strip().lower() in ("1", "t
 
 # Istoric persistent al piețelor analizate: {market_id: timestamp_float}.
 # Încărcat din _HISTORY_FILE la pornire; folosit pentru a filtra piețele
-# analizate în ultimele _CACHE_TTL_SECONDS înainte de procesare.
+# analizate în ultimele _CACHE_TTL_SECONDS înainte de procesare. Fișierul
+# history.json ține AMBELE stări (format „învelit"): piețele analizate ȘI
+# ultimele decizii AI per poziție (cheia `last_ai_decisions`, vezi _last_ai_decision),
+# ca ambele să supraviețuiască unui restart.
 # Calea poate fi suprascrisă cu HISTORY_FILE (ex: un volum montat pe Railway,
 # unde /app e efemer și root-only); altfel, history.json lângă main.py.
 _HISTORY_FILE = os.getenv("HISTORY_FILE") or os.path.join(
@@ -207,11 +210,14 @@ _PANIC_SELL_MIN_CONFIDENCE = float(os.getenv("PANIC_SELL_MIN_CONFIDENCE", "0.70"
 # care rulează prima analiză IMEDIAT la pornire (nu așteaptă scurgerea unui interval întreg).
 _last_position_reeval_ts: float = 0.0
 
-# Ultima decizie AI cunoscută per token DEȚINUT (memorie in-process, NU persistată). Cheie:
-# token_id → {"action", "confidence", "reason", "ts"}. Alimentată de intrarea în poziție
-# (BUY reușit) și de re-evaluarea Panic Sell (HOLD/PANIC_SELL); citită de raportul de status
-# per-heartbeat (`_log_position_status`) — pur informativ, NU costă niciun apel Groq. Fără
-# intrare pentru un token → raportul afișează „Pending initial AI sync".
+# Ultima decizie AI cunoscută per token DEȚINUT. Cheie: token_id → {"action",
+# "confidence", "reason", "ts"}. Alimentată de intrarea în poziție (BUY reușit) și de
+# re-evaluarea Panic Sell (HOLD/PANIC_SELL); citită de raportul de status per-heartbeat
+# (`_log_position_status`) — pur informativ, NU costă niciun apel Groq. PERSISTATĂ în
+# history.json (cheia `last_ai_decisions`): _record_ai_decision o salvează la fiecare
+# update, iar _load_history o restaurează la pornire, ca o poziție preexistentă să NU mai
+# reapară drept „Pending initial AI sync" după un restart de proces/container. Fără intrare
+# pentru un token → raportul afișează „Pending initial AI sync".
 _last_ai_decision: dict[str, dict] = {}
 
 # Stare raport orar P/L pe Discord. `_next_pnl_report_ts` = momentul (epoch) al
@@ -496,51 +502,90 @@ def _live_best_bid(token_id: str) -> float | None:
         return None
 
 
-def _load_history() -> None:
-    """Încarcă istoricul piețelor analizate din history.json (prima instrucțiune la rulare).
+def _parse_ai_decisions(raw) -> dict[str, dict]:
+    """Deserializează blocul `last_ai_decisions` din history.json → {token_id: {...}}.
 
-    Intrările mai vechi decât _CACHE_TTL_SECONDS sunt eliminate la încărcare, pentru
-    a limita creșterea fișierului. Acceptă atât formatul {id: timestamp} cât și o
-    listă simplă de ID-uri (considerate analizate „acum").
+    Robust la date lipsă/corupte: sare intrările care nu-s dict și normalizează câmpurile.
+    `ts` și `confidence` sunt trecute prin _qfloat (deci merg și dacă au fost salvate ca
+    string), ca vechimea „(acum Xm)" din raportul de status să nu crape după un restart."""
+    out: dict[str, dict] = {}
+    if not isinstance(raw, dict):
+        return out
+    for tid, dec in raw.items():
+        if not isinstance(dec, dict):
+            continue
+        out[str(tid)] = {
+            "action":     str(dec.get("action") or "?"),
+            "confidence": _qfloat(dec.get("confidence")),
+            "reason":     str(dec.get("reason") or "")[:200],
+            "ts":         _qfloat(dec.get("ts")),
+        }
+    return out
+
+
+def _load_history() -> None:
+    """Încarcă istoricul din history.json (prima instrucțiune la rulare).
+
+    Formatul curent e un dict „învelit": {"analyzed": {id: ts}, "last_ai_decisions":
+    {token_id: {...}}}, ca AMBELE stări — cooldown-ul de analiză ȘI ultima decizie AI per
+    poziție — să supraviețuiască unui restart dintr-un singur fișier. Compatibil înapoi cu
+    formatele vechi: un dict plat {id: ts} sau o listă simplă de ID-uri (analizate „acum").
+    Intrările de analiză mai vechi decât _CACHE_TTL_SECONDS sunt eliminate la încărcare.
     """
-    global _analyzed_history
+    global _analyzed_history, _last_ai_decision
     now = time.time()
     try:
         with open(_HISTORY_FILE, "r", encoding="utf-8") as fh:
             raw = json.load(fh)
     except FileNotFoundError:
         _analyzed_history = {}
+        _last_ai_decision = {}
         logger.info("[History] %s inexistent — pornesc cu istoric gol.", _HISTORY_FILE)
         return
     except (json.JSONDecodeError, OSError) as exc:
         _analyzed_history = {}
+        _last_ai_decision = {}
         logger.warning("[History] Nu am putut citi %s (%s) — pornesc cu istoric gol.", _HISTORY_FILE, exc)
         return
 
+    # Formatul „învelit" nou (dict cu sub-blocul `analyzed` și/sau `last_ai_decisions`) vs.
+    # formatele vechi (dict plat {id: ts} sau listă de ID-uri). Detecția e sigură: în formatul
+    # vechi valorile sunt timestamp-uri (numere), niciodată dict-uri.
+    raw_analyzed = raw
+    decisions_raw: dict = {}
+    if isinstance(raw, dict) and (
+        isinstance(raw.get("analyzed"), dict) or isinstance(raw.get("last_ai_decisions"), dict)
+    ):
+        raw_analyzed = raw.get("analyzed", {})
+        decisions_raw = raw.get("last_ai_decisions", {})
+
     parsed: dict[str, float] = {}
-    if isinstance(raw, dict):
-        for mid, ts in raw.items():
+    if isinstance(raw_analyzed, dict):
+        for mid, ts in raw_analyzed.items():
             try:
                 parsed[str(mid)] = float(ts)
             except (ValueError, TypeError):
                 continue
-    elif isinstance(raw, list):
-        parsed = {str(mid): now for mid in raw}
+    elif isinstance(raw_analyzed, list):
+        parsed = {str(mid): now for mid in raw_analyzed}
 
     _analyzed_history = {mid: ts for mid, ts in parsed.items() if now - ts < _CACHE_TTL_SECONDS}
+    _last_ai_decision = _parse_ai_decisions(decisions_raw)
     expired = len(parsed) - len(_analyzed_history)
     logger.info(
-        "[History] Încărcate %d piețe analizate recent din %s (%d expirate, ignorate).",
-        len(_analyzed_history), _HISTORY_FILE, expired,
+        "[History] Încărcate %d piețe analizate recent din %s (%d expirate, ignorate); "
+        "%d decizii AI restaurate.",
+        len(_analyzed_history), _HISTORY_FILE, expired, len(_last_ai_decision),
     )
     if expired:
         _save_history()  # rescrie fișierul curățat de intrările expirate
 
 
 def _save_history() -> None:
-    """Persistă istoricul piețelor analizate în history.json (scriere atomică).
-
-    Creează directorul părinte dacă lipsește; erorile de permisiuni/IO sunt
+    """Persistă istoricul în history.json (scriere atomică), în formatul „învelit":
+    {"analyzed": {id: ts}} (piețele analizate — cooldown) + {"last_ai_decisions":
+    {token_id: {...}}} (ultima decizie AI per poziție), ca ambele să supraviețuiască unui
+    restart. Creează directorul părinte dacă lipsește; erorile de IO/serializare sunt
     prinse și logate, fără a opri botul (history e best-effort).
     """
     tmp = f"{_HISTORY_FILE}.tmp"
@@ -548,10 +593,14 @@ def _save_history() -> None:
         parent = os.path.dirname(_HISTORY_FILE)
         if parent:
             os.makedirs(parent, exist_ok=True)
+        payload = {
+            "analyzed": _analyzed_history,
+            "last_ai_decisions": _last_ai_decision,
+        }
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(_analyzed_history, fh)
+            json.dump(payload, fh)
         os.replace(tmp, _HISTORY_FILE)
-    except OSError as exc:
+    except (OSError, TypeError) as exc:
         logger.warning("[History] Nu am putut salva %s: %s", _HISTORY_FILE, exc)
 
 
@@ -778,9 +827,10 @@ def _maybe_send_pnl_report(account_state: dict) -> None:
 
 
 def _record_ai_decision(token_id: str, action: str, confidence: float, reason: str) -> None:
-    """Reține în memorie (in-process) ultima decizie AI pentru un token DEȚINUT, ca raportul
-    de status per-heartbeat s-o poată afișa FĂRĂ a re-apela Groq. Best-effort, nedurabil —
-    pur informativ, nu influențează tranzacționarea."""
+    """Reține ultima decizie AI pentru un token DEȚINUT (ca raportul de status per-heartbeat
+    s-o poată afișa FĂRĂ a re-apela Groq) ȘI o persistă imediat în history.json, ca decizia
+    să supraviețuiască unui restart — altfel poziția preexistentă ar reapărea drept „Pending
+    initial AI sync". Pur informativ, nu influențează tranzacționarea."""
     tid = str(token_id or "")
     if not tid:
         return
@@ -790,6 +840,7 @@ def _record_ai_decision(token_id: str, action: str, confidence: float, reason: s
         "reason":     str(reason or "")[:200],
         "ts":         time.time(),
     }
+    _save_history()   # persistă deciziile (+ istoricul de analiză) — supraviețuiesc restartului
 
 
 def _live_bid_ask(token_id: str) -> tuple[float | None, float | None]:

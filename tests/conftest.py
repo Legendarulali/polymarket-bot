@@ -10,6 +10,8 @@ import sys
 from dataclasses import dataclass
 from unittest.mock import MagicMock
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Required environment variables (must come before any project import)
 # ---------------------------------------------------------------------------
@@ -126,3 +128,19 @@ except ImportError:
     _mock_defusedxml.ElementTree = _mock_defusedxml_et
     sys.modules["defusedxml"] = _mock_defusedxml
     sys.modules["defusedxml.ElementTree"] = _mock_defusedxml_et
+
+
+# ---------------------------------------------------------------------------
+# Izolare fișier persistent: history.json → director temporar per test.
+# Necesar acum că _record_ai_decision persistă deciziile AI (împreună cu istoricul
+# de analiză) la fiecare update. Fără redirecționare, testele care ating
+# _record_ai_decision (panic-sell, raportul de status) ar suprascrie history.json
+# real din repo. Rulează pentru fiecare test; testele care își setează propriul
+# _HISTORY_FILE îl suprascriu în continuare (monkeypatch, ultima setare câștigă).
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _isolate_history_file(monkeypatch, tmp_path):
+    main = sys.modules.get("main")
+    if main is not None:
+        monkeypatch.setattr(main, "_HISTORY_FILE", str(tmp_path / "history.json"), raising=False)
+    yield
