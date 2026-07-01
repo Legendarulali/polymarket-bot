@@ -20,6 +20,20 @@ except ImportError:  # pragma: no cover
     class PolyApiException(Exception):  # type: ignore[no-redef]
         status_code = None
 
+# openai.RateLimitError — ridicată de SDK-ul OpenAI-compatibil (Groq) la HTTP 429 când
+# bugetul zilnic de tokeni (TPD) e epuizat. O prindem EXPLICIT (după TIP) în Panic Sell ca
+# să IEȘIM din ciclul de re-evaluare — toate apelurile rămase ar da tot 429, deci a itera
+# mai departe ar ține bucla ocupată degeaba. Import defensiv, în aceeași manieră ca
+# PolyApiException: dacă `openai` lipsește sau e mock-uit (fără o clasă reală de excepție),
+# degradăm la None și ne bazăm pe `_is_rate_limit_error` (detecție pe mesaj), ca importul
+# acestui modul să nu pice niciodată.
+try:
+    from openai import RateLimitError as _OPENAI_RATE_LIMIT  # type: ignore[assignment]
+    if not (isinstance(_OPENAI_RATE_LIMIT, type) and issubclass(_OPENAI_RATE_LIMIT, BaseException)):
+        _OPENAI_RATE_LIMIT = None  # type: ignore[assignment]
+except Exception:  # pragma: no cover — openai absent sau mock-uit
+    _OPENAI_RATE_LIMIT = None  # type: ignore[assignment]
+
 from config.settings import settings
 from src.reconciliation import log_reconciliation_report, get_account_state, compute_portfolio_summary
 from src.execution import (
@@ -192,6 +206,13 @@ _PANIC_SELL_MIN_CONFIDENCE = float(os.getenv("PANIC_SELL_MIN_CONFIDENCE", "0.70"
 # Sentinel 0.0 = încă nerulat → detectat explicit ca `is_boot` în _reevaluate_active_positions,
 # care rulează prima analiză IMEDIAT la pornire (nu așteaptă scurgerea unui interval întreg).
 _last_position_reeval_ts: float = 0.0
+
+# Ultima decizie AI cunoscută per token DEȚINUT (memorie in-process, NU persistată). Cheie:
+# token_id → {"action", "confidence", "reason", "ts"}. Alimentată de intrarea în poziție
+# (BUY reușit) și de re-evaluarea Panic Sell (HOLD/PANIC_SELL); citită de raportul de status
+# per-heartbeat (`_log_position_status`) — pur informativ, NU costă niciun apel Groq. Fără
+# intrare pentru un token → raportul afișează „Pending initial AI sync".
+_last_ai_decision: dict[str, dict] = {}
 
 # Stare raport orar P/L pe Discord. `_next_pnl_report_ts` = momentul (epoch) al
 # următorului raport, ALINIAT la ceas (oră fixă xx:00, ca resetul de metrici Polymarket),
@@ -756,6 +777,120 @@ def _maybe_send_pnl_report(account_state: dict) -> None:
     _next_pnl_report_ts = _next_report_time(interval_h).timestamp()
 
 
+def _record_ai_decision(token_id: str, action: str, confidence: float, reason: str) -> None:
+    """Reține în memorie (in-process) ultima decizie AI pentru un token DEȚINUT, ca raportul
+    de status per-heartbeat s-o poată afișa FĂRĂ a re-apela Groq. Best-effort, nedurabil —
+    pur informativ, nu influențează tranzacționarea."""
+    tid = str(token_id or "")
+    if not tid:
+        return
+    _last_ai_decision[tid] = {
+        "action":     str(action or "?"),
+        "confidence": _qfloat(confidence),
+        "reason":     str(reason or "")[:200],
+        "ts":         time.time(),
+    }
+
+
+def _live_bid_ask(token_id: str) -> tuple[float | None, float | None]:
+    """Best bid & best ask live dintr-o SINGURĂ cerere orderbook (vs _live_best_bid +
+    _live_best_ask, care fac câte una fiecare). Best-effort și TĂCUT: la orice eroare întoarce
+    (None, None) și loghează doar la DEBUG — raportul de status rulează la FIECARE heartbeat,
+    deci nu vrem spam de warning-uri dacă orderbook-ul e momentan indisponibil."""
+    tid = str(token_id or "")
+    if not tid:
+        return None, None
+    try:
+        ob = get_clob_client().get_order_book(token_id=tid)
+        bids = ob.bids if hasattr(ob, "bids") else ob.get("bids", [])
+        asks = ob.asks if hasattr(ob, "asks") else ob.get("asks", [])
+        best_bid = max((float(b.price if hasattr(b, "price") else b["price"]) for b in bids), default=None) if bids else None
+        best_ask = min((float(a.price if hasattr(a, "price") else a["price"]) for a in asks), default=None) if asks else None
+        return best_bid, best_ask
+    except Exception as exc:
+        logger.debug("[Status] Orderbook indisponibil pentru token=%s: %s", tid, exc)
+        return None, None
+
+
+def _format_ai_decision(token_id: str) -> str:
+    """Ultima decizie AI cunoscută pentru un token (Action, Confidence, Reason + vechime), sau
+    „Pending initial AI sync" dacă poziția nu a fost încă evaluată de AI (fără apel Groq)."""
+    dec = _last_ai_decision.get(str(token_id or ""))
+    if not dec:
+        return "AI: Pending initial AI sync"
+    age_min = max(0.0, (time.time() - _qfloat(dec.get("ts"))) / 60.0)
+    reason = str(dec.get("reason") or "").strip()
+    reason_str = f' - "{reason[:70]}"' if reason else ""
+    return (
+        f"AI: {dec.get('action', '?')} conf {_qfloat(dec.get('confidence')):.2f} "
+        f"(acum {age_min:.0f}m){reason_str}"
+    )
+
+
+def _format_position_status(idx: int, pos: dict) -> str:
+    """Un RÂND de status pentru o poziție deținută: titlu + outcome, preț de intrare vs preț
+    curent (mark din reconciliere + best bid/ask live best-effort), P/L și ultima decizie AI.
+    Pur informativ — NU apelează Groq."""
+    title = str(pos.get("asset_name") or "Necunoscut").strip()[:55]
+    outcome = str(pos.get("outcome") or "?")
+    token_id = str(pos.get("token_id") or "")
+    entry = _qfloat(pos.get("avg_price"))
+    cur = _qfloat(pos.get("cur_price"))
+    size = _qfloat(pos.get("size"))
+    pnl = _qfloat(pos.get("cash_pnl"))
+    pnl_pct = _qfloat(pos.get("percent_pnl"))
+
+    # Best bid/ask live (best-effort). Prețul „curent" preferă mark-ul din reconciliere (deja
+    # preluat, mereu prezent); dacă lipsește, cade pe mijlocul bid/ask, dacă îl avem.
+    bid, ask = _live_bid_ask(token_id)
+    book_str = f" (bid ${bid:.3f} / ask ${ask:.3f})" if (bid is not None and ask is not None) else ""
+    if cur <= 0 and bid is not None and ask is not None:
+        cur = (bid + ask) / 2.0
+
+    if entry > 0 and cur > 0:
+        move = (cur - entry) / entry * 100.0
+        arrow = "▲" if cur > entry else ("▼" if cur < entry else "▬")
+        price_str = f"intrare ${entry:.3f} → acum ${cur:.3f}{book_str} {arrow} {move:+.1f}%"
+    elif cur > 0:
+        price_str = f"intrare ${entry:.3f} → acum ${cur:.3f}{book_str}"
+    else:
+        price_str = f"intrare ${entry:.3f} → preț curent indisponibil"
+
+    return (
+        f"  #{idx} {title} · {outcome} | {price_str} | "
+        f"size {size:.2f} · P/L ${pnl:+.2f} ({pnl_pct:+.1f}%) | {_format_ai_decision(token_id)}"
+    )
+
+
+def _log_position_status(account_state: dict) -> None:
+    """Raport de status per-heartbeat (la fiecare _LOOP_INTERVAL, 60s) al pozițiilor deținute.
+    PUR informativ și FĂRĂ apel Groq (nu ardem rate-limit-ul): pentru fiecare poziție arată
+    prețul curent (mark + best bid/ask best-effort) vs prețul de intrare, P/L-ul și ULTIMA
+    decizie AI cunoscută din memorie. Un rând per poziție; robust: o eroare pe o singură
+    poziție e prinsă și NU strică restul raportului (fără traceback-uri repetate în buclă).
+
+    Volum de loguri neglijabil (≤ MAX_ACTIVE_POSITIONS rânduri/minut), deci sigur la INFO
+    chiar cu rate-limit-ul Railway (spre deosebire de scanarea a mii de piețe)."""
+    positions = account_state.get("active_positions", [])
+    if not positions:
+        logger.info("[Status] Nicio poziție activă — monitorizez, portofoliu în așteptare.")
+        return
+
+    summary = compute_portfolio_summary(account_state)
+    logger.info(
+        "[Status] Urmăresc %d poziții active | valoare $%.2f · cash $%.2f · P/L nerealizat $%+.2f",
+        summary["n_positions"], summary["total_value"], summary["cash"], summary["unrealized_pnl"],
+    )
+    for idx, pos in enumerate(positions, 1):
+        try:
+            logger.info("[Status] %s", _format_position_status(idx, pos))
+        except Exception as exc:  # niciodată nu stricăm raportul pe o singură poziție
+            logger.warning(
+                "[Status] Nu am putut construi statusul poziției token=%s: %s",
+                pos.get("token_id"), exc,
+            )
+
+
 def _prob_window() -> tuple[float, float]:
     """Fereastra de probabilitate efectivă pentru filtre: lărgită (0.01, 0.99) în
     NOTIFICATION_TEST_MODE ca testul de notificări să găsească ușor o piață; altfel
@@ -1235,6 +1370,12 @@ def _execute_trade(
             "cash_pnl":      0.0,
             "event_id":      event_id,
         })
+        # Reține teza de intrare (decizia AI la BUY) pentru raportul de status per-heartbeat,
+        # ca poziția proaspăt deschisă să nu apară drept „Pending initial AI sync".
+        _record_ai_decision(
+            token_id, "BUY (intrare)",
+            decision.get("confidence", 0.0), decision.get("reason", ""),
+        )
         notify_trade(
             "BUY",
             title,
@@ -1384,6 +1525,23 @@ def _reevaluate_active_positions(account_state: dict) -> None:
         try:
             _reevaluate_one_position(pos, account_state)
         except Exception as exc:
+            # Rate-limit Groq (HTTP 429 — buget zilnic de tokeni epuizat): TOATE apelurile
+            # rămase din acest ciclu ar eșua identic, deci nu are rost să iterăm mai departe
+            # (am ține bucla ocupată degeaba, exact „recovery loop"-ul strâns descris). Prindem
+            # `openai.RateLimitError` direct (după TIP — robust chiar dacă mesajul nu conține
+            # „429") ȘI, via `_is_rate_limit_error`, cazul învelit de tenacity (RetryError).
+            # Logăm clar și IEȘIM din ciclu (break), lăsând bucla principală să-și continue
+            # monitorizarea + celelalte task-uri. Throttle-ul `_last_position_reeval_ts` (setat
+            # deja mai sus) previne oricum o re-rulare imediată — nu revenim înainte de interval.
+            if (
+                (_OPENAI_RATE_LIMIT is not None and isinstance(exc, _OPENAI_RATE_LIMIT))
+                or _is_rate_limit_error(exc)
+            ):
+                logger.warning(
+                    "[PanicSell] Groq API rate limit reached. Skipping remaining position "
+                    "evaluations for this cycle to allow the core loop to continue."
+                )
+                break
             logger.error(
                 "[PanicSell] Eroare la re-evaluarea poziției token=%s: %s",
                 pos.get("token_id"), exc, exc_info=True,
@@ -1416,6 +1574,8 @@ def _reevaluate_one_position(pos: dict, account_state: dict) -> None:
 
     news = fetch_free_news(query=title[:100])
     decision = analyse_position_exit(title, outcome_label, avg_price, bid, news)
+    # Reține decizia AI proaspătă pentru raportul de status per-heartbeat (fără re-apel Groq).
+    _record_ai_decision(token_id, decision["action"], decision["confidence"], decision.get("reason", ""))
     logger.info(
         "[PanicSell] '%s' (%s) | entry=$%.4f bid=$%.4f → action=%s | confidence=%.2f | reason=%s",
         title[:50], outcome_label, avg_price, bid,
@@ -1952,6 +2112,16 @@ def main() -> None:
                         _reevaluate_active_positions(account_state)
                     except Exception as exc:
                         logger.error("[PanicSell] Re-evaluarea pozițiilor a eșuat: %s", exc, exc_info=True)
+
+                # Raport de status per-heartbeat: la FIECARE buclă (60s), NU doar la scanare, și
+                # NECONDIȚIONAT de balanță/expunere/cadență (rulează înaintea tuturor gate-urilor
+                # de mai jos), ca utilizatorul să vadă în fiecare minut că botul își urmărește activ
+                # portofoliul. ZERO apeluri Groq — doar starea deja reconciliată + un best bid/ask
+                # best-effort. Izolat în try/except ca un eșec de raportare să nu oprească bucla.
+                try:
+                    _log_position_status(account_state)
+                except Exception as exc:
+                    logger.error("[Status] Raportul de status al pozițiilor a eșuat: %s", exc, exc_info=True)
 
                 # --- Separare Cumpărare vs. Vânzare la cash insuficient ---
                 # Sub pragul minim de cash NU mai putem deschide poziții NOI (BUY) — un ordin

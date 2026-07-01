@@ -3229,6 +3229,158 @@ class TestPanicSell:
         mock_ai.assert_not_called()    # token în cooldown → nici nu chemăm Groq
         mock_order.assert_not_called()
 
+    def _two_positions_state(self):
+        """Stare cu 2 poziții deținute — ca testele de rate-limit să poată dovedi break-ul
+        (dacă ciclul continuă, a 2-a poziție e evaluată; dacă se oprește, nu)."""
+        return {
+            "pusd_balance": 5.0,
+            "active_positions": [
+                {"asset_name": "Match A", "token_id": "0xA", "outcome": "1 (A)",
+                 "side": "BUY", "size": 10.0, "avg_price": 0.50},
+                {"asset_name": "Match B", "token_id": "0xB", "outcome": "1 (B)",
+                 "side": "BUY", "size": 10.0, "avg_price": 0.50},
+            ],
+        }
+
+    def _run_multi(self, state, *, side_effect):
+        import main
+        from src import position_manager
+        position_manager._exit_attempts.clear()
+        with patch.object(main, "_PANIC_SELL_ENABLED", True), \
+             patch.object(main, "_last_position_reeval_ts", 0.0), \
+             patch.object(main, "_POSITION_REEVAL_INTERVAL", 1800), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch("main._live_best_bid", return_value=0.30), \
+             patch("main.fetch_free_news", return_value=["news"]), \
+             patch("main.analyse_position_exit", side_effect=side_effect) as mock_ai, \
+             patch("main.place_limit_order") as mock_order:
+            main._reevaluate_active_positions(state)
+        return mock_ai, mock_order
+
+    def test_openai_rate_limit_breaks_cycle_and_warns(self, caplog):
+        """Un `openai.RateLimitError` (HTTP 429 — buget zilnic Groq epuizat) la re-evaluarea
+        unei poziții oprește TOT ciclul: apelurile rămase ar da tot 429. Logăm avertismentul
+        cerut, ieșim (break) și NU mai evaluăm pozițiile următoare — bucla principală continuă.
+        Mesajul excepției e INTENȚIONAT fără „429", ca testul să dovedească prinderea după TIP
+        (`isinstance`), nu doar detecția pe mesaj din `_is_rate_limit_error`."""
+        import logging
+        import httpx
+        import openai
+        state = self._two_positions_state()
+        resp = httpx.Response(429, request=httpx.Request("POST", "https://api.groq.com/v1"))
+        rate_err = openai.RateLimitError("daily token budget exhausted", response=resp, body=None)
+        with caplog.at_level(logging.WARNING):
+            mock_ai, mock_order = self._run_multi(state, side_effect=rate_err)
+        assert mock_ai.call_count == 1           # break la primul 429 → a 2-a poziție neatinsă
+        mock_order.assert_not_called()           # nimic lichidat
+        assert len(state["active_positions"]) == 2
+        assert "Groq API rate limit reached" in caplog.text
+        assert "Skipping remaining position evaluations" in caplog.text
+
+    def test_generic_429_message_breaks_cycle(self):
+        """Un 429 care NU e `openai.RateLimitError` tipat (altă clasă, dar cu „429" în mesaj —
+        ex. înfășurat de tenacity) e prins prin `_is_rate_limit_error` → tot break pe ciclu."""
+        state = self._two_positions_state()
+        mock_ai, mock_order = self._run_multi(
+            state, side_effect=RuntimeError("Error code: 429 rate limit"),
+        )
+        assert mock_ai.call_count == 1           # break, nu iterăm la a doua poziție
+        mock_order.assert_not_called()
+
+    def test_non_rate_limit_error_continues_cycle(self):
+        """Un crash care NU e rate-limit (ex. ValueError) e logat per-poziție dar NU oprește
+        ciclul: pozițiile următoare sunt încă evaluate (robustețea per-poziție existentă)."""
+        state = self._two_positions_state()
+        mock_ai, mock_order = self._run_multi(state, side_effect=ValueError("boom"))
+        assert mock_ai.call_count == 2           # non-rate-limit → ambele poziții încercate
+        mock_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: raport de status per-heartbeat al pozițiilor (_log_position_status)
+# ---------------------------------------------------------------------------
+
+class TestPositionStatusReport:
+    """`_log_position_status`: raport per-heartbeat (60s), PUR informativ și FĂRĂ apel Groq —
+    un rând per poziție cu preț de intrare vs curent (mark + best bid/ask), P/L și ULTIMA
+    decizie AI din memorie (sau „Pending initial AI sync" dacă nu a fost încă evaluată)."""
+
+    def _state(self):
+        return {
+            "pusd_balance": 50.0,
+            "active_positions": [
+                {"asset_name": "Arsenal vs Chelsea", "token_id": "0xA", "outcome": "1 (Arsenal)",
+                 "side": "BUY", "size": 10.0, "avg_price": 0.50, "cur_price": 0.53,
+                 "current_value": 5.3, "initial_value": 5.0, "cash_pnl": 0.30, "percent_pnl": 6.0},
+                {"asset_name": "Lakers vs Celtics", "token_id": "0xB", "outcome": "YES",
+                 "side": "BUY", "size": 8.0, "avg_price": 0.60, "cur_price": 0.58,
+                 "current_value": 4.64, "initial_value": 4.8, "cash_pnl": -0.16, "percent_pnl": -3.3},
+            ],
+        }
+
+    def test_reports_row_per_position_with_ai_and_pending(self, caplog):
+        import logging
+        import main
+        main._last_ai_decision.clear()
+        main._record_ai_decision("0xA", "HOLD", 0.90, "no major development")   # 0xA evaluat
+        with patch("main._live_bid_ask", return_value=(0.52, 0.54)), \
+             patch("main.analyse_position_exit") as mock_groq:
+            with caplog.at_level(logging.INFO):
+                main._log_position_status(self._state())
+        text = caplog.text
+        assert "Urmăresc 2 poziții active" in text                  # header
+        assert "Arsenal vs Chelsea" in text and "1 (Arsenal)" in text
+        assert "Lakers vs Celtics" in text
+        assert "intrare $0.500" in text and "acum $0.530" in text   # intrare vs curent
+        assert "bid $0.520 / ask $0.540" in text                    # bid/ask live
+        assert "$+0.30" in text and "$-0.16" in text                # P/L per poziție
+        assert "AI: HOLD conf 0.90" in text                         # decizia AI cunoscută
+        assert "no major development" in text                       # reason
+        assert "Pending initial AI sync" in text                    # 0xB neevaluat
+        mock_groq.assert_not_called()                               # ESENȚA: zero apeluri Groq
+
+    def test_no_positions_logs_idle_line(self, caplog):
+        import logging
+        import main
+        with caplog.at_level(logging.INFO):
+            main._log_position_status({"pusd_balance": 5.0, "active_positions": []})
+        assert "Nicio poziție activă" in caplog.text
+
+    def test_survives_orderbook_unavailable(self, caplog):
+        import logging
+        import main
+        main._last_ai_decision.clear()
+        # Orderbook indisponibil → (None, None): raportul cade pe mark, fără bloc bid/ask, fără crash.
+        with patch("main._live_bid_ask", return_value=(None, None)):
+            with caplog.at_level(logging.INFO):
+                main._log_position_status(self._state())
+        assert "acum $0.530" in caplog.text        # mark price folosit
+        assert "bid $" not in caplog.text           # niciun bloc bid/ask
+        assert "Pending initial AI sync" in caplog.text
+
+    def test_per_position_error_isolated_no_traceback_spam(self, caplog):
+        import logging
+        import main
+        main._last_ai_decision.clear()
+        calls = {"n": 0}
+
+        def flaky(token_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")     # prima poziție eșuează la formatare
+            return (None, None)
+
+        with patch("main._live_bid_ask", side_effect=flaky):
+            with caplog.at_level(logging.INFO):
+                main._log_position_status(self._state())
+        assert "Nu am putut construi statusul" in caplog.text   # prima prinsă (warning, nu crash)
+        assert "Lakers vs Celtics" in caplog.text               # a doua tot raportată
+
+    def test_format_ai_decision_pending_when_unknown(self):
+        import main
+        main._last_ai_decision.clear()
+        assert main._format_ai_decision("0xUNKNOWN") == "AI: Pending initial AI sync"
+
 
 # ---------------------------------------------------------------------------
 # Tests: _call_groq robustețe pe gpt-oss-20b (model de reasoning) — JSON Mode,
