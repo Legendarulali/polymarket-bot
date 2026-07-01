@@ -48,6 +48,11 @@ _LOOP_INTERVAL = float(os.getenv("LOOP_INTERVAL_SECONDS", "60"))
 # buclei (monitorizarea + vânzarea pozițiilor) rămâne la _LOOP_INTERVAL. 0 = scanează la
 # fiecare buclă (vechiul comportament). În DRY_RUN gate-ul e ignorat (stress-test).
 _SCAN_INTERVAL_SECONDS = max(0.0, float(os.getenv("SCAN_INTERVAL_MINUTES", "15"))) * 60
+# Pauză (secunde) după o excepție neprevăzută prinsă în bucla principală, înainte de a
+# relua AUTOMAT iterația (auto-restart). „Câteva secunde" ca un crash tranzitoriu
+# (ValueError/TypeError/timeout de rețea etc.) să nu trântească tot procesul; configurabil
+# via CRASH_RECOVERY_SLEEP_SECONDS. Minim 1s.
+_CRASH_RECOVERY_SLEEP = max(1.0, float(os.getenv("CRASH_RECOVERY_SLEEP_SECONDS", "5")))
 _LOW_BALANCE_SLEEP = 15 * 60  # standby 15 min la eșec de reconciliere (401/glitch API, fără stare de cont). NU se mai folosește la cash insuficient — acolo doar dezactivăm cumpărarea (allow_new_trades) și rămânem la 60s.
 _CACHE_TTL_SECONDS = 4 * 3600 # cooldown: re-analizează o piață cel mult o dată la 4h (persistat în history.json)
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
@@ -1859,266 +1864,279 @@ def main() -> None:
         # _LOOP_INTERVAL. Pornim de la 0.0 → prima iterație scanează imediat.
         last_scan_time = 0.0
         while RUNNING:
-            # Reconciliere stare cont — apel critic de rețea (CLOB get_balance_allowance
-            # + Data API positions). Îl izolăm într-un try/except: un glitch temporar al
-            # API-ului Polymarket (ex. 401 Unauthorized dintr-o desincronizare de ceas sau
-            # o cheie respinsă tranzitoriu) NU trebuie să trântească tot procesul. Funcția
-            # are deja un retry intern (3×); dacă tot eșuează, intrăm în standby și reîncercăm
-            # runda următoare cu `continue`, în loc să propagăm eroarea în handler-ul fatal.
             try:
-                account_state = get_account_state()
-            except PolyApiException as exc:
-                status = getattr(exc, "status_code", None)
-                if status == 401:
+                # Reconciliere stare cont — apel critic de rețea (CLOB get_balance_allowance
+                # + Data API positions). Îl izolăm într-un try/except: un glitch temporar al
+                # API-ului Polymarket (ex. 401 Unauthorized dintr-o desincronizare de ceas sau
+                # o cheie respinsă tranzitoriu) NU trebuie să trântească tot procesul. Funcția
+                # are deja un retry intern (3×); dacă tot eșuează, intrăm în standby și reîncercăm
+                # runda următoare cu `continue`, în loc să propagăm eroarea în handler-ul fatal.
+                try:
+                    account_state = get_account_state()
+                except PolyApiException as exc:
+                    status = getattr(exc, "status_code", None)
+                    if status == 401:
+                        logger.error(
+                            "[Agent] Eroare temporară de autentificare 401 (Unauthorized/"
+                            "Invalid api key). Posibil glitch API Polymarket sau desincronizare "
+                            "de ceas (clock drift). Reîncerc după standby de %d min...",
+                            _LOW_BALANCE_SLEEP // 60,
+                        )
+                    else:
+                        logger.error(
+                            "[Agent] Eroare API Polymarket la reconciliere (status=%s): %s. "
+                            "Reîncerc după standby de %d min...",
+                            status, exc, _LOW_BALANCE_SLEEP // 60,
+                        )
+                    _interruptible_sleep(_LOW_BALANCE_SLEEP)
+                    continue
+                except Exception as exc:
                     logger.error(
-                        "[Agent] Eroare temporară de autentificare 401 (Unauthorized/"
-                        "Invalid api key). Posibil glitch API Polymarket sau desincronizare "
-                        "de ceas (clock drift). Reîncerc după standby de %d min...",
-                        _LOW_BALANCE_SLEEP // 60,
+                        "[Agent] Reconcilierea stării contului a eșuat (eroare tranzitorie de "
+                        "rețea?): %s. Reîncerc după standby de %d min...",
+                        exc, _LOW_BALANCE_SLEEP // 60, exc_info=True,
                     )
-                else:
-                    logger.error(
-                        "[Agent] Eroare API Polymarket la reconciliere (status=%s): %s. "
-                        "Reîncerc după standby de %d min...",
-                        status, exc, _LOW_BALANCE_SLEEP // 60,
+                    _interruptible_sleep(_LOW_BALANCE_SLEEP)
+                    continue
+
+                pusd_balance: float = account_state.get("pusd_balance", 0.0)
+
+                # Conturile proxy returnează 0 de la /balance-allowance chiar dacă au fonduri.
+                # OVERRIDE_BALANCE permite specificarea balanței reale cunoscute via env var.
+                if settings.OVERRIDE_BALANCE > 0 and pusd_balance == 0.0:
+                    logger.info(
+                        "[Agent] API balanță = 0 (cont proxy) — folosesc OVERRIDE_BALANCE=%.4f pUSD.",
+                        settings.OVERRIDE_BALANCE,
                     )
-                _interruptible_sleep(_LOW_BALANCE_SLEEP)
-                continue
-            except Exception as exc:
-                logger.error(
-                    "[Agent] Reconcilierea stării contului a eșuat (eroare tranzitorie de "
-                    "rețea?): %s. Reîncerc după standby de %d min...",
-                    exc, _LOW_BALANCE_SLEEP // 60, exc_info=True,
-                )
-                _interruptible_sleep(_LOW_BALANCE_SLEEP)
-                continue
+                    pusd_balance = settings.OVERRIDE_BALANCE
+                    account_state = {**account_state, "pusd_balance": pusd_balance}
 
-            pusd_balance: float = account_state.get("pusd_balance", 0.0)
+                # Curățarea cozii (DOAR cu ACTIVATE_QUEUE — altfel coada e complet inertă):
+                # elimină oportunitățile expirate (> _QUEUE_TTL_HOURS) la începutul fiecărei
+                # iterații, ca să nu re-evaluăm teze pe baza unor știri perimate.
+                if _ACTIVATE_QUEUE:
+                    try:
+                        _clean_queue()
+                    except Exception as exc:
+                        logger.error("[Queue] Curățarea cozii a eșuat: %s", exc, exc_info=True)
 
-            # Conturile proxy returnează 0 de la /balance-allowance chiar dacă au fonduri.
-            # OVERRIDE_BALANCE permite specificarea balanței reale cunoscute via env var.
-            if settings.OVERRIDE_BALANCE > 0 and pusd_balance == 0.0:
-                logger.info(
-                    "[Agent] API balanță = 0 (cont proxy) — folosesc OVERRIDE_BALANCE=%.4f pUSD.",
-                    settings.OVERRIDE_BALANCE,
-                )
-                pusd_balance = settings.OVERRIDE_BALANCE
-                account_state = {**account_state, "pusd_balance": pusd_balance}
-
-            # Curățarea cozii (DOAR cu ACTIVATE_QUEUE — altfel coada e complet inertă):
-            # elimină oportunitățile expirate (> _QUEUE_TTL_HOURS) la începutul fiecărei
-            # iterații, ca să nu re-evaluăm teze pe baza unor știri perimate.
-            if _ACTIVATE_QUEUE:
+                # Raport orar P/L pe Discord. Rulează înaintea verificării de balanță
+                # ca să continue și când fondurile sunt insuficiente (cu cash insuficient
+                # se dezactivează doar cumpărarea, dar bucla rulează în continuare la 60s,
+                # deci raportul tot iese la timp).
                 try:
-                    _clean_queue()
+                    _maybe_send_pnl_report(account_state)
                 except Exception as exc:
-                    logger.error("[Queue] Curățarea cozii a eșuat: %s", exc, exc_info=True)
+                    logger.error("[Agent] Raport P/L eșuat: %s", exc, exc_info=True)
 
-            # Raport orar P/L pe Discord. Rulează înaintea verificării de balanță
-            # ca să continue și când fondurile sunt insuficiente (cu cash insuficient
-            # se dezactivează doar cumpărarea, dar bucla rulează în continuare la 60s,
-            # deci raportul tot iese la timp).
-            try:
-                _maybe_send_pnl_report(account_state)
-            except Exception as exc:
-                logger.error("[Agent] Raport P/L eșuat: %s", exc, exc_info=True)
+                # Verifică TP/SL pe pozițiile deschise (opt-in via TAKE_PROFIT_PCT /
+                # STOP_LOSS_PCT). Rulează înainte de verificarea de balanță: vânzarea (SELL)
+                # trebuie să funcționeze și când nu mai sunt fonduri de cumpărare — pentru a
+                # vinde avem nevoie doar de token-urile deja deținute. Cu cash insuficient
+                # bucla NU mai doarme 15 min, deci acest check (protecția pozițiilor) se reia
+                # la fiecare 60s, nu o dată pe sfert de oră. În DRY_RUN sărim complet: TP/SL
+                # plasează ordine SELL REALE (prin position_manager, nu prin _execute_trade)
+                # → nimic nu trebuie să ajungă pe lanț.
+                if not _DRY_RUN:
+                    try:
+                        check_exit_conditions(account_state)
+                    except Exception as exc:
+                        logger.error("[Agent] Exit check eșuat: %s", exc, exc_info=True)
 
-            # Verifică TP/SL pe pozițiile deschise (opt-in via TAKE_PROFIT_PCT /
-            # STOP_LOSS_PCT). Rulează înainte de verificarea de balanță: vânzarea (SELL)
-            # trebuie să funcționeze și când nu mai sunt fonduri de cumpărare — pentru a
-            # vinde avem nevoie doar de token-urile deja deținute. Cu cash insuficient
-            # bucla NU mai doarme 15 min, deci acest check (protecția pozițiilor) se reia
-            # la fiecare 60s, nu o dată pe sfert de oră. În DRY_RUN sărim complet: TP/SL
-            # plasează ordine SELL REALE (prin position_manager, nu prin _execute_trade)
-            # → nimic nu trebuie să ajungă pe lanț.
-            if not _DRY_RUN:
-                try:
-                    check_exit_conditions(account_state)
-                except Exception as exc:
-                    logger.error("[Agent] Exit check eșuat: %s", exc, exc_info=True)
+                # STEP 4 — Panic Sell: re-evaluare pe ȘTIRI a pozițiilor deținute (opt-in via
+                # PANIC_SELL_ENABLED, throttle intern pe interval). La fel ca TP/SL: rulează ÎNAINTE
+                # de gate-ul de balanță (SELL nu cere cash) și e sărit în DRY_RUN (plasează SELL-uri
+                # REALE prin place_limit_order, nu prin _execute_trade interceptat).
+                if not _DRY_RUN:
+                    try:
+                        _reevaluate_active_positions(account_state)
+                    except Exception as exc:
+                        logger.error("[PanicSell] Re-evaluarea pozițiilor a eșuat: %s", exc, exc_info=True)
 
-            # STEP 4 — Panic Sell: re-evaluare pe ȘTIRI a pozițiilor deținute (opt-in via
-            # PANIC_SELL_ENABLED, throttle intern pe interval). La fel ca TP/SL: rulează ÎNAINTE
-            # de gate-ul de balanță (SELL nu cere cash) și e sărit în DRY_RUN (plasează SELL-uri
-            # REALE prin place_limit_order, nu prin _execute_trade interceptat).
-            if not _DRY_RUN:
-                try:
-                    _reevaluate_active_positions(account_state)
-                except Exception as exc:
-                    logger.error("[PanicSell] Re-evaluarea pozițiilor a eșuat: %s", exc, exc_info=True)
-
-            # --- Separare Cumpărare vs. Vânzare la cash insuficient ---
-            # Sub pragul minim de cash NU mai putem deschide poziții NOI (BUY) — un ordin
-            # ar fi oricum blocat în `_execute_trade`. DAR pozițiile deschise rămân expuse:
-            # pentru a le ÎNCHIDE (SELL / TP / SL) avem nevoie doar de token-urile deja
-            # deținute, nu de cash. De aceea NU mai intrăm în standby 15 min cu `continue`
-            # (ne-ar lăsa pozițiile nemonitorizate un sfert de oră); doar DEZACTIVĂM modul
-            # de cumpărare (`allow_new_trades=False`) și păstrăm bucla la cadența normală
-            # de 60s, ca reconcilierea + check_exit_conditions (deja rulate mai sus, fără
-            # cash) să se reia la fiecare minut.
-            #
-            # `allow_new_trades` e firul roșu care, dus în _process_queue / _scan_markets /
-            # _apply_decision → _execute_trade, blochează STRICT orice BUY, lăsând SELL-urile
-            # (check_exit_conditions, în afara acestui flux) neatinse. În DRY_RUN rămâne True
-            # (oricum nu pleacă niciun ordin real — _execute_trade e interceptat la intrare).
-            allow_new_trades = _DRY_RUN or pusd_balance >= _MIN_BALANCE_PUSD
-            if not allow_new_trades:
-                logger.warning(
-                    "[Agent] Cash insuficient pentru achiziții noi (%.4f pUSD < $%.2f). "
-                    "Modul de cumpărare este dezactivat — continui să monitorizez și pot "
-                    "vinde pozițiile existente (TP/SL/exit rămân active).",
-                    pusd_balance, _MIN_BALANCE_PUSD,
-                )
-                # Scanarea masivă produce DOAR decizii de cumpărare (BUY) pe piețe noi —
-                # toate ar fi blocate acum → ar irosi degeaba bugetul de tokeni Groq (vezi
-                # filtrul STRICT/batching). O sărim; protecția pozițiilor vine din exit
-                # checks (SELL), rulate deja mai sus și reluate la următoarea iterație (60s).
-                _interruptible_sleep(_LOOP_INTERVAL)
-                continue
-            if _DRY_RUN and pusd_balance < _MIN_BALANCE_PUSD:
-                logger.info(
-                    "[DRY_RUN] Balanță %.4f sub $%.2f — ignor gate-ul de balanță și "
-                    "continui scanarea (simulare).", pusd_balance, _MIN_BALANCE_PUSD,
-                )
-
-            # Limită globală de expunere
-            n_open = len(account_state.get("active_positions", []))
-            maxed = (
-                settings.MAX_ACTIVE_POSITIONS > 0
-                and n_open >= settings.MAX_ACTIVE_POSITIONS
-            )
-            # Fără ACTIVATE_QUEUE: MAX poziții = standby (comportament implicit — nu
-            # irosim API calls scanând când nu putem deschide nimic). Cu ACTIVATE_QUEUE
-            # NU dormim: scanăm ca să construim wishlist-ul (piețele aprobate de AI sunt
-            # salvate în next_in_line.json pentru când se eliberează un slot).
-            # În DRY_RUN nu dormim nici la MAX poziții: vrem să scanăm și să trimitem loturi
-            # către Groq (nu deschidem nimic oricum — _execute_trade e interceptat).
-            if maxed and not _ACTIVATE_QUEUE and not _DRY_RUN:
-                logger.info(
-                    "[Agent] Limită de expunere atinsă: %d/%d poziții deschise. "
-                    "Nu se deschid poziții noi. Aștept...",
-                    n_open,
-                    settings.MAX_ACTIVE_POSITIONS,
-                )
-                _interruptible_sleep(_LOOP_INTERVAL)
-                continue
-
-            # Procesare PRIORITARĂ a cozii (DOAR cu ACTIVATE_QUEUE și DOAR când avem
-            # sloturi libere): re-evaluăm wishlist-ul și deschidem pozițiile aprobate
-            # ÎNAINTE de scanarea masivă. La MAX poziții n-am putea deschide nimic, deci
-            # sărim execuția și mergem direct la scanare (care doar va alimenta wishlist-ul).
-            if _ACTIVATE_QUEUE and not maxed:
-                try:
-                    _process_queue(account_state, allow_new_trades=allow_new_trades)
-                except Exception as exc:
-                    logger.error("[Queue] Procesarea cozii a eșuat: %s", exc, exc_info=True)
-
-                # Coada poate epuiza fondurile: dacă balanța a scăzut sub minim, dezactivăm
-                # cumpărarea și sărim scanarea masivă (ar produce doar BUY-uri blocate). NU
-                # dormim 15 min — păstrăm cadența de 60s ca pozițiile să rămână monitorizate
-                # (exit/SELL se reia la următoarea iterație).
-                if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
-                    allow_new_trades = False
+                # --- Separare Cumpărare vs. Vânzare la cash insuficient ---
+                # Sub pragul minim de cash NU mai putem deschide poziții NOI (BUY) — un ordin
+                # ar fi oricum blocat în `_execute_trade`. DAR pozițiile deschise rămân expuse:
+                # pentru a le ÎNCHIDE (SELL / TP / SL) avem nevoie doar de token-urile deja
+                # deținute, nu de cash. De aceea NU mai intrăm în standby 15 min cu `continue`
+                # (ne-ar lăsa pozițiile nemonitorizate un sfert de oră); doar DEZACTIVĂM modul
+                # de cumpărare (`allow_new_trades=False`) și păstrăm bucla la cadența normală
+                # de 60s, ca reconcilierea + check_exit_conditions (deja rulate mai sus, fără
+                # cash) să se reia la fiecare minut.
+                #
+                # `allow_new_trades` e firul roșu care, dus în _process_queue / _scan_markets /
+                # _apply_decision → _execute_trade, blochează STRICT orice BUY, lăsând SELL-urile
+                # (check_exit_conditions, în afara acestui flux) neatinse. În DRY_RUN rămâne True
+                # (oricum nu pleacă niciun ordin real — _execute_trade e interceptat la intrare).
+                allow_new_trades = _DRY_RUN or pusd_balance >= _MIN_BALANCE_PUSD
+                if not allow_new_trades:
                     logger.warning(
-                        "[Agent] Fonduri epuizate la procesarea cozii — modul de cumpărare "
-                        "dezactivat; sar scanarea, dar continui monitorizarea pozițiilor.",
+                        "[Agent] Cash insuficient pentru achiziții noi (%.4f pUSD < $%.2f). "
+                        "Modul de cumpărare este dezactivat — continui să monitorizez și pot "
+                        "vinde pozițiile existente (TP/SL/exit rămân active).",
+                        pusd_balance, _MIN_BALANCE_PUSD,
+                    )
+                    # Scanarea masivă produce DOAR decizii de cumpărare (BUY) pe piețe noi —
+                    # toate ar fi blocate acum → ar irosi degeaba bugetul de tokeni Groq (vezi
+                    # filtrul STRICT/batching). O sărim; protecția pozițiilor vine din exit
+                    # checks (SELL), rulate deja mai sus și reluate la următoarea iterație (60s).
+                    _interruptible_sleep(_LOOP_INTERVAL)
+                    continue
+                if _DRY_RUN and pusd_balance < _MIN_BALANCE_PUSD:
+                    logger.info(
+                        "[DRY_RUN] Balanță %.4f sub $%.2f — ignor gate-ul de balanță și "
+                        "continui scanarea (simulare).", pusd_balance, _MIN_BALANCE_PUSD,
+                    )
+
+                # Limită globală de expunere
+                n_open = len(account_state.get("active_positions", []))
+                maxed = (
+                    settings.MAX_ACTIVE_POSITIONS > 0
+                    and n_open >= settings.MAX_ACTIVE_POSITIONS
+                )
+                # Fără ACTIVATE_QUEUE: MAX poziții = standby (comportament implicit — nu
+                # irosim API calls scanând când nu putem deschide nimic). Cu ACTIVATE_QUEUE
+                # NU dormim: scanăm ca să construim wishlist-ul (piețele aprobate de AI sunt
+                # salvate în next_in_line.json pentru când se eliberează un slot).
+                # În DRY_RUN nu dormim nici la MAX poziții: vrem să scanăm și să trimitem loturi
+                # către Groq (nu deschidem nimic oricum — _execute_trade e interceptat).
+                if maxed and not _ACTIVATE_QUEUE and not _DRY_RUN:
+                    logger.info(
+                        "[Agent] Limită de expunere atinsă: %d/%d poziții deschise. "
+                        "Nu se deschid poziții noi. Aștept...",
+                        n_open,
+                        settings.MAX_ACTIVE_POSITIONS,
                     )
                     _interruptible_sleep(_LOOP_INTERVAL)
                     continue
 
-            # --- Cadența scanării masive (decuplată de heartbeat) ---
-            # Reconcilierea + exit-urile (TP/SL/Panic Sell) + coada au rulat deja la acest
-            # heartbeat (60s). Scanarea masivă (fetch Gamma + Groq pe sute de piețe) e însă
-            # costisitoare → o rulăm cel mult o dată la _SCAN_INTERVAL_SECONDS. În DRY_RUN o
-            # rulăm la fiecare buclă (stress-test de rate-limit); 0 = dezactivat (scanează mereu).
-            now = time.time()
-            scan_due = (
-                _DRY_RUN
-                or _SCAN_INTERVAL_SECONDS <= 0
-                or (now - last_scan_time) >= _SCAN_INTERVAL_SECONDS
-            )
-            if not scan_due:
-                logger.debug(
-                    "[Agent] Scanare amânată: %.0f/%.0fs scurse. Heartbeat la %.0fs — "
-                    "monitorizez și pot vinde pozițiile existente între scanări.",
-                    now - last_scan_time, _SCAN_INTERVAL_SECONDS, _LOOP_INTERVAL,
+                # Procesare PRIORITARĂ a cozii (DOAR cu ACTIVATE_QUEUE și DOAR când avem
+                # sloturi libere): re-evaluăm wishlist-ul și deschidem pozițiile aprobate
+                # ÎNAINTE de scanarea masivă. La MAX poziții n-am putea deschide nimic, deci
+                # sărim execuția și mergem direct la scanare (care doar va alimenta wishlist-ul).
+                if _ACTIVATE_QUEUE and not maxed:
+                    try:
+                        _process_queue(account_state, allow_new_trades=allow_new_trades)
+                    except Exception as exc:
+                        logger.error("[Queue] Procesarea cozii a eșuat: %s", exc, exc_info=True)
+
+                    # Coada poate epuiza fondurile: dacă balanța a scăzut sub minim, dezactivăm
+                    # cumpărarea și sărim scanarea masivă (ar produce doar BUY-uri blocate). NU
+                    # dormim 15 min — păstrăm cadența de 60s ca pozițiile să rămână monitorizate
+                    # (exit/SELL se reia la următoarea iterație).
+                    if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+                        allow_new_trades = False
+                        logger.warning(
+                            "[Agent] Fonduri epuizate la procesarea cozii — modul de cumpărare "
+                            "dezactivat; sar scanarea, dar continui monitorizarea pozițiilor.",
+                        )
+                        _interruptible_sleep(_LOOP_INTERVAL)
+                        continue
+
+                # --- Cadența scanării masive (decuplată de heartbeat) ---
+                # Reconcilierea + exit-urile (TP/SL/Panic Sell) + coada au rulat deja la acest
+                # heartbeat (60s). Scanarea masivă (fetch Gamma + Groq pe sute de piețe) e însă
+                # costisitoare → o rulăm cel mult o dată la _SCAN_INTERVAL_SECONDS. În DRY_RUN o
+                # rulăm la fiecare buclă (stress-test de rate-limit); 0 = dezactivat (scanează mereu).
+                now = time.time()
+                scan_due = (
+                    _DRY_RUN
+                    or _SCAN_INTERVAL_SECONDS <= 0
+                    or (now - last_scan_time) >= _SCAN_INTERVAL_SECONDS
                 )
-                _interruptible_sleep(_LOOP_INTERVAL)
-                continue
-            last_scan_time = now
-
-            if maxed:  # _ACTIVATE_QUEUE sau _DRY_RUN (altfel am fi făcut deja continue)
-                if _DRY_RUN:
-                    logger.info(
-                        "[DRY_RUN] Limită de expunere atinsă (%d/%d) — ignor și scanez ca "
-                        "să trimit loturi către Groq (simulare).",
-                        n_open, settings.MAX_ACTIVE_POSITIONS,
+                if not scan_due:
+                    logger.debug(
+                        "[Agent] Scanare amânată: %.0f/%.0fs scurse. Heartbeat la %.0fs — "
+                        "monitorizez și pot vinde pozițiile existente între scanări.",
+                        now - last_scan_time, _SCAN_INTERVAL_SECONDS, _LOOP_INTERVAL,
                     )
-                else:
+                    _interruptible_sleep(_LOOP_INTERVAL)
+                    continue
+                last_scan_time = now
+
+                if maxed:  # _ACTIVATE_QUEUE sau _DRY_RUN (altfel am fi făcut deja continue)
+                    if _DRY_RUN:
+                        logger.info(
+                            "[DRY_RUN] Limită de expunere atinsă (%d/%d) — ignor și scanez ca "
+                            "să trimit loturi către Groq (simulare).",
+                            n_open, settings.MAX_ACTIVE_POSITIONS,
+                        )
+                    else:
+                        logger.info(
+                            "[Agent] Limită de expunere atinsă (%d/%d) — ACTIVATE_QUEUE activ: "
+                            "scanez pentru wishlist (next_in_line.json), fără a deschide poziții noi.",
+                            n_open, settings.MAX_ACTIVE_POSITIONS,
+                        )
+
+                markets = fetch_active_markets()
+                if not markets:
+                    logger.warning("[Agent] Nicio piață activă găsită. Aștept...")
+                    _interruptible_sleep(_LOOP_INTERVAL)
+                    continue
+
+                # Filtrare pe baza istoricului persistent (history.json) ÎNAINTE de procesare:
+                # ignoră piețele analizate în ultimele _CACHE_TTL_SECONDS (cooldown).
+                total_fetched = len(markets)
+                markets = [m for m in markets if not _is_recently_analyzed(str(m.get("id", "?")))]
+                skipped = total_fetched - len(markets)
+                if skipped:
                     logger.info(
-                        "[Agent] Limită de expunere atinsă (%d/%d) — ACTIVATE_QUEUE activ: "
-                        "scanez pentru wishlist (next_in_line.json), fără a deschide poziții noi.",
-                        n_open, settings.MAX_ACTIVE_POSITIONS,
+                        "[History] %d/%d piețe deja analizate recent — filtrate. Rămân %d.",
+                        skipped, total_fetched, len(markets),
                     )
+                if not markets:
+                    logger.info("[Agent] Toate piețele active au fost analizate recent. Aștept...")
+                    _interruptible_sleep(_LOOP_INTERVAL)
+                    continue
 
-            markets = fetch_active_markets()
-            if not markets:
-                logger.warning("[Agent] Nicio piață activă găsită. Aștept...")
-                _interruptible_sleep(_LOOP_INTERVAL)
-                continue
+                # STEP 2 (anti-429): filtru STRICT — reduce DRASTIC câte piețe ajung la Groq
+                # (poziție deschisă / volum mare / keyword de interes, apoi plafonat). Vezi
+                # _strict_prefilter. STRICT_FILTER=false dezactivează complet acest pas.
+                markets = _strict_prefilter(markets, account_state)
+                if not markets:
+                    logger.info("[StrictFilter] Nicio piață nu trece filtrul strict în această rundă. Aștept...")
+                    _interruptible_sleep(_LOOP_INTERVAL)
+                    continue
 
-            # Filtrare pe baza istoricului persistent (history.json) ÎNAINTE de procesare:
-            # ignoră piețele analizate în ultimele _CACHE_TTL_SECONDS (cooldown).
-            total_fetched = len(markets)
-            markets = [m for m in markets if not _is_recently_analyzed(str(m.get("id", "?")))]
-            skipped = total_fetched - len(markets)
-            if skipped:
+                # Amestecă, apoi prioritizează meciurile (head-to-head, adesea iminente):
+                # un sort STABIL le aduce în față, păstrând ordinea aleatorie în interiorul
+                # fiecărui grup. Astfel meciurile sunt analizate înaintea limitelor de
+                # poziții/balanță sau a throttle-ului care s-ar putea atinge în timpul scanării.
+                random.shuffle(markets)
+                markets.sort(key=lambda m: not _is_match_market(m))
+                n_matches = sum(1 for m in markets if _is_match_market(m))
                 logger.info(
-                    "[History] %d/%d piețe deja analizate recent — filtrate. Rămân %d.",
-                    skipped, total_fetched, len(markets),
+                    "[Agent] Procesez %d piețe active (%d meciuri prioritizate la început).",
+                    len(markets), n_matches,
                 )
-            if not markets:
-                logger.info("[Agent] Toate piețele active au fost analizate recent. Aștept...")
+                # Scanare cu analiză în LOTURI (sau individual dacă BATCH_SIZE<=1). Gate-ul
+                # de balanță intra-scanare și throttle-ul (un singur sleep per lot/analiză)
+                # sunt încapsulate în `_scan_markets`, care resetează și `_scan_stats`.
+                # `allow_new_trades` (True aici — altfel am fi făcut deja continue, exceptând
+                # DRY_RUN) e dus până la `_execute_trade`, gardul comun de blocare a BUY-urilor.
+                _scan_markets(markets, account_state, allow_new_trades=allow_new_trades)
+
+                # Sumar de filtrare: ce a oprit piețele. Cheia pentru a vedea DE CE
+                # „ignoră" botul tot — ex: {'volum mic': 195, 'analizate (LLM)': 3}.
+                # Lista piețelor scanate rămâne STRICT în consolă/loguri (vezi logurile
+                # „[Agent] Procesez piața ..." de mai sus) — pe Discord nu se trimite
+                # nimic per buclă, doar raportul periodic din _maybe_send_pnl_report.
+                logger.info("[Scan] Rezultat filtrare pe %d piețe: %s",
+                            len(markets), dict(_scan_stats) or "nimic procesat")
+
                 _interruptible_sleep(_LOOP_INTERVAL)
-                continue
 
-            # STEP 2 (anti-429): filtru STRICT — reduce DRASTIC câte piețe ajung la Groq
-            # (poziție deschisă / volum mare / keyword de interes, apoi plafonat). Vezi
-            # _strict_prefilter. STRICT_FILTER=false dezactivează complet acest pas.
-            markets = _strict_prefilter(markets, account_state)
-            if not markets:
-                logger.info("[StrictFilter] Nicio piață nu trece filtrul strict în această rundă. Aștept...")
-                _interruptible_sleep(_LOOP_INTERVAL)
-                continue
-
-            # Amestecă, apoi prioritizează meciurile (head-to-head, adesea iminente):
-            # un sort STABIL le aduce în față, păstrând ordinea aleatorie în interiorul
-            # fiecărui grup. Astfel meciurile sunt analizate înaintea limitelor de
-            # poziții/balanță sau a throttle-ului care s-ar putea atinge în timpul scanării.
-            random.shuffle(markets)
-            markets.sort(key=lambda m: not _is_match_market(m))
-            n_matches = sum(1 for m in markets if _is_match_market(m))
-            logger.info(
-                "[Agent] Procesez %d piețe active (%d meciuri prioritizate la început).",
-                len(markets), n_matches,
-            )
-            # Scanare cu analiză în LOTURI (sau individual dacă BATCH_SIZE<=1). Gate-ul
-            # de balanță intra-scanare și throttle-ul (un singur sleep per lot/analiză)
-            # sunt încapsulate în `_scan_markets`, care resetează și `_scan_stats`.
-            # `allow_new_trades` (True aici — altfel am fi făcut deja continue, exceptând
-            # DRY_RUN) e dus până la `_execute_trade`, gardul comun de blocare a BUY-urilor.
-            _scan_markets(markets, account_state, allow_new_trades=allow_new_trades)
-
-            # Sumar de filtrare: ce a oprit piețele. Cheia pentru a vedea DE CE
-            # „ignoră" botul tot — ex: {'volum mic': 195, 'analizate (LLM)': 3}.
-            # Lista piețelor scanate rămâne STRICT în consolă/loguri (vezi logurile
-            # „[Agent] Procesez piața ..." de mai sus) — pe Discord nu se trimite
-            # nimic per buclă, doar raportul periodic din _maybe_send_pnl_report.
-            logger.info("[Scan] Rezultat filtrare pe %d piețe: %s",
-                        len(markets), dict(_scan_stats) or "nimic procesat")
-
-            _interruptible_sleep(_LOOP_INTERVAL)
-
+            except Exception as exc:
+                # Plasă de siguranță per-iterație: prindem ORICE excepție neprevăzută
+                # (ValueError/TypeError/timeout de rețea etc.) ca un crash într-o rundă să
+                # NU trântească tot procesul. O logăm cu traceback complet, dormim câteva
+                # secunde și RELUĂM automat bucla (auto-restart) în loc să ieșim. SIGTERM/
+                # SIGINT rămân onorate: _interruptible_sleep verifică RUNNING în timpul pauzei.
+                logger.critical(
+                    "[Agent] Excepție neprevăzută în bucla principală (%s) — prinsă ca să"
+                    " nu cadă tot procesul; reiau automat după %.0fs.",
+                    exc, _CRASH_RECOVERY_SLEEP, exc_info=True,
+                )
+                _interruptible_sleep(_CRASH_RECOVERY_SLEEP)
     except Exception as exc:
         logger.critical("Unhandled exception in event loop: %s", exc, exc_info=True)
     finally:
