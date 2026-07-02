@@ -19,6 +19,12 @@ class Settings:
     X_API_BEARER_TOKEN: str = os.getenv("X_API_BEARER_TOKEN", "")
     NEWS_API_KEY: str = os.getenv("NEWS_API_KEY", "")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    # FAILSAFE ROUTING: cheie OpenRouter (gol = dezactivat). Când Groq eșuează (în special
+    # 429 rate-limit / TPD epuizat), apelul LLM se rutează SILENȚIOS către OpenRouter ca
+    # backup (vezi src/ai_analyser._call_groq). Fără cheie → niciun fallback (comportament
+    # identic cu cel dinainte). OPENROUTER_MODEL: model gratuit/ieftin pe OpenRouter.
+    OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+    OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
     # Tipuri de semnătură (py-clob-client-v2): 0=EOA, 1=POLY_PROXY (Magic),
     # 2=POLY_GNOSIS_SAFE, 3=POLY_1271/EIP-1271 (conturi proxy — confirmat
     # funcțional pentru acest cont). Notă: cu chei API explicite, ordinele

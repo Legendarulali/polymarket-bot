@@ -9,6 +9,7 @@ from src.news_monitor import serialize_news_to_markdown
 logger = logging.getLogger(__name__)
 
 _client: OpenAI | None = None
+_openrouter_client: OpenAI | None = None
 _MIN_CONFIDENCE = 0.0
 _MAX_TITLE_LEN = 150
 # Modelul Groq folosit pentru TOATE analizele (individual + batch): gpt-oss-20b — modelul
@@ -41,6 +42,18 @@ def _get_groq_client() -> OpenAI:
             api_key=settings.GROQ_API_KEY,
         )
     return _client
+
+
+def _get_openrouter_client() -> OpenAI:
+    """Client OpenRouter (OpenAI-compatibil) pentru FALLBACK când Groq eșuează. Construit leneș
+    și doar dacă OPENROUTER_API_KEY e setat (verificat de apelant, _call_groq)."""
+    global _openrouter_client
+    if _openrouter_client is None:
+        _openrouter_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=settings.OPENROUTER_API_KEY,
+        )
+    return _openrouter_client
 
 
 def _sanitize(text: str, max_len: int) -> str:
@@ -116,45 +129,38 @@ def _build_match_prompt(home: str, away: str, candidates: list[dict], news_items
     )
 
 
-@retry(
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    stop=stop_after_attempt(4),
-    reraise=True,
-)
-def _call_groq(client: OpenAI, prompt: str, max_tokens: int = 768, *, json_object: bool = True) -> str:
-    """Apelează Groq API cu retry exponential. Ridică excepția dacă toate încercările eșuează.
-
-    Reglat pentru gpt-oss-20b, care e un model de RAȚIONAMENT (generează tokeni de „reasoning"
-    ÎNAINTE de răspunsul final, scăzuți din bugetul `max_tokens`):
-      - `reasoning_effort='low'` (via extra_body, independent de versiunea SDK) ține reasoning-ul
-        scurt → răspunsul JSON încape în buget (nu mai vine `content` GOL, cauza erorii de parsare
-        la reevaluarea pozițiilor) ȘI consumă mult mai puțini tokeni (esențial pentru limita TPD
-        a Groq pe un model de reasoning).
-      - `max_tokens` e PLAFON, nu consum (modelul se oprește când termină); mai generos decât la
-        vechiul model non-reasoning (150) ca răspunsul final să nu fie tăiat după reasoning.
-      - JSON Mode (`response_format={'type':'json_object'}`, doar când `json_object=True`) forțează
-        `content` să fie un OBIECT JSON valid, fără text liber în jur. Promptul conține deja „JSON"
-        (cerut de Groq pentru acest mod). NU se folosește la batch, care cere un ARRAY de top-level
-        (`json_object=False`) → acolo ne bazăm pe extragerea robustă din `_extract_json_array`."""
+def _chat_completion(
+    client: OpenAI, model: str, prompt: str, max_tokens: int, *, json_object: bool, reasoning: bool
+) -> str:
+    """UN singur apel chat-completions către `client`/`model` + extragerea `content`-ului. Fără
+    retry, fără fallback (orchestrarea e în _call_groq). Reglat pentru gpt-oss-20b (Groq), model
+    de RAȚIONAMENT care generează tokeni de „reasoning" ÎNAINTE de răspunsul final:
+      - `reasoning_effort='low'` (via extra_body) — trimis DOAR când `reasoning=True` (calea Groq;
+        e specific gpt-oss, deci NU pe fallback-ul OpenRouter) — ține reasoning-ul scurt → JSON-ul
+        încape în buget (nu mai vine `content` GOL) și consumă mult mai puțini tokeni (limita TPD).
+      - `max_tokens` e PLAFON, nu consum; generos ca răspunsul final să nu fie tăiat după reasoning.
+      - JSON Mode (`response_format`, doar când `json_object=True`) forțează un OBIECT JSON valid;
+        NU la batch, care cere un ARRAY de top-level → acolo ne bazăm pe `_extract_json_array`."""
     create_kwargs: dict = {
-        "model": _MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
         "max_tokens": max_tokens,
+    }
+    if reasoning:
         # reasoning_effort e specific gpt-oss; prin extra_body ajunge în corpul cererii
         # indiferent de versiunea SDK-ului OpenAI.
-        "extra_body": {"reasoning_effort": "low"},
-    }
+        create_kwargs["extra_body"] = {"reasoning_effort": "low"}
     if json_object:
         create_kwargs["response_format"] = {"type": "json_object"}
     response = client.chat.completions.create(**create_kwargs)
-    # Loghează consumul de tokeni raportat de Groq → ca să verificăm reducerea în loguri
-    # (după compresia Markdown a știrilor) și să urmărim apropierea de limita TPD.
+    # Loghează consumul de tokeni raportat de provider → ca să urmărim reducerea și apropierea
+    # de limita TPD (și ce provider a servit efectiv cererea, Groq vs fallback OpenRouter).
     usage = getattr(response, "usage", None)
     if usage is not None:
         logger.info(
-            "[Groq] model=%s | tokens: prompt=%s completion=%s total=%s",
-            _MODEL,
+            "[LLM] model=%s | tokens: prompt=%s completion=%s total=%s",
+            model,
             getattr(usage, "prompt_tokens", "?"),
             getattr(usage, "completion_tokens", "?"),
             getattr(usage, "total_tokens", "?"),
@@ -164,10 +170,60 @@ def _call_groq(client: OpenAI, prompt: str, max_tokens: int = 768, *, json_objec
     content = (response.choices[0].message.content or "").strip()
     if not content:
         logger.warning(
-            "[Groq] model=%s a întors content GOL (probabil reasoning a consumat tot bugetul) "
-            "— crește max_tokens sau verifică reasoning_effort.", _MODEL,
+            "[LLM] model=%s a întors content GOL (probabil reasoning a consumat tot bugetul) "
+            "— crește max_tokens sau verifică reasoning_effort.", model,
         )
     return content
+
+
+@retry(
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    stop=stop_after_attempt(4),
+    reraise=True,
+)
+def _call_groq_with_retry(client: OpenAI, prompt: str, max_tokens: int, json_object: bool) -> str:
+    """Apelul PRIMAR Groq (gpt-oss-20b) cu retry exponential (4 încercări). Ridică ultima excepție
+    dacă toate eșuează → _call_groq decide fallback-ul OpenRouter."""
+    return _chat_completion(client, _MODEL, prompt, max_tokens, json_object=json_object, reasoning=True)
+
+
+def _call_openrouter(prompt: str, max_tokens: int, json_object: bool) -> str:
+    """FALLBACK: același prompt către OpenRouter (model gratuit/ieftin din settings.OPENROUTER_MODEL),
+    când Groq eșuează. Model non-gpt-oss → NU trimitem `reasoning_effort`. O SINGURĂ încercare (fără
+    retry): dacă și acesta pică, _call_groq propagă eroarea Groq originală."""
+    client = _get_openrouter_client()
+    return _chat_completion(
+        client, settings.OPENROUTER_MODEL, prompt, max_tokens, json_object=json_object, reasoning=False
+    )
+
+
+def _call_groq(client: OpenAI, prompt: str, max_tokens: int = 768, *, json_object: bool = True) -> str:
+    """Apel LLM principal: Groq (gpt-oss-20b) cu retry; la ORICE eșec (în special 429 rate-limit /
+    TPD epuizat) rutează SILENȚIOS către OpenRouter ca backup, DACĂ OPENROUTER_API_KEY e setat.
+
+    Dacă OpenRouter lipsește (fără cheie) sau eșuează și el, propagă eroarea Groq ORIGINALĂ — deci
+    logica de rate-limit din apelanți (backoff la batch, break la Panic Sell) rămâne intactă. Fără
+    cheie OpenRouter, comportamentul e identic cu cel dinainte (doar Groq + retry).
+
+    Semnătura (clientul Groq ca prim argument) e păstrată pentru apelanți/teste: calea primară
+    folosește `client`; fallback-ul își construiește propriul client OpenRouter."""
+    try:
+        return _call_groq_with_retry(client, prompt, max_tokens, json_object)
+    except Exception as groq_exc:
+        if not settings.OPENROUTER_API_KEY:
+            raise
+        logger.warning(
+            "[AIAnalyser] Groq indisponibil (%s) — fallback silențios pe OpenRouter (model=%s).",
+            groq_exc, settings.OPENROUTER_MODEL,
+        )
+        try:
+            return _call_openrouter(prompt, max_tokens, json_object)
+        except Exception as or_exc:
+            logger.error(
+                "[AIAnalyser] Fallback OpenRouter a eșuat (%s) — propag eroarea Groq originală.",
+                or_exc,
+            )
+            raise groq_exc
 
 
 def analyse_market(market_title: str, current_price: float, news_items: list[str]) -> dict:

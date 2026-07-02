@@ -3196,9 +3196,10 @@ class TestAnalysePositionExit:
 # ---------------------------------------------------------------------------
 
 class TestPanicSell:
-    """`_reevaluate_active_positions`: re-evaluează pozițiile deținute pe știri și lichidează
-    (SELL la best bid) cele invalidate de Groq, INDEPENDENT de cash și ocolind `_execute_trade`.
-    Opt-in (PANIC_SELL_ENABLED), cu throttle pe interval și cooldown partajat cu TP/SL."""
+    """`_reevaluate_active_positions`: monitorizează pozițiile deținute la fiecare heartbeat și,
+    DOAR la o scădere bruscă de preț (TRIGGER MATEMATIC, > _PANIC_THRESHOLD_PERCENT), întreabă
+    Groq și lichidează (SELL la best bid) cele invalidate — INDEPENDENT de cash și ocolind
+    `_execute_trade`. Opt-in (PANIC_SELL_ENABLED), cu cooldown de exit partajat cu TP/SL."""
 
     def _state(self, balance=5.0, token_id="0xPOS", size=10.0, avg=0.50):
         return {
@@ -3220,14 +3221,19 @@ class TestPanicSell:
         return {"action": "HOLD", "confidence": 0.9, "reason": "nothing major"}
 
     def _run(self, state, *, decision, bid=0.30, enabled=True, min_conf=0.70,
-             last_ts=0.0, interval=1800):
+             baseline=0.50, threshold=5.0):
+        # baseline (preț memorat) > bid ⇒ scădere peste prag ⇒ declanșează apelul AI. Pune
+        # baseline=None ca să simulezi prima observare (fără baseline ⇒ fără apel AI).
         import main
         from src import position_manager
         position_manager._exit_attempts.clear()
+        seed = {} if baseline is None else {
+            str(p.get("token_id")): baseline for p in state.get("active_positions", [])
+        }
         with patch.object(main, "_PANIC_SELL_ENABLED", enabled), \
              patch.object(main, "_PANIC_SELL_MIN_CONFIDENCE", min_conf), \
-             patch.object(main, "_POSITION_REEVAL_INTERVAL", interval), \
-             patch.object(main, "_last_position_reeval_ts", last_ts), \
+             patch.object(main, "_PANIC_THRESHOLD_PERCENT", threshold), \
+             patch.object(main, "_last_position_price", dict(seed)), \
              patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
              patch("main.fetch_free_news", return_value=["bad news"]), \
              patch("main._live_best_bid", return_value=bid), \
@@ -3281,32 +3287,48 @@ class TestPanicSell:
         mock_order.assert_called_once()
         assert state["active_positions"] == []
 
-    def test_interval_throttle_skips_recent_run(self):
-        import time as _time
+    def test_sharp_drop_triggers_ai(self):
+        # TRIGGER MATEMATIC: preț 0.50 → 0.30 (−40% ≥ prag 5%) → chemăm Groq.
         state = self._state()
-        # Ultima rulare = acum → în interval → nu re-evaluăm (niciun apel Groq).
-        mock_ai, mock_order, _ = self._run(
-            state, decision=self._panic(), last_ts=_time.time(), interval=1800,
-        )
+        mock_ai, _, _ = self._run(state, decision=self._hold(), baseline=0.50, bid=0.30)
+        mock_ai.assert_called_once()
+
+    def test_stable_price_skips_ai(self):
+        # Preț quasi-stabil (0.50 → 0.49, −2% < prag 5%) → NICIUN apel Groq (economie de tokeni).
+        state = self._state()
+        mock_ai, mock_order, _ = self._run(state, decision=self._panic(), baseline=0.50, bid=0.49)
+        mock_ai.assert_not_called()
+        mock_order.assert_not_called()
+        assert len(state["active_positions"]) == 1
+
+    def test_price_rise_skips_ai(self):
+        # Preț în CREȘTERE (0.50 → 0.60) → scădere negativă → niciun apel Groq.
+        state = self._state()
+        mock_ai, mock_order, _ = self._run(state, decision=self._panic(), baseline=0.50, bid=0.60)
         mock_ai.assert_not_called()
         mock_order.assert_not_called()
 
-    def test_boot_runs_immediately_without_waiting_interval(self):
-        # Cerința: la PORNIRE (_last_position_reeval_ts == 0.0) prima analiză AI rulează
-        # IMEDIAT, fără să aștepte _POSITION_REEVAL_INTERVAL. interval=3600 (1h) ca să fie
-        # clar că nu se așteaptă scurgerea lui; decizie HOLD ca să izolăm „analiza a rulat".
+    def test_first_observation_sets_baseline_no_ai(self):
+        # La PRIMA observare (fără baseline memorat) doar stabilim prețul de referință, fără AI;
+        # o scădere se poate detecta abia la heartbeat-ul următor. Verificăm și că baseline-ul e scris.
+        import main
         state = self._state()
-        mock_ai, mock_order, _ = self._run(
-            state, decision=self._hold(), last_ts=0.0, interval=3600,
-        )
-        mock_ai.assert_called_once()    # Groq apelat la boot, deși intervalul e 1h
-        mock_order.assert_not_called()  # HOLD → nicio lichidare
+        with patch.object(main, "_PANIC_SELL_ENABLED", True), \
+             patch.object(main, "_PANIC_THRESHOLD_PERCENT", 5.0), \
+             patch.object(main, "_last_position_price", {}), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch("main._live_best_bid", return_value=0.30), \
+             patch("main.analyse_position_exit") as mock_ai, \
+             patch("main.place_limit_order") as mock_order:
+            main._reevaluate_active_positions(state)
+            assert main._last_position_price["0xPOS"] == pytest.approx(0.30)   # baseline stabilit
+        mock_ai.assert_not_called()      # nimic cu ce compara încă → fără apel Groq
+        mock_order.assert_not_called()
 
     def test_no_positions_no_groq(self):
         import main
         state = {"pusd_balance": 5.0, "active_positions": []}
         with patch.object(main, "_PANIC_SELL_ENABLED", True), \
-             patch.object(main, "_last_position_reeval_ts", 0.0), \
              patch("main.analyse_position_exit") as mock_ai, \
              patch("main.place_limit_order") as mock_order:
             main._reevaluate_active_positions(state)
@@ -3320,23 +3342,23 @@ class TestPanicSell:
         mock_order.assert_not_called()
 
     def test_exit_cooldown_shared_with_tpsl(self):
-        # Dacă TP/SL a marcat deja un exit pe token, panic-sell îl sare (cooldown partajat),
-        # ca aceeași poziție să nu fie vândută de două ori.
+        # Chiar și la o SCĂDERE bruscă de preț (0.50→0.30), dacă TP/SL a marcat deja un exit pe
+        # token, panic-sell sare apelul AI (cooldown partajat) — nu vindem același token de două ori.
         import main
         from src import position_manager
         state = self._state()
         position_manager._exit_attempts.clear()
         position_manager.record_exit_attempt("0xPOS")   # TP/SL „tocmai a încercat un exit"
         with patch.object(main, "_PANIC_SELL_ENABLED", True), \
-             patch.object(main, "_last_position_reeval_ts", 0.0), \
-             patch.object(main, "_POSITION_REEVAL_INTERVAL", 1800), \
+             patch.object(main, "_PANIC_THRESHOLD_PERCENT", 5.0), \
+             patch.object(main, "_last_position_price", {"0xPOS": 0.50}), \
              patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
              patch("main._live_best_bid", return_value=0.30), \
              patch("main.fetch_free_news", return_value=[]), \
              patch("main.analyse_position_exit", return_value=self._panic()) as mock_ai, \
              patch("main.place_limit_order") as mock_order:
             main._reevaluate_active_positions(state)
-        mock_ai.assert_not_called()    # token în cooldown → nici nu chemăm Groq
+        mock_ai.assert_not_called()    # scădere bruscă, DAR token în cooldown → niciun apel Groq
         mock_order.assert_not_called()
 
     def _two_positions_state(self):
@@ -3356,9 +3378,12 @@ class TestPanicSell:
         import main
         from src import position_manager
         position_manager._exit_attempts.clear()
+        # Baseline > bid (0.30) pentru fiecare token ⇒ scădere peste prag ⇒ ambele poziții ar
+        # declanșa un apel AI (dacă ciclul nu se oprește mai devreme la un rate-limit).
+        seed = {str(p["token_id"]): 0.50 for p in state["active_positions"]}
         with patch.object(main, "_PANIC_SELL_ENABLED", True), \
-             patch.object(main, "_last_position_reeval_ts", 0.0), \
-             patch.object(main, "_POSITION_REEVAL_INTERVAL", 1800), \
+             patch.object(main, "_PANIC_THRESHOLD_PERCENT", 5.0), \
+             patch.object(main, "_last_position_price", dict(seed)), \
              patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
              patch("main._live_best_bid", return_value=0.30), \
              patch("main.fetch_free_news", return_value=["news"]), \
@@ -3564,3 +3589,89 @@ class TestCallGroqRobustness:
              patch("src.ai_analyser._call_groq", return_value=""):
             res = ai_analyser.analyse_batch(requests)
         assert res["m1"]["trade"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: FAILSAFE ROUTING — fallback silențios pe OpenRouter când Groq eșuează
+# ---------------------------------------------------------------------------
+
+class TestOpenRouterFallback:
+    """`_call_groq` rulează întâi Groq (gpt-oss-20b, cu retry); la ORICE eșec (în special 429
+    rate-limit / TPD) rutează SILENȚIOS către OpenRouter, DACĂ OPENROUTER_API_KEY e setat. Fără
+    cheie sau dacă și OpenRouter pică, propagă eroarea Groq originală (logica de rate-limit din
+    apelanți rămâne intactă)."""
+
+    def _mock_client(self, content="{}"):
+        client = MagicMock()
+        msg = MagicMock()
+        msg.content = content
+        choice = MagicMock()
+        choice.message = msg
+        resp = MagicMock()
+        resp.choices = [choice]
+        resp.usage = None
+        client.chat.completions.create.return_value = resp
+        return client
+
+    def test_fallback_to_openrouter_on_groq_failure(self):
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "OPENROUTER_API_KEY", "or-key"), \
+             patch("src.ai_analyser._call_groq_with_retry", side_effect=RuntimeError("429 rate limit")), \
+             patch("src.ai_analyser._call_openrouter", return_value='{"action":"HOLD"}') as mock_or:
+            out = ai_analyser._call_groq(MagicMock(), "prompt", max_tokens=100)
+        assert out == '{"action":"HOLD"}'      # rezultatul vine de la OpenRouter (fallback silențios)
+        mock_or.assert_called_once()
+
+    def test_groq_success_skips_openrouter(self):
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "OPENROUTER_API_KEY", "or-key"), \
+             patch("src.ai_analyser._call_groq_with_retry", return_value="GROQ-OK"), \
+             patch("src.ai_analyser._call_openrouter") as mock_or:
+            out = ai_analyser._call_groq(MagicMock(), "prompt")
+        assert out == "GROQ-OK"
+        mock_or.assert_not_called()             # Groq a reușit → niciun fallback
+
+    def test_no_fallback_without_key_reraises(self):
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "OPENROUTER_API_KEY", ""), \
+             patch("src.ai_analyser._call_groq_with_retry", side_effect=RuntimeError("boom")), \
+             patch("src.ai_analyser._call_openrouter") as mock_or:
+            with pytest.raises(RuntimeError, match="boom"):
+                ai_analyser._call_groq(MagicMock(), "prompt")
+        mock_or.assert_not_called()             # fără cheie OpenRouter → niciun fallback
+
+    def test_fallback_failure_reraises_original_groq_error(self):
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "OPENROUTER_API_KEY", "or-key"), \
+             patch("src.ai_analyser._call_groq_with_retry", side_effect=RuntimeError("GROQ-429")), \
+             patch("src.ai_analyser._call_openrouter", side_effect=RuntimeError("OR-down")):
+            with pytest.raises(RuntimeError, match="GROQ-429"):   # propagăm eroarea Groq ORIGINALĂ
+                ai_analyser._call_groq(MagicMock(), "prompt")
+
+    def test_openrouter_uses_configured_model_without_reasoning(self):
+        from src import ai_analyser
+        from config.settings import settings
+        client = self._mock_client("{}")
+        with patch.object(settings, "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"), \
+             patch("src.ai_analyser._get_openrouter_client", return_value=client):
+            ai_analyser._call_openrouter("answer in JSON", 200, True)
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["model"] == "meta-llama/llama-3.3-70b-instruct:free"
+        assert "extra_body" not in kwargs                          # reasoning_effort NU pe OpenRouter
+        assert kwargs["response_format"] == {"type": "json_object"}  # json_object respectat
+
+    def test_position_exit_silent_fallback_end_to_end(self):
+        # Panic Sell: Groq 429 → fallback OpenRouter → decizie validă, FĂRĂ excepție propagată.
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "GROQ_API_KEY", "g-key"), \
+             patch.object(settings, "OPENROUTER_API_KEY", "or-key"), \
+             patch("src.ai_analyser._call_groq_with_retry", side_effect=RuntimeError("429 TPD")), \
+             patch("src.ai_analyser._call_openrouter",
+                   return_value='{"action":"PANIC_SELL","confidence":0.9,"reason":"key injury"}'):
+            d = ai_analyser.analyse_position_exit("Arsenal vs Chelsea", "1 (Arsenal)", 0.55, 0.30, [])
+        assert d["action"] == "PANIC_SELL" and d["confidence"] == pytest.approx(0.9)

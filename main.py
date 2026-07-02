@@ -196,19 +196,24 @@ _ACTIVATE_QUEUE = os.getenv("ACTIVATE_QUEUE", "false").strip().lower() in ("1", 
 # --- Panic Sell (STEP 4): re-evaluare pe ȘTIRI a pozițiilor DEȚINUTE ---
 # IMPLICIT dezactivat (False): e o lichidare REALĂ declanșată de judecata unui LLM, deci
 # opt-in explicit (ca DRY_RUN / ACTIVATE_QUEUE). Când e ON, `_reevaluate_active_positions`
-# rulează periodic (independent de cash — vânzarea folosește token-urile deținute) și, dacă
+# rulează la fiecare heartbeat (independent de cash — vânzarea folosește token-urile deținute),
+# dar cheamă Groq DOAR la o scădere bruscă de preț (_PANIC_THRESHOLD_PERCENT) și, dacă
 # Groq vede o știre care invalidează catastrofal teza de BUY, lichidează poziția la best bid
 # (SELL), ocolind `_execute_trade` (care e doar pentru BUY) și gate-ul de balanță.
 _PANIC_SELL_ENABLED = os.getenv("PANIC_SELL_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
-# Cât de des re-evaluăm pozițiile (minute). Doar ≤ MAX_ACTIVE_POSITIONS poziții × 1 apel
-# Groq fiecare, o dată la acest interval → buget de tokeni minim (≠ scanarea masivă).
-_POSITION_REEVAL_INTERVAL = max(60, int(os.getenv("POSITION_REEVAL_INTERVAL_MINUTES", "30")) * 60)
 # Pragul de confidence peste care acționăm un PANIC_SELL (conservator — nu lichidăm pe semnale slabe).
 _PANIC_SELL_MIN_CONFIDENCE = float(os.getenv("PANIC_SELL_MIN_CONFIDENCE", "0.70"))
-# Momentul ultimei rulări a re-evaluării pozițiilor (throttle pe _POSITION_REEVAL_INTERVAL).
-# Sentinel 0.0 = încă nerulat → detectat explicit ca `is_boot` în _reevaluate_active_positions,
-# care rulează prima analiză IMEDIAT la pornire (nu așteaptă scurgerea unui interval întreg).
-_last_position_reeval_ts: float = 0.0
+# TRIGGER MATEMATIC (economie de tokeni / anti-429): prag de SCĂDERE BRUSCĂ a prețului (best bid),
+# în PROCENTE, față de scanarea anterioară (heartbeat-ul precedent), peste care declanșăm o
+# re-evaluare AI a poziției. La FIECARE heartbeat comparăm prețul curent cu cel memorat (citire
+# orderbook ieftină, ZERO tokeni): DACĂ a scăzut ≥ acest prag → întrebăm Groq; dacă e stabil / în
+# creștere / scădere mică → doar actualizăm prețul memorat și trecem mai departe (NICIUN apel Groq).
+# Așa reacția rămâne promptă (≤ 1 heartbeat) fără să ardem bugetul de tokeni. Implicit 5%.
+_PANIC_THRESHOLD_PERCENT = float(os.getenv("PANIC_THRESHOLD_PERCENT", "5"))
+# Ultimul best bid observat per token DEȚINUT (memorie in-process, nepersistată) — baseline pentru
+# trigger-ul de preț de mai sus, realimentat la fiecare heartbeat. La (re)pornire e gol → prima
+# observare a unei poziții doar STABILEȘTE baseline-ul, fără apel AI (nimic cu ce compara încă).
+_last_position_price: dict[str, float] = {}
 
 # Ultima decizie AI cunoscută per token DEȚINUT. Cheie: token_id → {"action",
 # "confidence", "reason", "ts"}. Alimentată de intrarea în poziție (BUY reușit) și de
@@ -1537,53 +1542,42 @@ def _simulate_notif_cycle(price: float, title: str, outcome_label: str, decision
 # Panic Sell (STEP 4): re-evaluare pe ȘTIRI a pozițiilor DEȚINUTE
 # ---------------------------------------------------------------------------
 def _reevaluate_active_positions(account_state: dict) -> None:
-    """STEP 4 — Panic Sell: re-evaluează PERIODIC pozițiile deținute pe baza știrilor recente
-    și lichidează (SELL la best bid) cele a căror teză de BUY a fost invalidată catastrofal de
-    Groq. Opt-in via `PANIC_SELL_ENABLED`.
+    """STEP 4 — Panic Sell: monitorizează pozițiile DEȚINUTE la FIECARE heartbeat și, DOAR când
+    prețul (best bid) scade brusc față de scanarea anterioară (peste _PANIC_THRESHOLD_PERCENT),
+    întreabă Groq dacă o dezvoltare recentă invalidează teza de BUY și, la nevoie, lichidează
+    (SELL la best bid). Opt-in via `PANIC_SELL_ENABLED`.
 
-    Rulează INDEPENDENT de cash (vânzarea folosește token-urile deja deținute, nu fonduri) și
-    OCOLEȘTE `_execute_trade` (care e doar pentru BUY) — deci protejează portofoliul chiar și
-    cu balanță zero. La PORNIRE (boot) rulează o primă analiză IMEDIAT (vezi `is_boot` mai jos),
-    apoi throttle pe `_POSITION_REEVAL_INTERVAL` (≤ MAX_ACTIVE_POSITIONS apeluri Groq la fiecare
-    interval → buget de tokeni minim, spre deosebire de scanarea masivă)."""
-    global _last_position_reeval_ts
+    TRIGGER MATEMATIC (anti-429 / economie de tokeni): prețul e verificat local în fiecare minut
+    (citire orderbook — ieftină, ZERO tokeni); apelul Groq se face NUMAI la o scădere bruscă. Dacă
+    prețul e stabil / în creștere / scade puțin, doar actualizăm prețul memorat și trecem mai
+    departe. Așa reacția rămâne promptă (≤ 1 heartbeat) fără re-evaluări AI inutile.
+
+    Rulează INDEPENDENT de cash (vânzarea folosește token-urile deja deținute) și OCOLEȘTE
+    `_execute_trade` (BUY-only) — protejează portofoliul chiar și cu balanță zero."""
     if not _PANIC_SELL_ENABLED:
         return
     positions = account_state.get("active_positions", [])
     if not positions:
-        return  # nimic de re-evaluat → nu pornim ceasul, nu cheltuim tokeni
-    now = time.time()
-    # La PORNIRE (boot) `_last_position_reeval_ts` e încă 0.0 (sentinel „nerulat") → rulăm o
-    # primă analiză AI IMEDIAT, fără să așteptăm un interval întreg. Abia DUPĂ prima rulare se
-    # aplică throttle-ul `_POSITION_REEVAL_INTERVAL`. Așa, la fiecare (re)pornire pe Railway,
-    # pozițiile deținute sunt verificate pe loc, nu peste ~30 min. (Detectarea boot-ului e
-    # explicită — nu mai depinde de „now - 0.0 e uriaș", deci rămâne corectă chiar dacă
-    # cineva schimbă inițializarea sentinelului.)
-    is_boot = _last_position_reeval_ts == 0.0
-    if not is_boot and now - _last_position_reeval_ts < _POSITION_REEVAL_INTERVAL:
         return
-    _last_position_reeval_ts = now
+    # Curăță baseline-urile prețului pentru token-uri care nu mai sunt deținute (poziții închise),
+    # ca dict-ul să nu crească nemărginit și să nu re-declanșeze pe o intrare stală la re-achiziție.
+    held = {str(p.get("token_id") or "") for p in positions}
+    for tid in [t for t in _last_position_price if t not in held]:
+        _last_position_price.pop(tid, None)
 
-    logger.info(
-        "[PanicSell] %s: re-evaluez %d poziții deținute pe baza știrilor recente (interval %d min).",
-        "Analiză INIȚIALĂ la pornire" if is_boot else "Re-evaluare periodică",
-        len(positions), _POSITION_REEVAL_INTERVAL // 60,
-    )
     # Iterăm pe un snapshot: _panic_sell_position rescrie lista de poziții la o lichidare reușită.
     for pos in list(positions):
         if not RUNNING:
             break
         try:
-            _reevaluate_one_position(pos, account_state)
+            ai_called = _reevaluate_one_position(pos, account_state)
         except Exception as exc:
-            # Rate-limit Groq (HTTP 429 — buget zilnic de tokeni epuizat): TOATE apelurile
-            # rămase din acest ciclu ar eșua identic, deci nu are rost să iterăm mai departe
-            # (am ține bucla ocupată degeaba, exact „recovery loop"-ul strâns descris). Prindem
-            # `openai.RateLimitError` direct (după TIP — robust chiar dacă mesajul nu conține
-            # „429") ȘI, via `_is_rate_limit_error`, cazul învelit de tenacity (RetryError).
-            # Logăm clar și IEȘIM din ciclu (break), lăsând bucla principală să-și continue
-            # monitorizarea + celelalte task-uri. Throttle-ul `_last_position_reeval_ts` (setat
-            # deja mai sus) previne oricum o re-rulare imediată — nu revenim înainte de interval.
+            # Rate-limit LLM (HTTP 429 — buget zilnic de tokeni epuizat, atât pe Groq cât și pe
+            # fallback-ul OpenRouter dacă ambele sunt epuizate): TOATE apelurile rămase din acest
+            # ciclu ar eșua identic, deci nu are rost să iterăm mai departe. Prindem
+            # `openai.RateLimitError` direct (după TIP — robust chiar dacă mesajul nu conține „429")
+            # ȘI, via `_is_rate_limit_error`, cazul învelit de tenacity (RetryError). Logăm clar și
+            # IEȘIM din ciclu (break), lăsând bucla principală să continue monitorizarea.
             if (
                 (_OPENAI_RATE_LIMIT is not None and isinstance(exc, _OPENAI_RATE_LIMIT))
                 or _is_rate_limit_error(exc)
@@ -1597,32 +1591,60 @@ def _reevaluate_active_positions(account_state: dict) -> None:
                 "[PanicSell] Eroare la re-evaluarea poziției token=%s: %s",
                 pos.get("token_id"), exc, exc_info=True,
             )
-        _interruptible_sleep(_INTER_ANALYSIS_DELAY)  # throttle după apelul Groq
+            continue
+        # Throttle DOAR după un apel LLM real (o scădere bruscă). Când prețul e stabil (calea
+        # obișnuită, fără apel) NU dormim — bucla rămâne promptă și nu irosim heartbeat-ul.
+        if ai_called:
+            _interruptible_sleep(_INTER_ANALYSIS_DELAY)
 
 
-def _reevaluate_one_position(pos: dict, account_state: dict) -> None:
-    """Re-evaluează O poziție: best bid live → știri → Groq (`analyse_position_exit`). Dacă
-    verdictul e PANIC_SELL cu confidence ≥ prag, lichidează poziția. Cooldown-ul de exit e
-    partajat cu TP/SL (`should_attempt_exit`) ca să nu vindem același token de două ori."""
+def _reevaluate_one_position(pos: dict, account_state: dict) -> bool:
+    """Verifică O poziție DEȚINUTĂ. Întâi TRIGGER-ul de preț (ieftin, ZERO tokeni): compară best
+    bid-ul curent cu cel memorat; dacă NU a scăzut brusc (< _PANIC_THRESHOLD_PERCENT), doar
+    actualizează prețul memorat și iese. La o SCĂDERE bruscă: știri → Groq (`analyse_position_exit`)
+    și, dacă verdictul e PANIC_SELL cu confidence ≥ prag, lichidează. Cooldown-ul de exit e partajat
+    cu TP/SL (`should_attempt_exit`) ca să nu vindem același token de două ori.
+
+    Întoarce True DOAR dacă a făcut un apel LLM (ca apelantul să aplice throttle-ul), altfel False."""
     token_id = str(pos.get("token_id") or "")
     size = float(pos.get("size") or 0)
     avg_price = float(pos.get("avg_price") or 0)
     title = str(pos.get("asset_name") or "")
     outcome_label = str(pos.get("outcome") or "")
     if not token_id or size <= 0:
-        return
-
-    # Anti-dublă-vânzare: dacă TP/SL (sau o rundă anterioară de panic) a încercat deja un
-    # exit pe acest token recent, sărim — cooldown comun în position_manager.
-    if not should_attempt_exit(token_id):
-        logger.debug("[PanicSell] Token %s în cooldown de exit — skip.", token_id)
-        return
+        return False
 
     bid = _live_best_bid(token_id)
     if bid is None or bid <= 0:
-        logger.info("[PanicSell] Best bid indisponibil pentru '%s' — skip.", title[:50])
-        return
+        logger.debug("[PanicSell] Best bid indisponibil pentru '%s' — skip.", title[:50])
+        return False
 
+    # --- TRIGGER MATEMATIC: comparăm prețul curent cu cel de la scanarea anterioară ---
+    prev = _last_position_price.get(token_id)
+    _last_position_price[token_id] = bid   # baseline mereu proaspăt (inclusiv la prima observare)
+    if prev is None or prev <= 0:
+        logger.debug("[PanicSell] '%s' baseline inițial preț=$%.4f (fără apel AI).", title[:50], bid)
+        return False
+    drop_pct = (prev - bid) / prev * 100.0   # pozitiv = scădere
+    if drop_pct < _PANIC_THRESHOLD_PERCENT:
+        # Preț stabil / în creștere / scădere sub prag → NICIUN apel AI (calea ieftină, obișnuită).
+        logger.debug(
+            "[PanicSell] '%s' preț $%.4f→$%.4f (%+.1f%%) sub pragul de %.1f%% — fără apel AI.",
+            title[:50], prev, bid, -drop_pct, _PANIC_THRESHOLD_PERCENT,
+        )
+        return False
+
+    # Scădere bruscă. Respectăm cooldown-ul de exit ÎNAINTE de a cheltui un apel LLM (anti-dublă
+    # vânzare: dacă TP/SL sau o rundă anterioară de panic a încercat deja un exit recent, sărim).
+    if not should_attempt_exit(token_id):
+        logger.debug("[PanicSell] Token %s în cooldown de exit — skip apel AI.", token_id)
+        return False
+
+    logger.info(
+        "[PanicSell] '%s' (%s) SCĂDERE BRUSCĂ preț $%.4f→$%.4f (−%.1f%% ≥ prag %.1f%%) — "
+        "interoghez AI pe baza știrilor.",
+        title[:50], outcome_label, prev, bid, drop_pct, _PANIC_THRESHOLD_PERCENT,
+    )
     news = fetch_free_news(query=title[:100])
     decision = analyse_position_exit(title, outcome_label, avg_price, bid, news)
     # Reține decizia AI proaspătă pentru raportul de status per-heartbeat (fără re-apel Groq).
@@ -1633,16 +1655,14 @@ def _reevaluate_one_position(pos: dict, account_state: dict) -> None:
         decision["action"], decision["confidence"], decision["reason"],
     )
 
-    if decision["action"] != "PANIC_SELL":
-        return
-    if decision["confidence"] < _PANIC_SELL_MIN_CONFIDENCE:
+    if decision["action"] == "PANIC_SELL" and decision["confidence"] >= _PANIC_SELL_MIN_CONFIDENCE:
+        _panic_sell_position(pos, bid, decision, account_state)
+    elif decision["action"] == "PANIC_SELL":
         logger.info(
             "[PanicSell] PANIC_SELL pentru '%s' sub pragul de confidence %.2f (%.2f) — păstrez poziția.",
             title[:50], _PANIC_SELL_MIN_CONFIDENCE, decision["confidence"],
         )
-        return
-
-    _panic_sell_position(pos, bid, decision, account_state)
+    return True
 
 
 def _panic_sell_position(pos: dict, bid: float, decision: dict, account_state: dict) -> None:
@@ -2028,10 +2048,11 @@ def main() -> None:
 
     if _PANIC_SELL_ENABLED:
         logger.warning(
-            "[PanicSell] PANIC SELL ACTIV: re-evaluez pozițiile deținute pe baza știrilor o dată "
-            "la %d min și LICHIDEZ (SELL real la best bid) cele invalidate catastrofal de Groq "
-            "(confidence ≥ %.2f), independent de cash. Dezactivează PANIC_SELL_ENABLED pentru a opri.",
-            _POSITION_REEVAL_INTERVAL // 60, _PANIC_SELL_MIN_CONFIDENCE,
+            "[PanicSell] PANIC SELL ACTIV: monitorizez pozițiile deținute la fiecare heartbeat și, "
+            "DOAR la o scădere bruscă de preț (≥ %.1f%% față de minutul precedent), întreb Groq și "
+            "LICHIDEZ (SELL real la best bid) cele invalidate catastrofal (confidence ≥ %.2f), "
+            "independent de cash. Dezactivează PANIC_SELL_ENABLED pentru a opri.",
+            _PANIC_THRESHOLD_PERCENT, _PANIC_SELL_MIN_CONFIDENCE,
         )
 
     if settings.OVERRIDE_BALANCE > 0:
@@ -2154,10 +2175,11 @@ def main() -> None:
                     except Exception as exc:
                         logger.error("[Agent] Exit check eșuat: %s", exc, exc_info=True)
 
-                # STEP 4 — Panic Sell: re-evaluare pe ȘTIRI a pozițiilor deținute (opt-in via
-                # PANIC_SELL_ENABLED, throttle intern pe interval). La fel ca TP/SL: rulează ÎNAINTE
-                # de gate-ul de balanță (SELL nu cere cash) și e sărit în DRY_RUN (plasează SELL-uri
-                # REALE prin place_limit_order, nu prin _execute_trade interceptat).
+                # STEP 4 — Panic Sell: monitorizare la FIECARE heartbeat a pozițiilor deținute (opt-in
+                # via PANIC_SELL_ENABLED), cu apel Groq DOAR la o scădere bruscă de preț (TRIGGER
+                # MATEMATIC, _PANIC_THRESHOLD_PERCENT). La fel ca TP/SL: rulează ÎNAINTE de gate-ul de
+                # balanță (SELL nu cere cash) și e sărit în DRY_RUN (plasează SELL-uri REALE prin
+                # place_limit_order, nu prin _execute_trade interceptat).
                 if not _DRY_RUN:
                     try:
                         _reevaluate_active_positions(account_state)
