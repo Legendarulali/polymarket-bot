@@ -35,23 +35,33 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 
 def _get_groq_client() -> OpenAI:
+    # timeout: SDK-ul OpenAI are implicit 600s (10 min) + 2 retry-uri INTERNE — un hang de
+    # rețea ar îngheța bucla single-threaded (TP/SL, Panic Sell) zeci de minute. Plafonăm la
+    # LLM_TIMEOUT_SECONDS și dezactivăm retry-urile SDK: tenacity (4×, în _call_groq_with_retry)
+    # e SINGURUL strat de retry — altfel un 429 ar genera 4×3=12 cereri HTTP reale.
     global _client
     if _client is None:
         _client = OpenAI(
             base_url="https://api.groq.com/openai/v1",
             api_key=settings.GROQ_API_KEY,
+            timeout=settings.LLM_TIMEOUT_SECONDS,
+            max_retries=0,
         )
     return _client
 
 
 def _get_openrouter_client() -> OpenAI:
     """Client OpenRouter (OpenAI-compatibil) pentru FALLBACK când Groq eșuează. Construit leneș
-    și doar dacă OPENROUTER_API_KEY e setat (verificat de apelant, _call_groq)."""
+    și doar dacă OPENROUTER_API_KEY e setat (verificat de apelant, _call_groq).
+    Același timeout plafonat ca la Groq; max_retries=0 — fallback-ul e O SINGURĂ încercare
+    prin design (dacă pică, _call_groq propagă eroarea Groq originală)."""
     global _openrouter_client
     if _openrouter_client is None:
         _openrouter_client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=settings.OPENROUTER_API_KEY,
+            timeout=settings.LLM_TIMEOUT_SECONDS,
+            max_retries=0,
         )
     return _openrouter_client
 
@@ -165,13 +175,18 @@ def _chat_completion(
             getattr(usage, "completion_tokens", "?"),
             getattr(usage, "total_tokens", "?"),
         )
-    # Defensiv: gpt-oss poate întoarce content=None dacă tot bugetul s-a dus pe reasoning →
-    # tratăm ca string gol (apelantul cade pe decizia sigură în loc să crape pe .strip()).
-    content = (response.choices[0].message.content or "").strip()
+    # Defensiv: gpt-oss poate întoarce content=None dacă tot bugetul s-a dus pe reasoning, iar
+    # OpenRouter poate întoarce HTTP 200 cu `choices` GOL sau lipsă (eroare de provider în body,
+    # format ușor diferit de Groq/OpenAI). Orice formă degradată → string gol, ca apelantul să
+    # cadă pe decizia sigură (trade=False / HOLD) în loc să crape cu IndexError/TypeError.
+    choices = getattr(response, "choices", None) or []
+    message = getattr(choices[0], "message", None) if choices else None
+    content = (getattr(message, "content", None) or "").strip()
     if not content:
         logger.warning(
-            "[LLM] model=%s a întors content GOL (probabil reasoning a consumat tot bugetul) "
-            "— crește max_tokens sau verifică reasoning_effort.", model,
+            "[LLM] model=%s a întors content GOL (reasoning a consumat bugetul, sau răspuns "
+            "fără `choices` — ex. eroare de provider OpenRouter în body). Cad pe decizia sigură.",
+            model,
         )
     return content
 
@@ -190,10 +205,16 @@ def _call_groq_with_retry(client: OpenAI, prompt: str, max_tokens: int, json_obj
 def _call_openrouter(prompt: str, max_tokens: int, json_object: bool) -> str:
     """FALLBACK: același prompt către OpenRouter (model gratuit/ieftin din settings.OPENROUTER_MODEL),
     când Groq eșuează. Model non-gpt-oss → NU trimitem `reasoning_effort`. O SINGURĂ încercare (fără
-    retry): dacă și acesta pică, _call_groq propagă eroarea Groq originală."""
+    retry): dacă și acesta pică, _call_groq propagă eroarea Groq originală.
+
+    `json_object` e IGNORAT deliberat aici (nu trimitem `response_format`): mulți provideri de
+    modele free de pe OpenRouter nu suportă JSON Mode și ar respinge cererea cu 4xx — adică
+    fallback-ul ar muri EXACT când e nevoie de el. Prompturile cer deja „STRICTLY valid JSON",
+    iar apelanții extrag oricum substring-ul {...}/[...] înainte de parsare, deci JSON Mode e
+    doar un nice-to-have pe calea primară Groq, nu o cerință."""
     client = _get_openrouter_client()
     return _chat_completion(
-        client, settings.OPENROUTER_MODEL, prompt, max_tokens, json_object=json_object, reasoning=False
+        client, settings.OPENROUTER_MODEL, prompt, max_tokens, json_object=False, reasoning=False
     )
 
 

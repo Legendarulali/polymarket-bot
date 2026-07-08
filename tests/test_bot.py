@@ -3662,7 +3662,10 @@ class TestOpenRouterFallback:
         kwargs = client.chat.completions.create.call_args.kwargs
         assert kwargs["model"] == "meta-llama/llama-3.3-70b-instruct:free"
         assert "extra_body" not in kwargs                          # reasoning_effort NU pe OpenRouter
-        assert kwargs["response_format"] == {"type": "json_object"}  # json_object respectat
+        # JSON Mode NU se trimite pe fallback (chiar dacă apelantul l-a cerut): mulți provideri
+        # free de pe OpenRouter îl resping cu 4xx → fallback-ul ar muri exact când e nevoie de
+        # el. Parsarea extrage oricum substring-ul {...} din răspuns.
+        assert "response_format" not in kwargs
 
     def test_position_exit_silent_fallback_end_to_end(self):
         # Panic Sell: Groq 429 → fallback OpenRouter → decizie validă, FĂRĂ excepție propagată.
@@ -3675,3 +3678,311 @@ class TestOpenRouterFallback:
                    return_value='{"action":"PANIC_SELL","confidence":0.9,"reason":"key injury"}'):
             d = ai_analyser.analyse_position_exit("Arsenal vs Chelsea", "1 (Arsenal)", 0.55, 0.30, [])
         assert d["action"] == "PANIC_SELL" and d["confidence"] == pytest.approx(0.9)
+
+
+# ---------------------------------------------------------------------------
+# Tests (audit): timeouts LLM + parsare defensivă a răspunsului (choices gol/lipsă)
+# ---------------------------------------------------------------------------
+
+class TestLlmClientHardening:
+    """Clienții OpenAI (Groq + OpenRouter) sunt construiți cu timeout explicit
+    (LLM_TIMEOUT_SECONDS) și max_retries=0: SDK-ul are implicit 600s (10 min!) + 2 retry-uri
+    INTERNE — un hang de rețea ar îngheța bucla single-threaded (TP/SL, Panic Sell), iar la un
+    429 s-ar face 4×3=12 cereri HTTP reale (tenacity trebuie să fie SINGURUL strat de retry).
+    `_chat_completion` tolerează răspunsuri fără `choices` (OpenRouter poate întoarce HTTP 200
+    cu o eroare de provider în body, format ușor diferit de Groq)."""
+
+    def test_groq_client_built_with_timeout_and_no_sdk_retries(self, monkeypatch):
+        from src import ai_analyser
+        from config.settings import settings
+        monkeypatch.setattr(ai_analyser, "_client", None)   # ocolește cache-ul singleton
+        with patch("src.ai_analyser.OpenAI") as mock_openai:
+            ai_analyser._get_groq_client()
+        kwargs = mock_openai.call_args.kwargs
+        assert kwargs["timeout"] == pytest.approx(settings.LLM_TIMEOUT_SECONDS)
+        assert kwargs["max_retries"] == 0
+
+    def test_openrouter_client_built_with_timeout_and_no_sdk_retries(self, monkeypatch):
+        from src import ai_analyser
+        from config.settings import settings
+        monkeypatch.setattr(ai_analyser, "_openrouter_client", None)
+        with patch("src.ai_analyser.OpenAI") as mock_openai:
+            ai_analyser._get_openrouter_client()
+        kwargs = mock_openai.call_args.kwargs
+        assert kwargs["timeout"] == pytest.approx(settings.LLM_TIMEOUT_SECONDS)
+        assert kwargs["max_retries"] == 0
+
+    def test_llm_timeout_default_well_under_sdk_600s(self):
+        from config.settings import settings
+        assert 0 < settings.LLM_TIMEOUT_SECONDS <= 300   # mult sub default-ul SDK de 600s
+
+    def _resp_client(self, resp):
+        client = MagicMock()
+        client.chat.completions.create.return_value = resp
+        return client
+
+    def test_empty_choices_returns_empty_string(self):
+        # OpenRouter poate întoarce 200 cu choices=[] (eroare de provider în body) —
+        # fără IndexError: string gol → apelantul cade pe decizia sigură (False/HOLD).
+        from src import ai_analyser
+        resp = MagicMock()
+        resp.choices = []
+        resp.usage = None
+        out = ai_analyser._chat_completion(self._resp_client(resp), "m", "p", 100,
+                                           json_object=False, reasoning=False)
+        assert out == ""
+
+    def test_none_choices_returns_empty_string(self):
+        from src import ai_analyser
+        resp = MagicMock()
+        resp.choices = None
+        resp.usage = None
+        out = ai_analyser._chat_completion(self._resp_client(resp), "m", "p", 100,
+                                           json_object=False, reasoning=False)
+        assert out == ""
+
+    def test_missing_message_returns_empty_string(self):
+        from src import ai_analyser
+        choice = MagicMock()
+        choice.message = None
+        resp = MagicMock()
+        resp.choices = [choice]
+        resp.usage = None
+        out = ai_analyser._chat_completion(self._resp_client(resp), "m", "p", 100,
+                                           json_object=False, reasoning=False)
+        assert out == ""
+
+
+# ---------------------------------------------------------------------------
+# Tests (audit): timeout global de socket — plasă anti-blocaj pentru SDK-ul CLOB
+# ---------------------------------------------------------------------------
+
+class TestSocketTimeoutGuard:
+    """`_configure_socket_timeout` (apelat la pornire) setează timeout-ul GLOBAL de socket:
+    SDK-ul CLOB (py-clob-client-v2) folosește `requests` FĂRĂ timeout, deci un TCP hang la
+    get_order_book (rulat la FIECARE heartbeat prin _live_bid_ask / Panic Sell / TP-SL) sau la
+    plasarea unui ordin ar îngheța bucla single-threaded pentru totdeauna. Default-ul global se
+    aplică DOAR socket-urilor fără timeout explicit (requests/httpx/openai proprii, neatinse)."""
+
+    def test_sets_global_default_timeout(self, monkeypatch):
+        import socket
+        import main
+        old = socket.getdefaulttimeout()
+        try:
+            monkeypatch.setattr(main, "_SOCKET_TIMEOUT_SECONDS", 17.0)
+            main._configure_socket_timeout()
+            assert socket.getdefaulttimeout() == pytest.approx(17.0)
+        finally:
+            socket.setdefaulttimeout(old)
+
+    def test_zero_disables_the_guard(self, monkeypatch):
+        import socket
+        import main
+        old = socket.getdefaulttimeout()
+        try:
+            socket.setdefaulttimeout(None)
+            monkeypatch.setattr(main, "_SOCKET_TIMEOUT_SECONDS", 0.0)
+            main._configure_socket_timeout()
+            assert socket.getdefaulttimeout() is None    # 0 = dezactivat, nimic setat
+        finally:
+            socket.setdefaulttimeout(old)
+
+    def test_default_is_positive(self):
+        import main
+        assert main._SOCKET_TIMEOUT_SECONDS > 0
+
+
+# ---------------------------------------------------------------------------
+# Tests (audit): robustețea încărcării history.json/next_in_line.json + TTL decizii AI
+# ---------------------------------------------------------------------------
+
+class TestHistoryLoadHardening:
+    """Fișier corupt BINAR (UTF-8 invalid → UnicodeDecodeError, subclasă de ValueError care NU
+    era acoperită de json.JSONDecodeError) nu mai poate doborî botul la pornire — _load_history
+    rulează ÎNAINTE de plasa de crash-recovery a buclei. Deciziile AI mai vechi de
+    _AI_DECISION_TTL_SECONDS sunt aruncate la încărcare (anti-creștere nemărginită a fișierului,
+    rescris la fiecare _save_history)."""
+
+    def test_binary_garbage_history_starts_empty(self, monkeypatch, tmp_path):
+        import main
+        hist = tmp_path / "history.json"
+        hist.write_bytes(b"\xff\xfe\x00garbage\x80")     # bytes care nu sunt UTF-8 valid
+        monkeypatch.setattr(main, "_HISTORY_FILE", str(hist))
+        monkeypatch.setattr(main, "_analyzed_history", {"stale": 1.0})
+        monkeypatch.setattr(main, "_last_ai_decision", {"0xS": {}})
+        main._load_history()                              # NU ridică (UnicodeDecodeError prins)
+        assert main._analyzed_history == {}
+        assert main._last_ai_decision == {}
+
+    def test_binary_garbage_queue_is_empty(self, monkeypatch, tmp_path):
+        import main
+        q = tmp_path / "queue.json"
+        q.write_bytes(b"\xff\xfe\x00garbage\x80")
+        monkeypatch.setattr(main, "_QUEUE_FILE", str(q))
+        assert main._load_queue() == []                   # NU ridică
+
+    def test_old_ai_decisions_pruned_on_load(self, monkeypatch, tmp_path):
+        import main
+        now = time.time()
+        hist = tmp_path / "history.json"
+        hist.write_text(json.dumps({
+            "analyzed": {},
+            "last_ai_decisions": {
+                "0xOLD":   {"action": "HOLD", "confidence": 0.8, "reason": "r",
+                            "ts": now - main._AI_DECISION_TTL_SECONDS - 60},
+                "0xFRESH": {"action": "HOLD", "confidence": 0.8, "reason": "r", "ts": now},
+                "0xNO_TS": {"action": "HOLD"},            # ts lipsă (0.0) → păstrat (contract)
+            },
+        }), encoding="utf-8")
+        monkeypatch.setattr(main, "_HISTORY_FILE", str(hist))
+        monkeypatch.setattr(main, "_analyzed_history", {})
+        monkeypatch.setattr(main, "_last_ai_decision", {})
+        main._load_history()
+        assert "0xOLD" not in main._last_ai_decision      # decizie expirată (poziție demult închisă)
+        assert "0xFRESH" in main._last_ai_decision
+        assert "0xNO_TS" in main._last_ai_decision
+
+
+# ---------------------------------------------------------------------------
+# Tests (audit): o singură scriere history.json per LOT (_flush_batch)
+# ---------------------------------------------------------------------------
+
+class TestBatchHistoryWrites:
+    """_flush_batch scrie history.json O SINGURĂ dată per lot (save=False per piață +
+    un _save_history final) — nu o rescriere completă a fișierului per piață, care la o
+    scanare de ~900 de piețe însemna ~900 de scrieri pe disc."""
+
+    def _item(self, mid):
+        return {"kind": "binary", "market": {"id": mid}, "market_id": mid,
+                "title": f"T{mid}", "event_id": "", "yes_price": 0.6, "news": []}
+
+    def test_one_save_per_batch(self, monkeypatch):
+        import main
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        monkeypatch.setattr(main, "_analyzed_history", {})
+        with patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch("main._save_history") as mock_save, \
+             patch("main.analyse_batch", return_value={}):
+            main._flush_batch([self._item("m1"), self._item("m2"), self._item("m3")], state)
+        assert mock_save.call_count == 1                            # o scriere pentru tot lotul
+        assert set(main._analyzed_history) == {"m1", "m2", "m3"}    # toate marcate în memorie
+
+    def test_dry_run_never_saves(self, monkeypatch):
+        import main
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        monkeypatch.setattr(main, "_analyzed_history", {})
+        with patch.object(main, "_DRY_RUN", True), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch("main._save_history") as mock_save, \
+             patch("main.analyse_batch", return_value={}):
+            main._flush_batch([self._item("m1")], state)
+        mock_save.assert_not_called()                     # DRY_RUN nu atinge history.json
+        assert main._analyzed_history == {}
+
+
+# ---------------------------------------------------------------------------
+# Tests (audit): igiena baseline-urilor Panic Sell la închidere/redeschidere + poziții „praf"
+# ---------------------------------------------------------------------------
+
+class TestPanicBaselineHygiene:
+    """`_last_position_price` nu poate rămâne STAL între dețineri: un BUY nou șterge baseline-ul
+    unei dețineri anterioare pe același token (altfel primul heartbeat ar compara bid-ul cu un
+    preț vechi → trigger AI fals sau chiar PANIC_SELL greșit pe o poziție abia deschisă), iar
+    lichidarea panic curăță intrarea imediat. Pozițiile „praf" (bid×size < $1, nevandabile pe
+    Polymarket) nu consumă știri/apeluri AI."""
+
+    def test_buy_clears_stale_price_baseline(self, monkeypatch):
+        import main
+        # Rest de la o deținere veche a aceluiași token, vândută între timp la alt preț.
+        monkeypatch.setattr(main, "_last_position_price", {"0xT": 0.90})
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        decision = {"trade": True, "outcome": "YES", "confidence": 0.9, "reason": "r"}
+        with patch("main.place_limit_order", return_value={"success": True, "order_id": "o1"}), \
+             patch("main._live_best_ask", return_value=None), \
+             patch("main.notify_trade"), \
+             patch("main._record_ai_decision"):
+            main._execute_trade(
+                {"id": "m1", "orderPriceMinTickSize": "0.01"}, state,
+                token_id="0xT", price=0.50, outcome_label="YES",
+                decision=decision, event_id="", title="T",
+            )
+        assert "0xT" not in main._last_position_price     # baseline-ul stal a fost șters
+        assert len(state["active_positions"]) == 1        # BUY-ul chiar s-a executat
+
+    def test_panic_sell_clears_baseline(self):
+        import main
+        from src import position_manager
+        position_manager._exit_attempts.clear()
+        state = {
+            "pusd_balance": 5.0,
+            "active_positions": [{
+                "asset_name": "Arsenal vs Chelsea", "token_id": "0xPOS",
+                "outcome": "1 (Arsenal)", "side": "BUY", "size": 10.0, "avg_price": 0.50,
+            }],
+        }
+        panic = {"action": "PANIC_SELL", "confidence": 0.95, "reason": "injury"}
+        with patch.object(main, "_PANIC_SELL_ENABLED", True), \
+             patch.object(main, "_PANIC_THRESHOLD_PERCENT", 5.0), \
+             patch.object(main, "_last_position_price", {"0xPOS": 0.50}), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch("main.fetch_free_news", return_value=["bad"]), \
+             patch("main._live_best_bid", return_value=0.30), \
+             patch("main.analyse_position_exit", return_value=panic), \
+             patch("main.place_limit_order", return_value={"success": True, "order_id": "s1"}), \
+             patch("main.notify_trade"), \
+             patch("main._record_ai_decision"):
+            main._reevaluate_active_positions(state)
+            assert "0xPOS" not in main._last_position_price   # curățat imediat după lichidare
+        assert state["active_positions"] == []
+
+    def test_dust_position_skips_ai_call(self):
+        # bid×size = 0.30×2 = $0.60 < $1: exit imposibil pe Polymarket → zero știri, zero tokeni.
+        import main
+        from src import position_manager
+        position_manager._exit_attempts.clear()
+        state = {
+            "pusd_balance": 5.0,
+            "active_positions": [{
+                "asset_name": "Dust", "token_id": "0xD", "outcome": "YES",
+                "side": "BUY", "size": 2.0, "avg_price": 0.50,
+            }],
+        }
+        with patch.object(main, "_PANIC_SELL_ENABLED", True), \
+             patch.object(main, "_PANIC_THRESHOLD_PERCENT", 5.0), \
+             patch.object(main, "_last_position_price", {"0xD": 0.50}), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch("main._live_best_bid", return_value=0.30), \
+             patch("main.fetch_free_news") as mock_news, \
+             patch("main.analyse_position_exit") as mock_ai, \
+             patch("main.place_limit_order") as mock_order:
+            main._reevaluate_active_positions(state)
+        mock_news.assert_not_called()
+        mock_ai.assert_not_called()       # scădere bruscă, dar poziție nevandabilă → fără apel AI
+        mock_order.assert_not_called()
+        assert len(state["active_positions"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests (audit): LOG_LEVEL tolerant la lowercase/valori invalide
+# ---------------------------------------------------------------------------
+
+class TestLogLevelResolution:
+    """`_resolve_log_level`: LOG_LEVEL=debug (lowercase) întorcea FUNCȚIA logging.debug prin
+    getattr → TypeError la basicConfig chiar LA IMPORT (bot mort la pornire). Normalizăm la
+    uppercase și acceptăm doar valori care sunt efectiv nivele numerice; altfel INFO."""
+
+    def test_lowercase_debug_resolves_to_level(self):
+        import logging
+        from config.settings import _resolve_log_level
+        assert _resolve_log_level("debug") == logging.DEBUG
+
+    def test_canonical_upper_still_works(self):
+        import logging
+        from config.settings import _resolve_log_level
+        assert _resolve_log_level("WARNING") == logging.WARNING
+
+    def test_garbage_falls_back_to_info(self):
+        import logging
+        from config.settings import _resolve_log_level
+        assert _resolve_log_level("verbose-please") == logging.INFO
+        assert _resolve_log_level("BASIC_FORMAT") == logging.INFO   # atribut non-nivel → INFO

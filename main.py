@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import socket
 import time
 import sys
 import signal
@@ -67,6 +68,14 @@ _SCAN_INTERVAL_SECONDS = max(0.0, float(os.getenv("SCAN_INTERVAL_MINUTES", "15")
 # (ValueError/TypeError/timeout de rețea etc.) să nu trântească tot procesul; configurabil
 # via CRASH_RECOVERY_SLEEP_SECONDS. Minim 1s.
 _CRASH_RECOVERY_SLEEP = max(1.0, float(os.getenv("CRASH_RECOVERY_SLEEP_SECONDS", "5")))
+# Timeout GLOBAL de socket (secunde; 0 = dezactivat). PLASĂ DE SIGURANȚĂ anti-blocaj:
+# SDK-ul CLOB (py-clob-client-v2) apelează `requests` FĂRĂ timeout — un TCP hang la
+# get_order_book (rulat la FIECARE heartbeat prin _live_bid_ask/Panic Sell/TP-SL), la
+# plasarea unui ordin sau la get_balance_allowance ar îngheța bucla single-threaded
+# PENTRU TOTDEAUNA (fără exit-uri, fără monitorizare). `socket.setdefaulttimeout` se
+# aplică DOAR socket-urilor fără timeout explicit: apelurile noastre directe
+# (requests/httpx cu timeout=8/10, clientul OpenAI cu LLM_TIMEOUT_SECONDS) rămân neatinse.
+_SOCKET_TIMEOUT_SECONDS = float(os.getenv("SOCKET_TIMEOUT_SECONDS", "30"))
 _LOW_BALANCE_SLEEP = 15 * 60  # standby 15 min la eșec de reconciliere (401/glitch API, fără stare de cont). NU se mai folosește la cash insuficient — acolo doar dezactivăm cumpărarea (allow_new_trades) și rămânem la 60s.
 _CACHE_TTL_SECONDS = 4 * 3600 # cooldown: re-analizează o piață cel mult o dată la 4h (persistat în history.json)
 _GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
@@ -224,6 +233,11 @@ _last_position_price: dict[str, float] = {}
 # reapară drept „Monitoring (Price stable)" după un restart de proces/container. Fără intrare
 # pentru un token → raportul afișează „Monitoring (Price stable)".
 _last_ai_decision: dict[str, dict] = {}
+# TTL pentru deciziile AI persistate: la încărcare (_load_history) aruncăm deciziile mai
+# vechi de atât — aparțin unor poziții demult închise și altfel s-ar acumula NEMĂRGINIT
+# (fiecare BUY adaugă o intrare; nimic altceva nu le șterge). 30 de zile e generos: orice
+# poziție încă deținută își reîmprospătează decizia la prima re-evaluare Panic Sell.
+_AI_DECISION_TTL_SECONDS = 30 * 24 * 3600
 
 # Stare raport orar P/L pe Discord. `_next_pnl_report_ts` = momentul (epoch) al
 # următorului raport, ALINIAT la ceas (oră fixă xx:00, ca resetul de metrici Polymarket),
@@ -316,6 +330,18 @@ def handle_shutdown(signum, frame):
 
 signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
+
+
+def _configure_socket_timeout() -> None:
+    """Setează timeout-ul GLOBAL de socket (vezi _SOCKET_TIMEOUT_SECONDS): garanția că NICIUN
+    apel de rețea fără timeout explicit (în special SDK-ul CLOB, care folosește `requests`
+    fără timeout) nu poate bloca bucla la nesfârșit. Apelată o dată, la pornire."""
+    if _SOCKET_TIMEOUT_SECONDS > 0:
+        socket.setdefaulttimeout(_SOCKET_TIMEOUT_SECONDS)
+        logger.info(
+            "[Agent] Timeout global de socket setat la %.0fs (plasă anti-blocaj pentru "
+            "apelurile fără timeout explicit, ex. SDK-ul CLOB).", _SOCKET_TIMEOUT_SECONDS,
+        )
 
 
 def _interruptible_sleep(seconds: float) -> None:
@@ -547,7 +573,11 @@ def _load_history() -> None:
         _last_ai_decision = {}
         logger.info("[History] %s inexistent — pornesc cu istoric gol.", _HISTORY_FILE)
         return
-    except (json.JSONDecodeError, OSError) as exc:
+    # ValueError acoperă și json.JSONDecodeError (subclasă) ȘI UnicodeDecodeError (fișier
+    # corupt binar / UTF-8 invalid, ex. o scriere trunchiată pe volum). _load_history rulează
+    # ÎNAINTE de plasa de crash-recovery a buclei, deci o excepție neprinsă aici ar însemna
+    # bot mort la pornire până șterge cineva fișierul manual.
+    except (ValueError, OSError) as exc:
         _analyzed_history = {}
         _last_ai_decision = {}
         logger.warning("[History] Nu am putut citi %s (%s) — pornesc cu istoric gol.", _HISTORY_FILE, exc)
@@ -575,7 +605,14 @@ def _load_history() -> None:
         parsed = {str(mid): now for mid in raw_analyzed}
 
     _analyzed_history = {mid: ts for mid, ts in parsed.items() if now - ts < _CACHE_TTL_SECONDS}
-    _last_ai_decision = _parse_ai_decisions(decisions_raw)
+    # Deciziile AI ale pozițiilor demult închise nu se șterg nicăieri altundeva → fără TTL,
+    # dict-ul (și history.json, rescris la fiecare _save_history) ar crește NEMĂRGINIT cu
+    # fiecare BUY din istorie. Păstrăm doar deciziile din ultimele _AI_DECISION_TTL_SECONDS;
+    # ts=0.0 (lipsă/corupt, contract existent în _parse_ai_decisions) e păstrat ca înainte.
+    _last_ai_decision = {
+        tid: dec for tid, dec in _parse_ai_decisions(decisions_raw).items()
+        if dec["ts"] <= 0 or now - dec["ts"] < _AI_DECISION_TTL_SECONDS
+    }
     expired = len(parsed) - len(_analyzed_history)
     logger.info(
         "[History] Încărcate %d piețe analizate recent din %s (%d expirate, ignorate); "
@@ -620,15 +657,20 @@ def _is_recently_analyzed(market_id: str) -> bool:
     return ts is not None and (time.time() - ts) < _CACHE_TTL_SECONDS
 
 
-def _record_analyzed(market_id: str) -> None:
+def _record_analyzed(market_id: str, *, save: bool = True) -> None:
     """Marchează o piață ca analizată acum și persistă imediat istoricul.
+
+    `save=False` amână scrierea pe disc (apelantul cheamă _save_history() O dată pentru
+    tot lotul): _flush_batch marchează 12 piețe per lot — a rescrie ÎNTREG history.json
+    per piață ar însemna ~900 de scrieri complete de fișier per scanare, degeaba.
 
     În DRY_RUN e no-op: nu persistăm nimic, ca să nu poluăm cooldown-ul real din
     history.json (altfel, după simulare, piețele ar fi blocate 4h în modul live)."""
     if _DRY_RUN:
         return
     _analyzed_history[market_id] = time.time()
-    _save_history()
+    if save:
+        _save_history()
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +695,9 @@ def _load_queue() -> list[dict]:
             raw = json.load(fh)
     except FileNotFoundError:
         return []
-    except (json.JSONDecodeError, OSError) as exc:
+    # ValueError = JSONDecodeError + UnicodeDecodeError (fișier corupt binar) — vezi
+    # _load_history pentru raționament; coada nu trebuie să poată doborî botul.
+    except (ValueError, OSError) as exc:
         logger.warning("[Queue] Nu am putut citi %s (%s) — coadă goală.", _QUEUE_FILE, exc)
         return []
     if not isinstance(raw, list):
@@ -1426,6 +1470,13 @@ def _execute_trade(
             "cash_pnl":      0.0,
             "event_id":      event_id,
         })
+        # Poziție NOUĂ pe acest token: șterge baseline-ul de preț rămas de la o eventuală
+        # deținere ANTERIOARĂ (vândută între timp). Altfel, primul heartbeat Panic Sell ar
+        # compara bid-ul curent cu un preț STAL (de dinaintea închiderii) și ar putea
+        # declanșa un apel Groq fals — sau chiar un PANIC_SELL greșit — pe o poziție abia
+        # deschisă. Fără intrare, prima observare doar stabilește baseline-ul (comportament
+        # existent, bid-la-bid — imun și la spread-ul bid/ask de la intrare).
+        _last_position_price.pop(token_id, None)
         # Reține teza de intrare (decizia AI la BUY) pentru raportul de status per-heartbeat,
         # ca poziția proaspăt deschisă să nu apară drept „Monitoring (Price stable)".
         _record_ai_decision(
@@ -1558,6 +1609,12 @@ def _reevaluate_active_positions(account_state: dict) -> None:
         return
     positions = account_state.get("active_positions", [])
     if not positions:
+        # Deliberat NU curățăm baseline-urile aici: o listă goală poate veni și dintr-un
+        # glitch tranzitoriu al Data API (reconciliation întoarce [] la eroare de rețea) —
+        # a le șterge ar reseta referința și ar putea masca o scădere reală petrecută în
+        # fereastra glitch-ului. Igiena e asigurată oricum: prune-ul de mai jos (când lista
+        # e nevidă) + ștergerea explicită la BUY (_execute_trade) și la lichidare
+        # (_panic_sell_position), deci o re-achiziție nu moștenește niciodată un preț stal.
         return
     # Curăță baseline-urile prețului pentru token-uri care nu mai sunt deținute (poziții închise),
     # ca dict-ul să nu crească nemărginit și să nu re-declanșeze pe o intrare stală la re-achiziție.
@@ -1634,6 +1691,16 @@ def _reevaluate_one_position(pos: dict, account_state: dict) -> bool:
         )
         return False
 
+    # Poziție „praf": sub minimul de $1 al Polymarket un ordin SELL ar fi oricum respins
+    # (400) — aceeași regulă ca în TP/SL (position_manager._MIN_EXIT_VALUE_USD). Sărim
+    # ÎNAINTE de a cheltui știri + un apel LLM pe o lichidare imposibilă.
+    if bid * size < _MIN_ORDER_VALUE_USD:
+        logger.debug(
+            "[PanicSell] '%s' valoare poziție $%.2f sub minimul de $%.2f — exit imposibil, "
+            "skip apel AI.", title[:50], bid * size, _MIN_ORDER_VALUE_USD,
+        )
+        return False
+
     # Scădere bruscă. Respectăm cooldown-ul de exit ÎNAINTE de a cheltui un apel LLM (anti-dublă
     # vânzare: dacă TP/SL sau o rundă anterioară de panic a încercat deja un exit recent, sărim).
     if not should_attempt_exit(token_id):
@@ -1686,7 +1753,9 @@ def _panic_sell_position(pos: dict, bid: float, decision: dict, account_state: d
     if result.get("success"):
         logger.info("[PanicSell] Ordin SELL plasat | order_id=%s", result.get("order_id"))
         # Reflectă închiderea în starea locală: scoate poziția și recreditează (aprox) balanța,
-        # ca restul iterației (dedup, raport) să vadă portofoliul actualizat.
+        # ca restul iterației (dedup, raport) să vadă portofoliul actualizat. Curățăm imediat
+        # și baseline-ul de preț (nu mai avem ce monitoriza; o re-achiziție pornește curat).
+        _last_position_price.pop(token_id, None)
         account_state["active_positions"] = [
             p for p in account_state.get("active_positions", []) if p.get("token_id") != token_id
         ]
@@ -1867,9 +1936,13 @@ def _flush_batch(batch: list[dict], account_state: dict, allow_new_trades: bool 
         return  # nu marcăm nimic ca analizat → se reîncearcă
 
     # Apelul LLM a acoperit tot lotul → marcăm fiecare piață ca analizată (cooldown 4h).
+    # O SINGURĂ scriere pe disc pentru tot lotul (save=False per piață + un _save_history
+    # la final), nu o rescriere completă a history.json per piață (~12× mai puține scrieri).
     for it in batch:
-        _record_analyzed(str(it["market_id"]))
+        _record_analyzed(str(it["market_id"]), save=False)
         _scan_stats["analizate (LLM)"] += 1
+    if not _DRY_RUN:
+        _save_history()
 
     for it in batch:
         mid = str(it["market_id"])
@@ -2017,7 +2090,8 @@ def _scan_markets(markets: list[dict], account_state: dict, allow_new_trades: bo
 
 
 def main() -> None:
-    _load_history()  # prima instrucțiune la rulare: încarcă history.json (piețe deja analizate)
+    _configure_socket_timeout()  # anti-blocaj: niciun apel de rețea fără timeout nu poate îngheța bucla
+    _load_history()  # încarcă history.json (piețe deja analizate + decizii AI persistate)
 
     logger.info(
         "Polymarket AI Agent starting | host=%s | chain_id=%d | funder=%s",

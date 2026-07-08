@@ -61,10 +61,25 @@ class Settings:
     DISCORD_WEBHOOK_URL: str = os.getenv("DISCORD_WEBHOOK_URL", "")
     # Interval raport portofoliu pe Discord, în ore (0 = dezactivat raportul orar).
     PNL_REPORT_INTERVAL_HOURS: float = float(os.getenv("PNL_REPORT_INTERVAL_HOURS", "1"))
+    # Timeout (secunde) pentru apelurile LLM (Groq + fallback OpenRouter). SDK-ul OpenAI
+    # are implicit 600s (10 min!) — inacceptabil pentru bucla single-threaded: un apel
+    # blocat ar îngheța TP/SL-ul și Panic Sell-ul. 120s acoperă lejer și un batch mare pe
+    # un model free OpenRouter, dar taie hang-urile de rețea.
+    LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 
 settings = Settings()
 
+def _resolve_log_level(name: str) -> int:
+    """Nivelul de logging din LOG_LEVEL, tolerant la lowercase/valori invalide → INFO.
+
+    `getattr(logging, "debug")` (lowercase) ar întoarce FUNCȚIA logging.debug, nu nivelul —
+    și `basicConfig(level=<funcție>)` ar crăpa cu TypeError chiar la import (bot mort la
+    pornire pentru un simplu LOG_LEVEL=debug în .env). Normalizăm la uppercase și acceptăm
+    doar valori care sunt efectiv nivele numerice."""
+    level = getattr(logging, str(name).strip().upper(), logging.INFO)
+    return level if isinstance(level, int) else logging.INFO
+
 logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
+    level=_resolve_log_level(settings.LOG_LEVEL),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
