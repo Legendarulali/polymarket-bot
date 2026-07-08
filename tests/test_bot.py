@@ -1146,8 +1146,8 @@ class TestAnalyzedHistory:
 
 class TestAiDecisionPersistence:
     """`_last_ai_decision` e persistat în history.json (cheia `last_ai_decisions`) și
-    restaurat la pornire, ca o poziție preexistentă să NU reapară drept „Pending initial
-    AI sync" după un restart de proces/container. Formatul e „învelit": {"analyzed": {...},
+    restaurat la pornire, ca o poziție preexistentă să NU reapară drept „Monitoring
+    (Price stable)" după un restart de proces/container. Formatul e „învelit": {"analyzed": {...},
     "last_ai_decisions": {...}}, compatibil înapoi cu formatele vechi (dict plat / listă)."""
 
     def _fresh(self, monkeypatch, tmp_path):
@@ -1175,10 +1175,10 @@ class TestAiDecisionPersistence:
         # Simulează restartul: golește memoria (ca la un proces nou) și reîncarcă din fișier.
         monkeypatch.setattr(main, "_last_ai_decision", {})
         monkeypatch.setattr(main, "_analyzed_history", {})
-        assert main._format_ai_decision("0xA") == "AI: Pending initial AI sync"   # memorie goală
+        assert main._format_ai_decision("0xA") == "AI: Monitoring (Price stable)"   # memorie goală
         main._load_history()
         text = main._format_ai_decision("0xA")
-        assert "Pending initial AI sync" not in text                   # ESENȚA cerinței
+        assert "Monitoring (Price stable)" not in text                 # ESENȚA cerinței
         assert "AI: HOLD conf 0.90" in text and "no major development" in text
 
     def test_analyzed_and_decisions_coexist(self, monkeypatch, tmp_path):
@@ -1220,7 +1220,7 @@ class TestAiDecisionPersistence:
         assert dec["ts"] == pytest.approx(five_min_ago)      # string → float
         assert dec["confidence"] == pytest.approx(0.75)      # string → float
         text = main._format_ai_decision("0xA")
-        assert "Pending initial AI sync" not in text and "conf 0.75" in text
+        assert "Monitoring (Price stable)" not in text and "conf 0.75" in text
 
     def test_legacy_flat_format_loads_without_decisions(self, monkeypatch, tmp_path):
         import time
@@ -3438,7 +3438,7 @@ class TestPanicSell:
 class TestPositionStatusReport:
     """`_log_position_status`: raport per-heartbeat (60s), PUR informativ și FĂRĂ apel Groq —
     un rând per poziție cu preț de intrare vs curent (mark + best bid/ask), P/L și ULTIMA
-    decizie AI din memorie (sau „Pending initial AI sync" dacă nu a fost încă evaluată)."""
+    decizie AI din memorie (sau „Monitoring (Price stable)" dacă nu a fost încă evaluată)."""
 
     def _state(self):
         return {
@@ -3471,7 +3471,7 @@ class TestPositionStatusReport:
         assert "$+0.30" in text and "$-0.16" in text                # P/L per poziție
         assert "AI: HOLD conf 0.90" in text                         # decizia AI cunoscută
         assert "no major development" in text                       # reason
-        assert "Pending initial AI sync" in text                    # 0xB neevaluat
+        assert "Monitoring (Price stable)" in text                  # 0xB neevaluat
         mock_groq.assert_not_called()                               # ESENȚA: zero apeluri Groq
 
     def test_no_positions_logs_idle_line(self, caplog):
@@ -3491,7 +3491,7 @@ class TestPositionStatusReport:
                 main._log_position_status(self._state())
         assert "acum $0.530" in caplog.text        # mark price folosit
         assert "bid $" not in caplog.text           # niciun bloc bid/ask
-        assert "Pending initial AI sync" in caplog.text
+        assert "Monitoring (Price stable)" in caplog.text
 
     def test_per_position_error_isolated_no_traceback_spam(self, caplog):
         import logging
@@ -3514,7 +3514,7 @@ class TestPositionStatusReport:
     def test_format_ai_decision_pending_when_unknown(self):
         import main
         main._last_ai_decision.clear()
-        assert main._format_ai_decision("0xUNKNOWN") == "AI: Pending initial AI sync"
+        assert main._format_ai_decision("0xUNKNOWN") == "AI: Monitoring (Price stable)"
 
 
 # ---------------------------------------------------------------------------

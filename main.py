@@ -221,8 +221,8 @@ _last_position_price: dict[str, float] = {}
 # (`_log_position_status`) — pur informativ, NU costă niciun apel Groq. PERSISTATĂ în
 # history.json (cheia `last_ai_decisions`): _record_ai_decision o salvează la fiecare
 # update, iar _load_history o restaurează la pornire, ca o poziție preexistentă să NU mai
-# reapară drept „Pending initial AI sync" după un restart de proces/container. Fără intrare
-# pentru un token → raportul afișează „Pending initial AI sync".
+# reapară drept „Monitoring (Price stable)" după un restart de proces/container. Fără intrare
+# pentru un token → raportul afișează „Monitoring (Price stable)".
 _last_ai_decision: dict[str, dict] = {}
 
 # Stare raport orar P/L pe Discord. `_next_pnl_report_ts` = momentul (epoch) al
@@ -834,8 +834,8 @@ def _maybe_send_pnl_report(account_state: dict) -> None:
 def _record_ai_decision(token_id: str, action: str, confidence: float, reason: str) -> None:
     """Reține ultima decizie AI pentru un token DEȚINUT (ca raportul de status per-heartbeat
     s-o poată afișa FĂRĂ a re-apela Groq) ȘI o persistă imediat în history.json, ca decizia
-    să supraviețuiască unui restart — altfel poziția preexistentă ar reapărea drept „Pending
-    initial AI sync". Pur informativ, nu influențează tranzacționarea."""
+    să supraviețuiască unui restart — altfel poziția preexistentă ar reapărea drept „Monitoring
+    (Price stable)". Pur informativ, nu influențează tranzacționarea."""
     tid = str(token_id or "")
     if not tid:
         return
@@ -870,10 +870,10 @@ def _live_bid_ask(token_id: str) -> tuple[float | None, float | None]:
 
 def _format_ai_decision(token_id: str) -> str:
     """Ultima decizie AI cunoscută pentru un token (Action, Confidence, Reason + vechime), sau
-    „Pending initial AI sync" dacă poziția nu a fost încă evaluată de AI (fără apel Groq)."""
+    „Monitoring (Price stable)" dacă poziția nu a fost încă evaluată de AI (fără apel Groq)."""
     dec = _last_ai_decision.get(str(token_id or ""))
     if not dec:
-        return "AI: Pending initial AI sync"
+        return "AI: Monitoring (Price stable)"
     age_min = max(0.0, (time.time() - _qfloat(dec.get("ts"))) / 60.0)
     reason = str(dec.get("reason") or "").strip()
     reason_str = f' - "{reason[:70]}"' if reason else ""
@@ -1427,7 +1427,7 @@ def _execute_trade(
             "event_id":      event_id,
         })
         # Reține teza de intrare (decizia AI la BUY) pentru raportul de status per-heartbeat,
-        # ca poziția proaspăt deschisă să nu apară drept „Pending initial AI sync".
+        # ca poziția proaspăt deschisă să nu apară drept „Monitoring (Price stable)".
         _record_ai_decision(
             token_id, "BUY (intrare)",
             decision.get("confidence", 0.0), decision.get("reason", ""),
