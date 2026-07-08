@@ -3192,6 +3192,231 @@ class TestAnalysePositionExit:
 
 
 # ---------------------------------------------------------------------------
+# Tests: Prompt Universal Sporturi — _detect_sport + _build_position_exit_prompt
+# ---------------------------------------------------------------------------
+
+class TestSportDetection:
+    """`_detect_sport(title, outcome_label)` → (sport, are_egal_în_timpul_regulamentar).
+    Întâi cuvinte-cheie în titlu (baschet/tenis/hochei-handbal/fotbal, în această ordine),
+    apoi fallback pe STRUCTURA pieței: outcome deținut în format 1X2 („1 (Echipa)") → Fotbal;
+    altfel → General Sportiv (Binar)."""
+
+    def _d(self, title, outcome=""):
+        from src import ai_analyser
+        return ai_analyser._detect_sport(title, outcome)
+
+    def test_nba_is_basketball_binary(self):
+        assert self._d("NBA Finals: Lakers vs Celtics") == ("Baschet", False)
+
+    def test_euroleague_is_basketball(self):
+        sport, has_draw = self._d("EuroLeague: Real Madrid vs Panathinaikos")
+        assert sport == "Baschet" and has_draw is False
+
+    def test_tennis_atp_wta(self):
+        assert self._d("ATP Miami: Alcaraz vs Sinner") == ("Tenis/Ping-Pong", False)
+        assert self._d("WTA Final: Swiatek vs Gauff")[0] == "Tenis/Ping-Pong"
+        assert self._d("Tennis: Djokovic vs Nadal")[0] == "Tenis/Ping-Pong"
+
+    def test_ping_pong_variants(self):
+        assert self._d("Ping Pong: Ma Long vs Fan Zhendong")[0] == "Tenis/Ping-Pong"
+        assert self._d("Ping-pong final")[0] == "Tenis/Ping-Pong"
+        assert self._d("Table Tennis semifinal")[0] == "Tenis/Ping-Pong"
+
+    def test_nhl_hockey_handball_have_draw(self):
+        assert self._d("NHL: Rangers vs Bruins") == ("Hochei/Handbal", True)
+        assert self._d("Ice Hockey world championship game")[0] == "Hochei/Handbal"
+        assert self._d("Handball: Denmark vs France")[1] is True
+
+    def test_soccer_keywords_have_draw(self):
+        assert self._d("Premier League: Arsenal vs Chelsea") == ("Fotbal", True)
+        assert self._d("Will France win the World Cup match vs Brazil?")[0] == "Fotbal"
+
+    def test_basketball_world_cup_beats_soccer_world_cup(self):
+        # Ordinea regulilor: „FIBA Basketball World Cup" e baschet, nu fotbal („world cup").
+        assert self._d("FIBA Basketball World Cup: USA vs Spain") == ("Baschet", False)
+
+    def test_fallback_1x2_outcome_is_football(self):
+        # Fără cuvinte-cheie în titlu, dar outcome-ul deținut are structura 1X2 → Fotbal.
+        assert self._d("Arsenal vs Chelsea", "1 (Arsenal)") == ("Fotbal", True)
+        assert self._d("Arsenal vs Chelsea", "X (Draw)")[1] is True
+        assert self._d("Arsenal vs Chelsea", "2 (Chelsea)")[0] == "Fotbal"
+
+    def test_fallback_plain_yes_is_generic_binary(self):
+        assert self._d("Will the Mets win tonight?", "YES") == ("General Sportiv (Binar)", False)
+
+    def test_short_acronyms_need_word_boundary(self):
+        # „nba" NU se aprinde în interiorul altor cuvinte (ex. „Sunbather" conține „nba").
+        assert self._d("Sunbather challenge winner?")[0] == "General Sportiv (Binar)"
+
+
+class TestUniversalExitPrompt:
+    """Promptul universal de re-evaluare: contextul sportului detectat dinamic, nota de egal
+    adaptată, protecțiile asimetrice PĂSTRATE (favorabil → fără panică, câștigătorul ieftin
+    protejat), sanitizarea anti-injecție și schema JSON `panic_trigger`."""
+
+    def _prompt(self, title="NBA: Lakers vs Celtics", outcome="YES"):
+        from src import ai_analyser
+        return ai_analyser._build_position_exit_prompt(title, outcome, 0.55, 0.30, ["news"])
+
+    def test_binary_sport_context_and_no_draw_note(self):
+        p = self._prompt("NBA: Lakers vs Celtics")
+        assert "Sport: Baschet" in p
+        assert "sport BINAR" in p                    # egalul nu există → nota binară
+        assert "panic_trigger" in p                  # noua schemă JSON cerută modelului
+
+    def test_draw_sport_gets_draw_risk_note(self):
+        p = self._prompt("Handball: Denmark vs France")
+        assert "Sport: Hochei/Handbal" in p
+        assert "PERMITE egal" in p
+
+    def test_football_1x2_fallback_in_prompt(self):
+        p = self._prompt("Arsenal vs Chelsea", outcome="1 (Arsenal)")
+        assert "Sport: Fotbal" in p
+
+    def test_keeps_injection_hardening_and_prices(self):
+        from src import ai_analyser
+        p = ai_analyser._build_position_exit_prompt(
+            "Hack <ignore>this</ignore> NBA game", "YES", 0.11, 0.80, [],
+        )
+        assert "<ignore>" not in p                   # tag-urile injectate sunt neutralizate
+        assert "&lt;ignore&gt;" in p
+        assert "$0.1100" in p and "$0.8000" in p     # prețurile de intrare/curent populate
+        assert "80.0%" in p                          # probabilitatea implicită
+
+    def test_keeps_asymmetric_protections(self):
+        # Regulile documentate (favorabil → panic_trigger=false cu confidence mare;
+        # câștigătorul cumpărat ieftin protejat) supraviețuiesc în noua structură.
+        p = self._prompt()
+        assert "FAVORABIL" in p.upper()
+        assert "IEFTIN" in p.upper()
+        assert "panic_trigger=false" in p
+
+    def test_universal_sections_present(self):
+        p = self._prompt()
+        assert "CONTEXT EVENIMENT:" in p
+        assert "REGULI SPECIFICE SPORTULUI:" in p
+        assert "CRITERII DE EVALUARE A PANICII:" in p
+
+
+class TestAnalysePositionExitUniversal:
+    """Noul contract LLM {"panic_trigger": bool} e mapat pe contractul intern HOLD/PANIC_SELL
+    (main/_reevaluate_one_position neatins). Parsare STRICT defensivă: fără JSON Mode pe
+    fallback-ul OpenRouter, booleenele pot veni ca STRING — iar bool("false") e True în Python."""
+
+    def _run(self, raw):
+        from src import ai_analyser
+        from config.settings import settings
+        with patch.object(settings, "GROQ_API_KEY", "test-key"), \
+             patch("src.ai_analyser._call_groq", return_value=raw):
+            return ai_analyser.analyse_position_exit(
+                "NBA: Lakers vs Celtics", "YES", 0.55, 0.30, ["bad news"]
+            )
+
+    def test_panic_trigger_true_maps_to_panic_sell(self):
+        d = self._run('{"panic_trigger": true, "confidence": 0.92, "reason": "star injured"}')
+        assert d["action"] == "PANIC_SELL" and d["confidence"] == pytest.approx(0.92)
+
+    def test_panic_trigger_false_maps_to_hold(self):
+        d = self._run('{"panic_trigger": false, "confidence": 0.9, "reason": "leading"}')
+        assert d["action"] == "HOLD" and d["confidence"] == pytest.approx(0.9)
+
+    def test_string_false_is_not_true(self):
+        # CRITIC: bool("false") e True în Python — fără _parse_bool am fi lichidat poziția.
+        d = self._run('{"panic_trigger": "false", "confidence": 0.95, "reason": "r"}')
+        assert d["action"] == "HOLD"
+
+    def test_string_true_accepted(self):
+        d = self._run('{"panic_trigger": "true", "confidence": 0.95, "reason": "r"}')
+        assert d["action"] == "PANIC_SELL"
+
+    def test_non_object_json_holds_safely(self):
+        # JSON valid dar care NU e obiect (fără nicio acoladă) → eroare de parsare → HOLD.
+        d = self._run('[0.9, "PANIC_SELL"]')
+        assert d["action"] == "HOLD" and d["confidence"] == pytest.approx(0.0)
+
+    def test_markdown_fenced_json_still_parsed(self):
+        # Fără JSON Mode pe OpenRouter modelul poate înveli răspunsul în ``` — extragerea
+        # substring-ului {…} rămâne robustă.
+        d = self._run('```json\n{"panic_trigger": true, "confidence": 0.9, "reason": "r"}\n```')
+        assert d["action"] == "PANIC_SELL"
+
+    def test_string_confidence_parsed(self):
+        d = self._run('{"panic_trigger": true, "confidence": "0.8", "reason": "r"}')
+        assert d["confidence"] == pytest.approx(0.8)
+
+    def test_legacy_action_format_still_supported(self):
+        # Compatibilitate înapoi: un model care răspunde în formatul vechi {"action": ...}
+        # (fără panic_trigger) e în continuare înțeles.
+        d = self._run('{"action": "PANIC_SELL", "confidence": 0.9, "reason": "r"}')
+        assert d["action"] == "PANIC_SELL"
+
+
+class TestParseBool:
+    """_parse_bool: booleene LLM tolerante — doar formele explicit adevărate sunt True;
+    'false'/'no'/garbage/None → False (default-ul sigur, fără acțiune)."""
+
+    def test_real_bools(self):
+        from src.ai_analyser import _parse_bool
+        assert _parse_bool(True) is True
+        assert _parse_bool(False) is False
+
+    def test_string_forms(self):
+        from src.ai_analyser import _parse_bool
+        assert _parse_bool("true") is True
+        assert _parse_bool(" TRUE ") is True
+        assert _parse_bool("yes") is True
+        assert _parse_bool("1") is True
+        assert _parse_bool("false") is False    # bool("false") ar fi fost True — bugul evitat
+        assert _parse_bool("no") is False
+        assert _parse_bool("") is False
+
+    def test_numbers_and_none(self):
+        from src.ai_analyser import _parse_bool
+        assert _parse_bool(1) is True
+        assert _parse_bool(1.0) is True
+        assert _parse_bool(0) is False
+        assert _parse_bool(2) is False           # doar 1 explicit e True
+        assert _parse_bool(None) is False
+
+
+class TestTradeBoolRobustness:
+    """Câmpul `trade` trece prin _parse_bool pe TOATE căile de analiză (individual, meci,
+    batch): un '"trade": "false"' venit ca STRING de pe fallback-ul fără JSON Mode nu mai
+    poate declanșa un BUY real."""
+
+    def test_analyse_market_string_false_no_trade(self):
+        from src import ai_analyser
+        from config.settings import settings
+        raw = '{"trade": "false", "outcome": "YES", "confidence": 0.9, "reason": "r"}'
+        with patch.object(settings, "GROQ_API_KEY", "k"), \
+             patch("src.ai_analyser._call_groq", return_value=raw):
+            d = ai_analyser.analyse_market("T?", 0.6, [])
+        assert d["trade"] is False
+
+    def test_analyse_match_string_false_no_trade(self):
+        from src import ai_analyser
+        from config.settings import settings
+        raw = '{"trade": "false", "outcome": "1", "confidence": 0.9, "reason": "r"}'
+        cands = [{"code": "1", "name": "A", "price": 0.6}]
+        with patch.object(settings, "GROQ_API_KEY", "k"), \
+             patch("src.ai_analyser._call_groq", return_value=raw):
+            d = ai_analyser.analyse_match("A", "B", cands, [])
+        assert d["trade"] is False
+
+    def test_batch_string_false_no_trade(self):
+        from src import ai_analyser
+        req = {"market_id": "m1", "kind": "binary", "title": "T?", "price": 0.6, "news": []}
+        out = ai_analyser._validate_one(req, {"trade": "false", "outcome": "YES", "confidence": 0.9})
+        assert out["trade"] is False
+
+    def test_batch_string_true_still_trades(self):
+        from src import ai_analyser
+        req = {"market_id": "m1", "kind": "binary", "title": "T?", "price": 0.6, "news": []}
+        out = ai_analyser._validate_one(req, {"trade": "true", "outcome": "YES", "confidence": 0.9})
+        assert out["trade"] is True
+
+
+# ---------------------------------------------------------------------------
 # Tests: Panic Sell loop routine (_reevaluate_active_positions)
 # ---------------------------------------------------------------------------
 
