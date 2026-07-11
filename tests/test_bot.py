@@ -1850,7 +1850,10 @@ class TestAnalyseMatch:
 # ---------------------------------------------------------------------------
 
 class TestQueuePersistence:
-    """_load_queue / _save_queue / _enqueue_opportunity / _clean_queue."""
+    """_load_queue / _save_queue / _enqueue_opportunity / _clean_queue. Coada trăiește
+    ÎN MEMORIE (main._opportunity_queue) și e persistată în history.json (cheia
+    `next_in_line`) la fiecare _save_queue; restaurarea la restart + migrarea legacy
+    sunt acoperite în TestQueueHistoryPersistence."""
 
     def _fresh_main(self, monkeypatch, tmp_path):
         import importlib
@@ -1858,26 +1861,24 @@ class TestQueuePersistence:
         if "main" not in sys.modules:
             importlib.import_module("main")
         import main
-        queue_file = tmp_path / "next_in_line.json"
-        monkeypatch.setattr(main, "_QUEUE_FILE", str(queue_file))
-        return main, queue_file
+        hist_file = tmp_path / "history.json"
+        monkeypatch.setattr(main, "_HISTORY_FILE", str(hist_file))
+        monkeypatch.setattr(main, "_opportunity_queue", [])
+        return main, hist_file
 
-    def test_missing_file_returns_empty(self, monkeypatch, tmp_path):
+    def test_empty_memory_returns_empty(self, monkeypatch, tmp_path):
         main, _ = self._fresh_main(monkeypatch, tmp_path)
         assert main._load_queue() == []
 
-    def test_corrupt_file_returns_empty(self, monkeypatch, tmp_path):
-        main, qf = self._fresh_main(monkeypatch, tmp_path)
-        qf.write_text("{not valid json", encoding="utf-8")
-        assert main._load_queue() == []
-
-    def test_non_list_returns_empty(self, monkeypatch, tmp_path):
-        main, qf = self._fresh_main(monkeypatch, tmp_path)
-        qf.write_text(json.dumps({"market_id": "m1"}), encoding="utf-8")
-        assert main._load_queue() == []
+    def test_invalid_entries_filtered_on_load(self, monkeypatch, tmp_path):
+        # Intrări corupte în memorie (non-dict / fără market_id) nu ajung la apelanți.
+        main, _ = self._fresh_main(monkeypatch, tmp_path)
+        monkeypatch.setattr(main, "_opportunity_queue",
+                            ["not-a-dict", {"fara_id": 1}, {"market_id": "m1"}])
+        assert main._load_queue() == [{"market_id": "m1"}]
 
     def test_enqueue_then_load_roundtrip(self, monkeypatch, tmp_path):
-        main, qf = self._fresh_main(monkeypatch, tmp_path)
+        main, hist_file = self._fresh_main(monkeypatch, tmp_path)
         main._enqueue_opportunity("m1", "0xTOK", "Arsenal vs Chelsea", "1 (Arsenal)", 0.55, 0.82)
         q = main._load_queue()
         assert len(q) == 1
@@ -1889,7 +1890,9 @@ class TestQueuePersistence:
         assert item["original_price"] == pytest.approx(0.55)
         assert item["confidence"] == pytest.approx(0.82)
         assert "added_at" in item
-        assert qf.exists()
+        # Serializată IMEDIAT în history.json (cheia next_in_line), nu în fișier separat.
+        data = json.loads(hist_file.read_text(encoding="utf-8"))
+        assert data["next_in_line"][0]["market_id"] == "m1"
 
     def test_enqueue_without_token_is_skipped(self, monkeypatch, tmp_path):
         main, _ = self._fresh_main(monkeypatch, tmp_path)
@@ -1925,13 +1928,13 @@ class TestQueuePersistence:
 
     def test_clean_removes_expired_keeps_fresh(self, monkeypatch, tmp_path):
         import time
-        main, qf = self._fresh_main(monkeypatch, tmp_path)
+        main, _ = self._fresh_main(monkeypatch, tmp_path)
         now = time.time()
-        qf.write_text(json.dumps([
+        main._save_queue([
             {"market_id": "old", "token_id": "0xO", "confidence": 0.9,
              "added_at": now - main._QUEUE_TTL_HOURS * 3600 - 10},
             {"market_id": "fresh", "token_id": "0xF", "confidence": 0.8, "added_at": now},
-        ]), encoding="utf-8")
+        ])
         main._clean_queue()
         ids = [it["market_id"] for it in main._load_queue()]
         assert ids == ["fresh"]
@@ -1943,14 +1946,122 @@ class TestQueuePersistence:
 
 
 # ---------------------------------------------------------------------------
+# Tests: coada next_in_line persistată în history.json (+ migrare legacy)
+# ---------------------------------------------------------------------------
+
+class TestQueueHistoryPersistence:
+    """Coada next_in_line e serializată în history.json la FIECARE actualizare și
+    reîncărcată INTACTĂ la _load_history — deci un container distrus/reconstruit care
+    își trage history.json de pe volumul Docker (/data) își recuperează și coada.
+    Vechiul fișier separat next_in_line.json rămâne doar sursă de MIGRARE legacy
+    (one-shot, când history.json nu are încă cheia `next_in_line`)."""
+
+    def _fresh(self, monkeypatch, tmp_path):
+        import main
+        hist = tmp_path / "history.json"
+        legacy = tmp_path / "next_in_line.json"
+        monkeypatch.setattr(main, "_HISTORY_FILE", str(hist))
+        monkeypatch.setattr(main, "_QUEUE_FILE", str(legacy))
+        monkeypatch.setattr(main, "_analyzed_history", {})
+        monkeypatch.setattr(main, "_last_ai_decision", {})
+        monkeypatch.setattr(main, "_opportunity_queue", [])
+        return main, hist, legacy
+
+    def _entry(self, market_id="m1", **over):
+        import time
+        entry = {"market_id": market_id, "token_id": "0xT", "market_title": "T",
+                 "predicted_outcome": "YES", "original_price": 0.5, "confidence": 0.9,
+                 "event_id": "", "tick_size": "0.01", "added_at": time.time()}
+        entry.update(over)
+        return entry
+
+    def test_queue_survives_restart(self, monkeypatch, tmp_path):
+        main, _, _ = self._fresh(monkeypatch, tmp_path)
+        main._save_queue([self._entry("m1"), self._entry("m2")])
+        # „Restart": procesul nou pornește cu memoria goală, apoi _load_history (prima
+        # instrucțiune din main()) reface TOT din history.json — inclusiv coada.
+        monkeypatch.setattr(main, "_opportunity_queue", [])
+        assert main._load_queue() == []
+        main._load_history()
+        assert sorted(it["market_id"] for it in main._load_queue()) == ["m1", "m2"]
+
+    def test_wrapped_file_contains_all_three_blocks(self, monkeypatch, tmp_path):
+        # history.json cară TOATE cele trei stări: cooldown-ul de analiză, deciziile AI
+        # și coada — un singur fișier de pus pe volum.
+        main, hist, _ = self._fresh(monkeypatch, tmp_path)
+        main._record_analyzed("mkt")
+        main._record_ai_decision("0xA", "BUY (intrare)", 0.8, "r")
+        main._enqueue_opportunity("m1", "0xT", "T", "YES", 0.5, 0.9)
+        data = json.loads(hist.read_text(encoding="utf-8"))
+        assert "analyzed" in data and "last_ai_decisions" in data and "next_in_line" in data
+        assert data["next_in_line"][0]["market_id"] == "m1"
+
+    def test_legacy_queue_file_migrated_once(self, monkeypatch, tmp_path):
+        main, hist, legacy = self._fresh(monkeypatch, tmp_path)
+        # history.json scris ÎNAINTE de mutarea cozii (fără cheia next_in_line) + fișier
+        # legacy cu o intrare → migrare la load.
+        hist.write_text(json.dumps({"analyzed": {}, "last_ai_decisions": {}}), encoding="utf-8")
+        legacy.write_text(json.dumps([self._entry("legacy-1")]), encoding="utf-8")
+        main._load_history()
+        assert [it["market_id"] for it in main._load_queue()] == ["legacy-1"]
+        # După prima salvare, coada trăiește în history.json: fișierul legacy poate
+        # dispărea, iar un nou restart o găsește tot acolo.
+        main._save_history()
+        legacy.unlink()
+        monkeypatch.setattr(main, "_opportunity_queue", [])
+        main._load_history()
+        assert [it["market_id"] for it in main._load_queue()] == ["legacy-1"]
+
+    def test_history_with_key_ignores_legacy_file(self, monkeypatch, tmp_path):
+        # Cheia next_in_line există (chiar goală) → fișierul legacy NU se re-importă
+        # (altfel intrări vechi/consumate ar reînvia la fiecare restart).
+        main, hist, legacy = self._fresh(monkeypatch, tmp_path)
+        hist.write_text(json.dumps({"analyzed": {}, "last_ai_decisions": {},
+                                    "next_in_line": []}), encoding="utf-8")
+        legacy.write_text(json.dumps([self._entry("stale")]), encoding="utf-8")
+        main._load_history()
+        assert main._load_queue() == []
+
+    def test_missing_history_migrates_legacy(self, monkeypatch, tmp_path):
+        main, _, legacy = self._fresh(monkeypatch, tmp_path)
+        legacy.write_text(json.dumps([self._entry("legacy-2")]), encoding="utf-8")
+        main._load_history()   # history.json inexistent → migrare din fișierul legacy
+        assert [it["market_id"] for it in main._load_queue()] == ["legacy-2"]
+
+    def test_expired_entries_pruned_at_load(self, monkeypatch, tmp_path):
+        import time
+        main, hist, _ = self._fresh(monkeypatch, tmp_path)
+        old = self._entry("old", added_at=time.time() - main._QUEUE_TTL_HOURS * 3600 - 10)
+        hist.write_text(json.dumps({"analyzed": {}, "last_ai_decisions": {},
+                                    "next_in_line": [old, self._entry("fresh")]}),
+                        encoding="utf-8")
+        main._load_history()
+        assert [it["market_id"] for it in main._load_queue()] == ["fresh"]
+
+    def test_corrupt_history_empties_queue(self, monkeypatch, tmp_path):
+        main, hist, _ = self._fresh(monkeypatch, tmp_path)
+        monkeypatch.setattr(main, "_opportunity_queue", [self._entry("stale")])
+        hist.write_text("{bad json", encoding="utf-8")
+        main._load_history()
+        assert main._load_queue() == []
+
+    def test_non_list_next_in_line_treated_empty(self, monkeypatch, tmp_path):
+        main, hist, _ = self._fresh(monkeypatch, tmp_path)
+        hist.write_text(json.dumps({"analyzed": {}, "next_in_line": {"m": 1}}), encoding="utf-8")
+        main._load_history()
+        assert main._load_queue() == []
+
+
+# ---------------------------------------------------------------------------
 # Tests: _execute_trade "wishlist" enqueue — ONLY when maxed + ACTIVATE_QUEUE
 # ---------------------------------------------------------------------------
 
 class TestWishlistEnqueue:
-    """Faza „Save" (Wishlist, ACTIVATE_QUEUE): _execute_trade salvează piața aprobată
-    de AI DOAR când balanța e suficientă (≥ 1.05) dar s-a atins MAX_ACTIVE_POSITIONS.
-    NU salvează pe lipsă de fonduri / slippage / duplicat, nu când ACTIVATE_QUEUE e
-    off, și nu la re-procesarea cozii (from_queue=True)."""
+    """Faza „Save" (Wishlist, ACTIVATE_QUEUE — implicit ON): _execute_trade salvează piața
+    aprobată de AI când NU poate fi deschisă ACUM: (1) cash insuficient pentru pragul
+    minim de intrare (master-switch allow_new_trades=False, gate-ul de balanță 1.05,
+    sizing skips), sau (2) MAX_ACTIVE_POSITIONS atins. NU salvează pe duplicat de token,
+    nu când ACTIVATE_QUEUE e off, și nu la re-procesarea cozii (from_queue=True)."""
 
     def _market(self):
         return {"id": "m1", "orderPriceMinTickSize": "0.01"}
@@ -1962,7 +2073,8 @@ class TestWishlistEnqueue:
         return [{"token_id": f"0xPOS{i}"} for i in range(n)]
 
     def _call(self, state, *, activate_queue=True, max_positions=5,
-              token_id="0xTOK", price=0.50, live_ask=None, from_queue=False):
+              token_id="0xTOK", price=0.50, live_ask=None, from_queue=False,
+              allow_new_trades=True):
         import main
         from config.settings import settings
         with patch.object(main, "_ACTIVATE_QUEUE", activate_queue), \
@@ -1974,7 +2086,7 @@ class TestWishlistEnqueue:
                 self._market(), state,
                 token_id=token_id, price=price, outcome_label="1 (Arsenal)",
                 decision=self._decision(), event_id="ev", title="Arsenal vs Chelsea",
-                from_queue=from_queue,
+                from_queue=from_queue, allow_new_trades=allow_new_trades,
             )
         return mock_order, mock_enq
 
@@ -2005,13 +2117,13 @@ class TestWishlistEnqueue:
         mock_enq.assert_not_called()
         mock_order.assert_called_once()
 
-    def test_below_balance_gate_no_enqueue(self):
-        # Regula 1.05 e neatinsă de ACTIVATE_QUEUE: sub prag → blocat la funds wall,
-        # fără wishlist, chiar dacă suntem la MAX (protejează API-ul).
+    def test_below_balance_gate_enqueues(self):
+        # Sub pragul de 1.05: ordinul rămâne blocat la funds wall (niciun BUY), dar
+        # oportunitatea NU se mai pierde — intră în wishlist pentru când revine cash-ul.
         state = {"pusd_balance": 1.0, "active_positions": self._maxed_positions()}
         mock_order, mock_enq = self._call(state)
         mock_order.assert_not_called()
-        mock_enq.assert_not_called()
+        mock_enq.assert_called_once()
 
     def test_duplicate_token_no_enqueue_when_maxed(self):
         # Dacă deținem deja token-ul, dedup-ul iese înainte de verificarea de wishlist.
@@ -2027,12 +2139,40 @@ class TestWishlistEnqueue:
         _, mock_enq = self._call(state, from_queue=True)
         mock_enq.assert_not_called()
 
-    def test_lack_of_funds_no_longer_enqueues(self):
-        # Vechiul trigger pe lipsă de fonduri a fost ELIMINAT: coada e DOAR pe MAX
-        # poziții. Balanță 1.0 (sub prag), fără poziții → blocat, nimic în wishlist.
+    def test_lack_of_funds_enqueues(self):
+        # Trigger-ul pe lipsă de fonduri (scenariul „$29 blocați în poziții, cenți cash"):
+        # balanță 1.0 (sub pragul minim de intrare), fără poziții → niciun ordin, dar
+        # oportunitatea aprobată de AI e salvată în wishlist.
         state = {"pusd_balance": 1.0, "active_positions": []}
-        _, mock_enq = self._call(state)
+        mock_order, mock_enq = self._call(state)
+        mock_order.assert_not_called()
+        mock_enq.assert_called_once()
+
+    def test_buy_disabled_master_switch_enqueues(self):
+        # Master-switch (allow_new_trades=False, setat de buclă la cash < 1.05): BUY
+        # strict blocat, dar oportunitatea intră în wishlist — scanarea pe „fără cash"
+        # alimentează coada în loc să arunce aprobările AI.
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        mock_order, mock_enq = self._call(state, allow_new_trades=False)
+        mock_order.assert_not_called()
+        mock_enq.assert_called_once()
+
+    def test_buy_disabled_queue_off_no_enqueue(self):
+        # Același master-switch cu ACTIVATE_QUEUE off → comportamentul vechi: blocat, atât.
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        mock_order, mock_enq = self._call(state, allow_new_trades=False, activate_queue=False)
+        mock_order.assert_not_called()
         mock_enq.assert_not_called()
+
+    def test_sizing_skip_enqueues(self):
+        # Gate coborât la 1.0 (ca în TestProcessMarketStateTracking) ca să atingem garda
+        # de sizing: ordin sub $1 (0.97×… la preț 0.46) → skip local + salvare în wishlist.
+        import main
+        state = {"pusd_balance": 1.0, "active_positions": []}
+        with patch.object(main, "_MIN_BALANCE_PUSD", 1.0):
+            mock_order, mock_enq = self._call(state, price=0.46)
+        mock_order.assert_not_called()
+        mock_enq.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -2202,9 +2342,10 @@ class TestProcessQueue:
 
 class TestDeadZoneGuard:
     """La gate-ul REAL de 1.05, o balanță din „zona moartă" 1.00–1.04 e blocată la
-    funds wall (și pusă în coadă) în loc să treacă, să producă un [Sizing] Skip sub
-    $1 fără a scădea balanța și să trimită botul în bucla-în-gol care apela Groq pe
-    toate piețele. O balanță ≥ 1.05 produce un ordin finanțabil (≥ $1)."""
+    funds wall în loc să treacă, să producă un [Sizing] Skip sub $1 fără a scădea
+    balanța și să trimită botul în bucla-în-gol care apela Groq pe toate piețele.
+    O balanță ≥ 1.05 produce un ordin finanțabil (≥ $1). ACTIVATE_QUEUE e oprit
+    explicit aici (cazul cu coadă — enqueue la funds wall — e în TestWishlistEnqueue)."""
 
     def _market(self):
         return {"id": "m1", "orderPriceMinTickSize": "0.01"}
@@ -2215,7 +2356,8 @@ class TestDeadZoneGuard:
     def _run(self, balance, price):
         import main
         state = {"pusd_balance": balance, "active_positions": []}
-        with patch("main._live_best_ask", return_value=None), \
+        with patch.object(main, "_ACTIVATE_QUEUE", False), \
+             patch("main._live_best_ask", return_value=None), \
              patch("main.place_limit_order", return_value={"success": True, "order_id": "o"}) as mock_order, \
              patch("main._enqueue_opportunity") as mock_enq:
             main._execute_trade(
@@ -2226,8 +2368,8 @@ class TestDeadZoneGuard:
         return state, mock_order, mock_enq
 
     def test_dead_zone_balance_blocked_no_order(self):
-        # 1.04 ∈ [1.00, 1.05): blocat la funds wall, niciun ordin. Fără wishlist:
-        # coada e DOAR pe MAX poziții, nu pe lipsă de fonduri (ACTIVATE_QUEUE off aici).
+        # 1.04 ∈ [1.00, 1.05): blocat la funds wall, niciun ordin; cu coada OFF nu se
+        # salvează nimic (comportamentul vechi, păstrat sub flag).
         state, mock_order, mock_enq = self._run(1.04, price=0.50)
         mock_order.assert_not_called()
         mock_enq.assert_not_called()
@@ -2255,13 +2397,15 @@ class TestDeadZoneGuard:
 
 
 # ---------------------------------------------------------------------------
-# Tests: ACTIVATE_QUEUE flag gating (default off; wishlist only when maxed)
+# Tests: ACTIVATE_QUEUE flag gating (default ON; off = coadă inertă)
 # ---------------------------------------------------------------------------
 
 class TestActivateQueueFlag:
-    """ACTIVATE_QUEUE gatează întreaga coadă. IMPLICIT False (coadă inertă). Când e
-    True ȘI suntem la MAX poziții, process_market lasă AI-ul să analizeze și salvează
-    aprobările în wishlist; când e False, păstrează skip-ul ieftin (fără apel LLM)."""
+    """ACTIVATE_QUEUE gatează întreaga coadă. IMPLICIT True (coada e activă — cerință:
+    oportunitățile NBA/etc. nu se pierd când cash-ul e blocat în poziții). Când e True
+    ȘI suntem la MAX poziții, process_market lasă AI-ul să analizeze și salvează
+    aprobările în wishlist; ACTIVATE_QUEUE=false restaurează skip-ul ieftin (fără apel
+    LLM) și coada complet inertă."""
 
     def _match_market(self):
         return {
@@ -2272,9 +2416,10 @@ class TestActivateQueueFlag:
             "events": [{"slug": "ev-1"}],
         }
 
-    def test_default_is_false(self):
+    def test_default_is_true(self):
+        # Coada e ACTIVĂ implicit (fără ACTIVATE_QUEUE în env) — cerință de produs.
         import main
-        assert main._ACTIVATE_QUEUE is False
+        assert main._ACTIVATE_QUEUE is True
 
     def _run(self, *, activate_queue, n_positions):
         import main
@@ -2463,7 +2608,8 @@ class TestBatchScan:
             "events": [{"slug": f"ev-{mid}"}],
         }
 
-    def _run_scan(self, markets, *, batch_size, decisions_by_id=None, balance=20.0, positions=None):
+    def _run_scan(self, markets, *, batch_size, decisions_by_id=None, balance=20.0,
+                  positions=None, activate_queue=True):
         import main
         decisions_by_id = decisions_by_id or {}
         state = {"pusd_balance": balance, "active_positions": positions or []}
@@ -2478,6 +2624,7 @@ class TestBatchScan:
 
         with patch.object(main, "_BATCH_SIZE", batch_size), \
              patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch.object(main, "_ACTIVATE_QUEUE", activate_queue), \
              patch("main.fetch_free_news", return_value=[]), \
              patch("main._record_analyzed"), \
              patch("main.analyse_batch", side_effect=fake_batch), \
@@ -2488,12 +2635,17 @@ class TestBatchScan:
 
     def test_batch_request_match_and_binary_shape(self):
         import main
+        # Meciul cară și titlul COMPLET al pieței + structura (by_code) pentru contextul
+        # sportiv din promptul de batch (market_title / is_three_way — _match_sport_context).
         match_item = {"kind": "match", "market_id": "m1", "label": "A vs B", "news": ["n"],
-                      "candidates": [{"code": "1", "name": "A", "price": 0.5}]}
+                      "title": "NBA: A vs B",
+                      "candidates": [{"code": "1", "name": "A", "price": 0.5}],
+                      "by_code": {"1": {}, "2": {}}}
         binary_item = {"kind": "binary", "market_id": "m2", "title": "T", "yes_price": 0.6, "news": []}
         assert main._batch_request(match_item) == {
             "market_id": "m1", "kind": "match", "title": "A vs B",
             "candidates": match_item["candidates"], "news": ["n"],
+            "market_title": "NBA: A vs B", "is_three_way": False,
         }
         assert main._batch_request(binary_item) == {
             "market_id": "m2", "kind": "binary", "title": "T", "price": 0.6, "news": [],
@@ -2563,13 +2715,34 @@ class TestBatchScan:
         mock_order.assert_not_called()
         assert any(c.args[:1] == (main._RATE_LIMIT_BACKOFF,) for c in mock_sleep.call_args_list)
 
-    def test_low_balance_skips_scan_entirely(self):
-        # Sub gate-ul de 1.05: nu pregătim/analizăm nimic (bariera de balanță intactă).
+    def test_low_balance_skips_scan_entirely_when_queue_off(self):
+        # Sub gate-ul de 1.05 și cu coada OFF: nu pregătim/analizăm nimic — comportamentul
+        # vechi, care economisește apelurile Groq când nimic nu s-ar putea cumpăra.
         _, mock_order, captured = self._run_scan(
-            [self._match_market("m1")], batch_size=5, balance=0.5,
+            [self._match_market("m1")], batch_size=5, balance=0.5, activate_queue=False,
         )
         assert captured["calls"] == 0
         mock_order.assert_not_called()
+
+    def test_low_balance_with_queue_scans_for_wishlist(self):
+        # Cu ACTIVATE_QUEUE (implicit), lipsa cash-ului NU mai oprește scanarea: piața
+        # aprobată de AI intră în wishlist prin gate-ul de fonduri din _execute_trade,
+        # și se va executa automat când o poziție închisă eliberează cash.
+        import main
+        decision = {"trade": True, "outcome": "1", "confidence": 0.9, "reason": "r"}
+        state = {"pusd_balance": 0.5, "active_positions": []}
+        with patch.object(main, "_BATCH_SIZE", 5), \
+             patch.object(main, "_INTER_ANALYSIS_DELAY", 0), \
+             patch.object(main, "_ACTIVATE_QUEUE", True), \
+             patch("main.fetch_free_news", return_value=[]), \
+             patch("main._record_analyzed"), \
+             patch("main.analyse_batch", return_value={"m1": decision}), \
+             patch("main._live_best_ask", return_value=None), \
+             patch("main._enqueue_opportunity") as mock_enq, \
+             patch("main.place_limit_order") as mock_order:
+            main._scan_markets([self._match_market("m1")], state)
+        mock_order.assert_not_called()      # niciun BUY fără cash
+        mock_enq.assert_called_once()       # dar oportunitatea e salvată în wishlist
 
     def test_fallback_single_when_batch_size_one(self):
         import main
@@ -3006,9 +3179,12 @@ class TestBuySellSeparation:
     def test_execute_trade_blocks_buy_when_new_trades_disabled(self):
         # Balanță AMPLĂ ($20), dar allow_new_trades=False → niciun ordin BUY, indiferent
         # de fonduri (modul de cumpărare e dezactivat), fără modificări de stare.
+        # ACTIVATE_QUEUE oprit: cu coada activă oportunitatea s-ar salva în wishlist
+        # (testat mai jos + în TestWishlistEnqueue), dar ordinul tot NU pleacă.
         import main
         state = {"pusd_balance": 20.0, "active_positions": []}
-        with patch("main._live_best_ask", return_value=None), \
+        with patch.object(main, "_ACTIVATE_QUEUE", False), \
+             patch("main._live_best_ask", return_value=None), \
              patch("main._enqueue_opportunity") as mock_enq, \
              patch("main.place_limit_order") as mock_order:
             main._execute_trade(
@@ -3020,6 +3196,26 @@ class TestBuySellSeparation:
         mock_order.assert_not_called()
         mock_enq.assert_not_called()
         assert state["pusd_balance"] == pytest.approx(20.0)   # balanța neatinsă
+        assert state["active_positions"] == []
+
+    def test_blocked_buy_saved_to_wishlist_when_queue_on(self):
+        # Cu ACTIVATE_QUEUE (implicit), BUY-ul blocat de master-switch NU se pierde:
+        # intră în wishlist (fără ordin, fără modificări de balanță/poziții).
+        import main
+        state = {"pusd_balance": 20.0, "active_positions": []}
+        with patch.object(main, "_ACTIVATE_QUEUE", True), \
+             patch("main._live_best_ask", return_value=None), \
+             patch("main._enqueue_opportunity") as mock_enq, \
+             patch("main.place_limit_order") as mock_order:
+            main._execute_trade(
+                self._market(), state,
+                token_id="0xTOK", price=0.50, outcome_label="1 (Arsenal)",
+                decision=self._decision(), event_id="ev", title="Arsenal vs Chelsea",
+                allow_new_trades=False,
+            )
+        mock_order.assert_not_called()
+        mock_enq.assert_called_once()
+        assert state["pusd_balance"] == pytest.approx(20.0)
         assert state["active_positions"] == []
 
     def test_execute_trade_allows_buy_when_new_trades_enabled(self):

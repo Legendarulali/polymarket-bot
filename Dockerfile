@@ -27,6 +27,18 @@ COPY . .
 # history.json[.tmp] → [Errno 13] Permission denied. Dă-i botuser proprietatea.
 RUN chown -R botuser:botuser /app
 
+# Director de STARE PERSISTENTĂ: montează aici un volum (bind mount ./data:/data —
+# vezi docker-compose.yml — sau un volum Railway pe /data). history.json (istoric
+# analize + decizii AI + coada next_in_line) și logurile trăiesc pe volum, deci
+# distrugerea/reconstruirea/repornirea containerului NU pierde nimic — la pornire
+# botul le recitește direct de pe mașina gazdă. Fără volum montat, comportamentul
+# rămâne cel vechi (stare efemeră în container). QUEUE_FILE e doar sursa de MIGRARE
+# legacy a cozii (vechiul next_in_line.json separat).
+ENV HISTORY_FILE=/data/history.json \
+    QUEUE_FILE=/data/next_in_line.json \
+    LOG_FILE=/data/logs/bot.log
+RUN mkdir -p /data/logs && chown -R botuser:botuser /data
+
 USER botuser
 
 CMD ["python", "main.py"]

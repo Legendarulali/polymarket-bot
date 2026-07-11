@@ -42,9 +42,23 @@ Minimul obligatoriu: `POLYMARKET_PRIVATE_KEY` și `FUNDER_ADDRESS`.
 
 ### Deploy (Railway / Docker)
 
-Repo-ul include `Dockerfile` (multi-stage, non-root) și `railway.json`.
-Secretele se setează ca variabile de mediu în platformă — fișierul `.env`
-nu este inclus niciodată în imagine (vezi `.dockerignore`).
+Repo-ul include `Dockerfile` (multi-stage, non-root), `docker-compose.yml` și
+`railway.json`. Secretele se setează ca variabile de mediu în platformă — fișierul
+`.env` nu este inclus niciodată în imagine (vezi `.dockerignore`).
+
+**Persistență (volum `/data`):** imaginea ține toată starea botului în `/data` —
+`history.json` (istoricul analizelor + ultimele decizii AI + coada de oportunități
+`next_in_line`) și logurile rotative (`/data/logs/bot.log`). Montează un volum acolo
+și starea supraviețuiește distrugerii/reconstruirii/repornirii containerului:
+
+```bash
+docker compose up -d --build     # bind mount ./data:/data (vezi docker-compose.yml)
+# sau, fără compose:
+docker run -d --env-file .env -v "$(pwd)/data:/data" polymarket-bot
+```
+
+Pe Railway, atașează un volum montat pe `/data` — fără el starea rămâne efemeră
+(comportamentul vechi), dar botul funcționează identic.
 
 ## Controale de risc
 

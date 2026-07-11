@@ -131,16 +131,22 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Izolare fișier persistent: history.json → director temporar per test.
+# Izolare stare persistentă: history.json → director temporar per test.
 # Necesar acum că _record_ai_decision persistă deciziile AI (împreună cu istoricul
 # de analiză) la fiecare update. Fără redirecționare, testele care ating
 # _record_ai_decision (panic-sell, raportul de status) ar suprascrie history.json
-# real din repo. Rulează pentru fiecare test; testele care își setează propriul
-# _HISTORY_FILE îl suprascriu în continuare (monkeypatch, ultima setare câștigă).
+# real din repo. Coada „next in line" trăiește ÎN MEMORIE (main._opportunity_queue,
+# persistată tot în history.json) → o resetăm per test, altfel starea globală ar
+# curge dintr-un test în altul; _QUEUE_FILE (sursa de migrare legacy) e și el
+# redirecționat ca un next_in_line.json real din repo să nu fie citit de teste.
+# Rulează pentru fiecare test; testele care își setează propriul _HISTORY_FILE îl
+# suprascriu în continuare (monkeypatch, ultima setare câștigă).
 # ---------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
 def _isolate_history_file(monkeypatch, tmp_path):
     main = sys.modules.get("main")
     if main is not None:
         monkeypatch.setattr(main, "_HISTORY_FILE", str(tmp_path / "history.json"), raising=False)
+        monkeypatch.setattr(main, "_QUEUE_FILE", str(tmp_path / "next_in_line.json"), raising=False)
+        monkeypatch.setattr(main, "_opportunity_queue", [], raising=False)
     yield

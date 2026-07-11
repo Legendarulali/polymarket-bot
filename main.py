@@ -185,22 +185,31 @@ _HISTORY_FILE = os.getenv("HISTORY_FILE") or os.path.join(
 )
 _analyzed_history: dict[str, float] = {}
 
-# Coadă de oportunități „next in line" (next_in_line.json): piețe aprobate de AI
-# (trade=True, confidence peste prag) dar nefinanțate la momentul scanării (lipsă
-# fonduri). Sunt re-evaluate PRIORITAR când revin fondurile, fără a re-scana mii de
-# piețe. Calea poate fi suprascrisă cu QUEUE_FILE (ex: volum montat pe Railway);
-# altfel next_in_line.json lângă main.py. Best-effort, exact ca history.json.
+# Coadă de oportunități „next in line": piețe aprobate de AI (trade=True, confidence
+# peste prag) dar neexecutabile la momentul scanării — cash insuficient pentru pragul
+# minim de intrare SAU MAX_ACTIVE_POSITIONS atins. Sunt re-evaluate PRIORITAR imediat ce
+# se eliberează cash / un slot, fără a re-scana mii de piețe.
+# PERSISTENȚĂ: coada trăiește ÎN history.json (cheia `next_in_line`, scrisă la fiecare
+# update prin _save_history) — un container repornit cu history.json pe volum (vezi
+# docker-compose.yml, /data) își recuperează coada INTACTĂ la _load_history.
+# _QUEUE_FILE (QUEUE_FILE env) e păstrat DOAR ca sursă de MIGRARE legacy: un
+# next_in_line.json vechi e importat o singură dată, când history.json nu are încă
+# cheia `next_in_line` (vezi _migrate_legacy_queue).
 _QUEUE_FILE = os.getenv("QUEUE_FILE") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "next_in_line.json"
 )
 _QUEUE_TTL_HOURS = 12   # oportunitățile mai vechi sunt eliminate (știri expirate)
 _QUEUE_MAX_SIZE = 10    # plafon coadă: păstrăm intrările cu cel mai mare confidence
-# Activează coada „Wishlist". IMPLICIT dezactivată (False): coada e complet inertă —
-# funcțiile ei (_clean_queue / _process_queue / _enqueue_opportunity) NU sunt apelate.
-# Când e ON, coada salvează DOAR piețele aprobate de AI care nu pot fi deschise pentru
-# că s-a atins MAX_ACTIVE_POSITIONS (deși balanța e suficientă, ≥ _MIN_BALANCE_PUSD), și
-# le re-evaluează prioritar când se eliberează un slot. NU atinge regula de balanță 1.05.
-_ACTIVATE_QUEUE = os.getenv("ACTIVATE_QUEUE", "false").strip().lower() in ("1", "true", "yes", "on")
+# Coada ÎN MEMORIE (sursa de adevăr la runtime; restaurată din history.json la pornire).
+_opportunity_queue: list[dict] = []
+# Activează coada „Wishlist". IMPLICIT ACTIVATĂ (true): oportunitățile aprobate de AI
+# care nu pot fi deschise ACUM (cash insuficient pentru pragul minim de intrare — ex.
+# $29 blocați în poziții și doar cenți cash — SAU limită de expunere atinsă) sunt salvate
+# și re-evaluate prioritar, în ordinea confidence-ului, imediat ce o poziție se închide
+# (TP/SL/Panic Sell) și eliberează cash sau un slot. ACTIVATE_QUEUE=false o dezactivează
+# complet (coada devine inertă — comportamentul vechi, economisește apelurile Groq de
+# scanare pe perioadele fără fonduri).
+_ACTIVATE_QUEUE = os.getenv("ACTIVATE_QUEUE", "true").strip().lower() in ("1", "true", "yes", "on")
 
 # --- Panic Sell (STEP 4): re-evaluare pe ȘTIRI a pozițiilor DEȚINUTE ---
 # IMPLICIT dezactivat (False): e o lichidare REALĂ declanșată de judecata unui LLM, deci
@@ -558,12 +567,16 @@ def _load_history() -> None:
     """Încarcă istoricul din history.json (prima instrucțiune la rulare).
 
     Formatul curent e un dict „învelit": {"analyzed": {id: ts}, "last_ai_decisions":
-    {token_id: {...}}}, ca AMBELE stări — cooldown-ul de analiză ȘI ultima decizie AI per
-    poziție — să supraviețuiască unui restart dintr-un singur fișier. Compatibil înapoi cu
-    formatele vechi: un dict plat {id: ts} sau o listă simplă de ID-uri (analizate „acum").
-    Intrările de analiză mai vechi decât _CACHE_TTL_SECONDS sunt eliminate la încărcare.
+    {token_id: {...}}, "next_in_line": [...]}, ca TOATE stările — cooldown-ul de analiză,
+    ultima decizie AI per poziție ȘI coada de oportunități „next in line" — să
+    supraviețuiască unui restart dintr-un SINGUR fișier (pe volumul Docker /data, vezi
+    docker-compose.yml). Compatibil înapoi cu formatele vechi: un dict plat {id: ts} sau
+    o listă simplă de ID-uri (analizate „acum"); o coadă lipsă din fișier e migrată din
+    vechiul next_in_line.json (_migrate_legacy_queue). Intrările de analiză mai vechi
+    decât _CACHE_TTL_SECONDS și intrările de coadă mai vechi decât _QUEUE_TTL_HOURS sunt
+    eliminate la încărcare.
     """
-    global _analyzed_history, _last_ai_decision
+    global _analyzed_history, _last_ai_decision, _opportunity_queue
     now = time.time()
     try:
         with open(_HISTORY_FILE, "r", encoding="utf-8") as fh:
@@ -571,6 +584,7 @@ def _load_history() -> None:
     except FileNotFoundError:
         _analyzed_history = {}
         _last_ai_decision = {}
+        _opportunity_queue = _fresh_queue_entries(_migrate_legacy_queue())
         logger.info("[History] %s inexistent — pornesc cu istoric gol.", _HISTORY_FILE)
         return
     # ValueError acoperă și json.JSONDecodeError (subclasă) ȘI UnicodeDecodeError (fișier
@@ -580,19 +594,30 @@ def _load_history() -> None:
     except (ValueError, OSError) as exc:
         _analyzed_history = {}
         _last_ai_decision = {}
+        _opportunity_queue = []
         logger.warning("[History] Nu am putut citi %s (%s) — pornesc cu istoric gol.", _HISTORY_FILE, exc)
         return
 
-    # Formatul „învelit" nou (dict cu sub-blocul `analyzed` și/sau `last_ai_decisions`) vs.
-    # formatele vechi (dict plat {id: ts} sau listă de ID-uri). Detecția e sigură: în formatul
-    # vechi valorile sunt timestamp-uri (numere), niciodată dict-uri.
+    # Formatul „învelit" nou (dict cu sub-blocul `analyzed` / `last_ai_decisions` /
+    # `next_in_line`) vs. formatele vechi (dict plat {id: ts} sau listă de ID-uri). Detecția
+    # e sigură: în formatul vechi valorile sunt timestamp-uri (numere), niciodată dict-uri.
     raw_analyzed = raw
     decisions_raw: dict = {}
     if isinstance(raw, dict) and (
-        isinstance(raw.get("analyzed"), dict) or isinstance(raw.get("last_ai_decisions"), dict)
+        isinstance(raw.get("analyzed"), dict)
+        or isinstance(raw.get("last_ai_decisions"), dict)
+        or isinstance(raw.get("next_in_line"), list)
     ):
         raw_analyzed = raw.get("analyzed", {})
         decisions_raw = raw.get("last_ai_decisions", {})
+
+    # Coada „next in line": restaurată din history.json; un fișier istoric FĂRĂ cheia
+    # `next_in_line` (scris înainte de mutarea cozii aici) declanșează migrarea one-shot
+    # din vechiul next_in_line.json — după prima _save_history, cheia există mereu.
+    queue_raw = raw.get("next_in_line") if isinstance(raw, dict) else None
+    _opportunity_queue = _fresh_queue_entries(
+        queue_raw if isinstance(queue_raw, list) else _migrate_legacy_queue()
+    )
 
     parsed: dict[str, float] = {}
     if isinstance(raw_analyzed, dict):
@@ -616,8 +641,9 @@ def _load_history() -> None:
     expired = len(parsed) - len(_analyzed_history)
     logger.info(
         "[History] Încărcate %d piețe analizate recent din %s (%d expirate, ignorate); "
-        "%d decizii AI restaurate.",
+        "%d decizii AI restaurate; %d oportunități next_in_line restaurate.",
         len(_analyzed_history), _HISTORY_FILE, expired, len(_last_ai_decision),
+        len(_opportunity_queue),
     )
     if expired:
         _save_history()  # rescrie fișierul curățat de intrările expirate
@@ -626,8 +652,9 @@ def _load_history() -> None:
 def _save_history() -> None:
     """Persistă istoricul în history.json (scriere atomică), în formatul „învelit":
     {"analyzed": {id: ts}} (piețele analizate — cooldown) + {"last_ai_decisions":
-    {token_id: {...}}} (ultima decizie AI per poziție), ca ambele să supraviețuiască unui
-    restart. Creează directorul părinte dacă lipsește; erorile de IO/serializare sunt
+    {token_id: {...}}} (ultima decizie AI per poziție) + {"next_in_line": [...]} (coada
+    de oportunități), ca TOATE să supraviețuiască unui restart dintr-un singur fișier.
+    Creează directorul părinte dacă lipsește; erorile de IO/serializare sunt
     prinse și logate, fără a opri botul (history e best-effort).
     """
     tmp = f"{_HISTORY_FILE}.tmp"
@@ -638,6 +665,7 @@ def _save_history() -> None:
         payload = {
             "analyzed": _analyzed_history,
             "last_ai_decisions": _last_ai_decision,
+            "next_in_line": _opportunity_queue,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
@@ -684,12 +712,27 @@ def _qfloat(value, default: float = 0.0) -> float:
         return default
 
 
-def _load_queue() -> list[dict]:
-    """Citește coada de oportunități din next_in_line.json.
+def _fresh_queue_entries(entries) -> list[dict]:
+    """Filtrează intrările de coadă VALIDE (dict cu `market_id` — altfel nereexecutabile) și
+    NEEXPIRATE (mai noi decât _QUEUE_TTL_HOURS — știrile din spatele tezei s-au perimat).
+    Aplicat la restaurarea cozii din history.json / migrarea legacy (_load_history)."""
+    if not isinstance(entries, list):
+        return []
+    now = time.time()
+    ttl = _QUEUE_TTL_HOURS * 3600
+    return [
+        it for it in entries
+        if isinstance(it, dict) and it.get("market_id")
+        and now - _qfloat(it.get("added_at")) < ttl
+    ]
 
-    Întoarce o listă (goală dacă fișierul lipsește, e corupt sau nu e o listă).
-    Filtrează intrările fără `market_id` (nereutilizabile). Robust la fișier
-    lipsă/corupt — niciodată ridică, ca botul să nu cadă pe o coadă stricată."""
+
+def _migrate_legacy_queue() -> list[dict]:
+    """MIGRARE one-shot: citește vechiul fișier separat next_in_line.json (_QUEUE_FILE),
+    folosit înainte ca persistența cozii să fie mutată în history.json. Apelată DOAR din
+    _load_history, când history.json lipsește sau nu are încă cheia `next_in_line`; după
+    prima _save_history coada trăiește în history.json și fișierul vechi e ignorat definitiv
+    (nu îl ștergem — e inofensiv). Robustă la fișier lipsă/corupt (listă goală)."""
     try:
         with open(_QUEUE_FILE, "r", encoding="utf-8") as fh:
             raw = json.load(fh)
@@ -698,26 +741,35 @@ def _load_queue() -> list[dict]:
     # ValueError = JSONDecodeError + UnicodeDecodeError (fișier corupt binar) — vezi
     # _load_history pentru raționament; coada nu trebuie să poată doborî botul.
     except (ValueError, OSError) as exc:
-        logger.warning("[Queue] Nu am putut citi %s (%s) — coadă goală.", _QUEUE_FILE, exc)
+        logger.warning("[Queue] Nu am putut citi fișierul legacy %s (%s) — coadă goală.", _QUEUE_FILE, exc)
         return []
     if not isinstance(raw, list):
-        logger.warning("[Queue] %s nu conține o listă — coadă goală.", _QUEUE_FILE)
         return []
-    return [it for it in raw if isinstance(it, dict) and it.get("market_id")]
+    queue = [it for it in raw if isinstance(it, dict) and it.get("market_id")]
+    if queue:
+        logger.info(
+            "[Queue] %d oportunități migrate din fișierul legacy %s în history.json.",
+            len(queue), _QUEUE_FILE,
+        )
+    return queue
+
+
+def _load_queue() -> list[dict]:
+    """Coada de oportunități „next in line" — ținută ÎN MEMORIE (_opportunity_queue) și
+    persistată în history.json (cheia `next_in_line`), NU într-un fișier separat: un
+    container repornit își recuperează coada din același volum cu istoricul, la
+    _load_history. Întoarce o COPIE filtrată (doar intrări valide) — apelanții o pot
+    modifica liber și o salvează înapoi cu _save_queue."""
+    return [it for it in _opportunity_queue if isinstance(it, dict) and it.get("market_id")]
 
 
 def _save_queue(queue: list[dict]) -> None:
-    """Persistă coada (scriere atomică). Best-effort: erorile IO sunt logate, nu ridicate."""
-    tmp = f"{_QUEUE_FILE}.tmp"
-    try:
-        parent = os.path.dirname(_QUEUE_FILE)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(queue, fh)
-        os.replace(tmp, _QUEUE_FILE)
-    except OSError as exc:
-        logger.warning("[Queue] Nu am putut salva %s: %s", _QUEUE_FILE, exc)
+    """Persistă coada: actualizează memoria (_opportunity_queue) și scrie IMEDIAT
+    history.json (prin _save_history — scriere atomică, best-effort), ca fiecare
+    actualizare a cozii să supraviețuiască unei opriri bruște a containerului."""
+    global _opportunity_queue
+    _opportunity_queue = list(queue)
+    _save_history()
 
 
 def _enqueue_opportunity(
@@ -730,12 +782,13 @@ def _enqueue_opportunity(
     event_id: str = "",
     tick_size: str = "0.01",
 ) -> None:
-    """Adaugă în coadă o oportunitate aprobată de AI dar nefinanțată (lipsă fonduri).
+    """Adaugă în coadă o oportunitate aprobată de AI dar neexecutabilă acum
+    (cash sub pragul minim de intrare sau MAX poziții — vezi _queue_if_enabled).
 
     Deduplică pe `market_id` (intrarea nouă o înlocuiește pe cea veche, cu preț/
     confidence proaspete) și plafonează coada la _QUEUE_MAX_SIZE, păstrând
     intrările cu cel mai mare confidence. Fără `token_id` nu putem reexecuta, deci
-    intrarea e ignorată."""
+    intrarea e ignorată. Persistă imediat în history.json (via _save_queue)."""
     if not token_id:
         logger.debug("[Queue] '%s' fără token_id — nu se pune în coadă.", str(title)[:50])
         return
@@ -1185,7 +1238,14 @@ def _analyse_single(item: dict) -> dict:
     """Decizie LLM pentru UN singur item pregătit (cale non-batch: process_market).
     Rutează către analyse_match (1X2) sau analyse_market (binar)."""
     if item["kind"] == "match":
-        return analyse_match(item["home"], item["away"], item["candidates"], item["news"])
+        return analyse_match(
+            item["home"], item["away"], item["candidates"], item["news"],
+            # Context sportiv în promptul de BUY: titlul COMPLET al pieței (pentru
+            # detecția sportului) + structura reală (există leg „X"?) — vezi
+            # _match_sport_context în ai_analyser.
+            market_title=item["title"],
+            is_three_way="X" in (item.get("by_code") or {}),
+        )
     return analyse_market(item["title"], item["yes_price"], item["news"])
 
 
@@ -1298,13 +1358,34 @@ def _execute_trade(
     orice BUY chiar la intrare, înaintea oricărei alte verificări — vezi „master-switch
     BUY" mai jos. E independent de gate-ul de balanță și nu afectează SELL-urile.
 
-    Wishlist (doar cu ACTIVATE_QUEUE): dacă balanța e suficientă (≥ _MIN_BALANCE_PUSD)
-    dar s-a atins MAX_ACTIVE_POSITIONS, piața aprobată de AI nu se tranzacționează, ci
-    se salvează în next_in_line.json pentru re-evaluare prioritară când se eliberează un
-    slot. `from_queue=True` (apel din re-procesarea cozii) dezactivează salvarea, ca o
-    intrare re-evaluată să nu se reintroducă la nesfârșit."""
+    Wishlist (cu ACTIVATE_QUEUE, implicit ON): o piață aprobată de AI care NU poate fi
+    deschisă ACUM se salvează în coada next_in_line (persistată în history.json) pentru
+    re-evaluare prioritară când condiția dispare. Declanșatoare: (1) cash insuficient
+    pentru pragul minim de intrare (master-switch / gate-ul de balanță / sizing skips);
+    (2) MAX_ACTIVE_POSITIONS atins. `from_queue=True` (apel din re-procesarea cozii)
+    dezactivează salvarea, ca o intrare re-evaluată să nu se reintroducă la nesfârșit."""
     pusd_balance: float = account_state.get("pusd_balance", 0.0)
     active_positions: list[dict] = account_state.setdefault("active_positions", [])
+
+    def _queue_if_enabled(context: str) -> None:
+        """Salvează oportunitatea aprobată de AI în wishlist (next_in_line, persistată în
+        history.json) când nu poate fi deschisă ACUM. Doar cu ACTIVATE_QUEUE, doar la
+        scanare reală (nu la re-procesarea cozii — anti-buclă) și doar dacă intrarea e
+        re-executabilă (token valid, preț valid, nu deținem deja token-ul)."""
+        if not _ACTIVATE_QUEUE or from_queue or not token_id or price < 0.01:
+            return
+        if any(pos.get("token_id") == token_id for pos in active_positions):
+            return
+        _scan_stats["adăugate în wishlist"] += 1
+        _enqueue_opportunity(
+            market.get("id", "?"), token_id, title, outcome_label, price,
+            decision.get("confidence", 0.0), event_id=event_id,
+            tick_size=str(market.get("orderPriceMinTickSize") or "0.01"),
+        )
+        logger.info(
+            "[Queue] '%s' (%s) salvată în next_in_line — %s.",
+            title[:50], outcome_label, context,
+        )
 
     # DRY_RUN (mod simulare / stress test): la acest punct piața a fost deja APROBATĂ de
     # AI (trade=True, confidence ≥ prag — verificate în `_apply_decision`/`_reevaluate_queued`).
@@ -1330,22 +1411,29 @@ def _execute_trade(
     # pleacă, indiferent de restul verificărilor de mai jos. E gardul explicit, numit, pe
     # chokepoint-ul prin care trec TOATE cumpărările (scanare + coadă). SELL-urile (TP/SL/
     # exit din position_manager) NU trec pe aici, deci rămân active chiar și cu cash zero.
+    # Cu ACTIVATE_QUEUE, oportunitatea NU se pierde: intră în wishlist și se execută
+    # automat când o poziție închisă eliberează cash.
     if not allow_new_trades:
         logger.info(
             "[Agent] BUY blocat pentru '%s' (%s): modul de cumpărare e dezactivat "
             "(cash insuficient pentru achiziții noi).",
             title[:60], outcome_label,
         )
+        _queue_if_enabled("cash insuficient (modul de cumpărare dezactivat)")
         return
 
     # Sub pragul _MIN_BALANCE_PUSD (1.05, peste minimul Polymarket de $1 ca să acopere
     # bufferul de 3% — vezi „zona moartă") nu putem plasa un ordin valid → blocăm.
-    # Între prag și $5 ordinul NU e blocat, ci dimensionat dinamic. Regula NU e atinsă
-    # de ACTIVATE_QUEUE: wishlist-ul de mai jos rulează DOAR după ce trecem de acest gate.
+    # Între prag și $5 ordinul NU e blocat, ci dimensionat dinamic. Cu ACTIVATE_QUEUE,
+    # oportunitatea blocată aici intră în wishlist (pragul minim de intrare nu e atins
+    # ACUM, dar cash-ul poate reveni la închiderea unei poziții).
     if pusd_balance < _MIN_BALANCE_PUSD:
         logger.warning(
             "[Agent] Balanță %.4f pUSD sub pragul de $%.2f (buffer anti-zonă-moartă) — ordin imposibil. Blocat.",
             pusd_balance, _MIN_BALANCE_PUSD,
+        )
+        _queue_if_enabled(
+            f"balanță {pusd_balance:.2f} pUSD sub pragul minim de intrare (${_MIN_BALANCE_PUSD:.2f})"
         )
         return
 
@@ -1367,19 +1455,16 @@ def _execute_trade(
 
     # Wishlist (ACTIVATE_QUEUE): balanță OK, token valid, fără duplicat, dar suntem la
     # MAX_ACTIVE_POSITIONS → nu putem deschide o poziție nouă acum. Salvăm piața aprobată
-    # de AI în next_in_line.json pentru când se eliberează un slot, în loc s-o pierdem.
-    # Doar la scanare reală (not from_queue), ca o re-evaluare din coadă să nu se re-pună.
+    # de AI în coada next_in_line (history.json) pentru când se eliberează un slot, în
+    # loc s-o pierdem. Doar la scanare reală (not from_queue) — anti-buclă.
     if (
         not from_queue
         and _ACTIVATE_QUEUE
         and settings.MAX_ACTIVE_POSITIONS > 0
         and len(active_positions) >= settings.MAX_ACTIVE_POSITIONS
     ):
-        _scan_stats["adăugate în wishlist"] += 1
-        _enqueue_opportunity(
-            market.get("id", "?"), token_id, title, outcome_label, price,
-            decision.get("confidence", 0.0), event_id=event_id,
-            tick_size=str(market.get("orderPriceMinTickSize") or "0.01"),
+        _queue_if_enabled(
+            f"limită de expunere atinsă ({len(active_positions)}/{settings.MAX_ACTIVE_POSITIONS})"
         )
         return
 
@@ -1411,21 +1496,27 @@ def _execute_trade(
     order_total = round(estimated_size * price, 4)                    # valoarea ordinului ($)
 
     # Verificare 1: la acest preț bugetul nu acoperă nici măcar o acțiune întreagă.
+    # Cash există dar nu ajunge pentru PRAGUL MINIM DE INTRARE pe această piață → wishlist.
     if estimated_size < 1:
         logger.info(
             "[Sizing] Skip '%s': preț $%.2f prea mare — bugetul de $%.2f cumpără doar "
             "%.2f acțiuni (< 1). Niciun ordin trimis.",
             title[:40], price, safe_balance, estimated_size,
         )
+        _queue_if_enabled(f"bugetul de ${safe_balance:.2f} nu acoperă o acțiune la ${price:.2f}")
         return
 
     # Verificare 2: valoarea totală a ordinului e sub minimul de $1.00 impus de
-    # API-ul Polymarket → ar fi respins (400). Îl sărim local, fără a lovi API-ul.
+    # API-ul Polymarket → ar fi respins (400). Îl sărim local, fără a lovi API-ul,
+    # și salvăm oportunitatea în wishlist (același caz de „cash sub pragul de intrare").
     if order_total < _MIN_ORDER_VALUE_USD:
         logger.info(
             "[Sizing] Skip '%s': valoare ordin $%.2f (%.2f acțiuni × $%.2f) sub minimul "
             "Polymarket de $%.2f. Niciun ordin trimis.",
             title[:40], order_total, estimated_size, price, _MIN_ORDER_VALUE_USD,
+        )
+        _queue_if_enabled(
+            f"valoare ordin ${order_total:.2f} sub minimul Polymarket de ${_MIN_ORDER_VALUE_USD:.2f}"
         )
         return
 
@@ -1829,7 +1920,8 @@ def _reevaluate_queued(item: dict, account_state: dict, allow_new_trades: bool =
 
 
 def _process_queue(account_state: dict, allow_new_trades: bool = True) -> None:
-    """Procesează PRIORITAR coada next_in_line.json înainte de scanarea masivă.
+    """Procesează PRIORITAR coada next_in_line (persistată în history.json) înainte de
+    scanarea masivă — deci imediat ce cash-ul / un slot se eliberează.
 
     Oportunitățile cu confidence mai mare se evaluează întâi. Fiecare e scoasă din
     coadă ÎNAINTE de re-evaluare (coada avansează indiferent de rezultat — cerința
@@ -1881,6 +1973,11 @@ def _batch_request(item: dict) -> dict:
         return {
             "market_id": item["market_id"], "kind": "match",
             "title": item["label"], "candidates": item["candidates"], "news": item["news"],
+            # Context sportiv per meci în promptul de batch: titlul COMPLET al pieței
+            # („label"-ul e doar „Home vs Away", fără cuvintele-cheie de sport) +
+            # structura reală a meciului (există leg „X"?) — vezi _match_sport_context.
+            "market_title": item.get("title", ""),
+            "is_three_way": "X" in (item.get("by_code") or {}),
         }
     return {
         "market_id": item["market_id"], "kind": "binary",
@@ -1953,7 +2050,9 @@ def _flush_batch(batch: list[dict], account_state: dict, allow_new_trades: bool 
             _apply_decision(it, decision, account_state, allow_new_trades)
         except Exception as exc:
             logger.error("[Batch] Eroare la aplicarea deciziei pentru id=%s: %s", mid, exc, exc_info=True)
-        if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+        # Cu ACTIVATE_QUEUE continuăm aplicarea (ieftină, fără Groq): deciziile de BUY
+        # rămase intră în wishlist prin gate-urile de fonduri din _execute_trade.
+        if not _DRY_RUN and not _ACTIVATE_QUEUE and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
             logger.info(
                 "[Batch] Balanță sub minimul de $%.2f în timpul execuției lotului — "
                 "opresc aplicarea restului.", _MIN_BALANCE_PUSD,
@@ -2035,7 +2134,8 @@ def _scan_markets(markets: list[dict], account_state: dict, allow_new_trades: bo
         for market in markets:
             if not RUNNING:
                 break
-            if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+            # Cu ACTIVATE_QUEUE nu abandonăm: aprobările AI intră în wishlist chiar fără cash.
+            if not _DRY_RUN and not _ACTIVATE_QUEUE and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
                 logger.info(
                     "[Agent] Balanța a fost epuizată în timpul scanării curente. "
                     "Abandonez restul piețelor din această rundă pentru a economisi API calls."
@@ -2059,7 +2159,9 @@ def _scan_markets(markets: list[dict], account_state: dict, allow_new_trades: bo
     for market in markets:
         if not RUNNING:
             break
-        if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+        # Cu ACTIVATE_QUEUE nu abandonăm: scanarea rămâne utilă și fără cash — aprobările
+        # AI intră în wishlist (next_in_line) prin gate-urile din _execute_trade.
+        if not _DRY_RUN and not _ACTIVATE_QUEUE and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
             logger.info(
                 "[Agent] Balanța a fost epuizată în timpul scanării curente. "
                 "Abandonez restul piețelor din această rundă pentru a economisi API calls."
@@ -2080,7 +2182,8 @@ def _scan_markets(markets: list[dict], account_state: dict, allow_new_trades: bo
         if len(batch) >= _BATCH_SIZE:
             _flush_batch(batch, account_state, allow_new_trades)
             batch = []
-            if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
+            # Idem: cu ACTIVATE_QUEUE, loturile următoare alimentează wishlist-ul.
+            if not _DRY_RUN and not _ACTIVATE_QUEUE and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
                 logger.info("[Agent] Balanța a fost epuizată după un lot. Abandonez restul rundei.")
                 break
 
@@ -2284,6 +2387,14 @@ def main() -> None:
                 # _apply_decision → _execute_trade, blochează STRICT orice BUY, lăsând SELL-urile
                 # (check_exit_conditions, în afara acestui flux) neatinse. În DRY_RUN rămâne True
                 # (oricum nu pleacă niciun ordin real — _execute_trade e interceptat la intrare).
+                # Balanța poate fi fost creditată LOCAL chiar în acest heartbeat de o
+                # lichidare (Panic Sell creditează account_state la un SELL reușit) →
+                # reîmprospătăm ÎNAINTE de gate, ca cash-ul proaspăt eliberat de o poziție
+                # închisă să fie folosit IMEDIAT de coada next_in_line (mai jos, în același
+                # heartbeat), nu abia la reconcilierea următoare. (TP/SL nu creditează local
+                # — ordinul SELL se umple asincron; cash-ul lui apare la reconcilierea
+                # heartbeat-ului următor, ≤60s, și coada îl consumă atunci.)
+                pusd_balance = account_state.get("pusd_balance", pusd_balance)
                 allow_new_trades = _DRY_RUN or pusd_balance >= _MIN_BALANCE_PUSD
                 if not allow_new_trades:
                     logger.warning(
@@ -2292,12 +2403,22 @@ def main() -> None:
                         "vinde pozițiile existente (TP/SL/exit rămân active).",
                         pusd_balance, _MIN_BALANCE_PUSD,
                     )
-                    # Scanarea masivă produce DOAR decizii de cumpărare (BUY) pe piețe noi —
-                    # toate ar fi blocate acum → ar irosi degeaba bugetul de tokeni Groq (vezi
-                    # filtrul STRICT/batching). O sărim; protecția pozițiilor vine din exit
-                    # checks (SELL), rulate deja mai sus și reluate la următoarea iterație (60s).
-                    _interruptible_sleep(_LOOP_INTERVAL)
-                    continue
+                    if not _ACTIVATE_QUEUE:
+                        # Fără coadă, scanarea masivă ar produce DOAR BUY-uri blocate → ar
+                        # irosi degeaba bugetul de tokeni Groq (vezi filtrul STRICT/batching).
+                        # O sărim; protecția pozițiilor vine din exit checks (SELL), rulate
+                        # deja mai sus și reluate la următoarea iterație (60s).
+                        _interruptible_sleep(_LOOP_INTERVAL)
+                        continue
+                    # Cu ACTIVATE_QUEUE, scanarea rămâne UTILĂ și fără cash: aprobările AI
+                    # nu se pierd, ci intră în wishlist (next_in_line, persistat în
+                    # history.json) prin gate-urile din _execute_trade, și se execută
+                    # automat când o poziție închisă (TP/SL/Panic Sell) eliberează cash.
+                    logger.info(
+                        "[Queue] ACTIVATE_QUEUE activ: continui scanarea DOAR pentru "
+                        "wishlist — oportunitățile aprobate se salvează în next_in_line "
+                        "până revin fondurile."
+                    )
                 if _DRY_RUN and pusd_balance < _MIN_BALANCE_PUSD:
                     logger.info(
                         "[DRY_RUN] Balanță %.4f sub $%.2f — ignor gate-ul de balanță și "
@@ -2326,28 +2447,28 @@ def main() -> None:
                     _interruptible_sleep(_LOOP_INTERVAL)
                     continue
 
-                # Procesare PRIORITARĂ a cozii (DOAR cu ACTIVATE_QUEUE și DOAR când avem
-                # sloturi libere): re-evaluăm wishlist-ul și deschidem pozițiile aprobate
-                # ÎNAINTE de scanarea masivă. La MAX poziții n-am putea deschide nimic, deci
-                # sărim execuția și mergem direct la scanare (care doar va alimenta wishlist-ul).
-                if _ACTIVATE_QUEUE and not maxed:
+                # Procesare PRIORITARĂ a cozii (DOAR cu ACTIVATE_QUEUE, cu sloturi libere ȘI
+                # cash peste prag): re-evaluăm wishlist-ul și deschidem pozițiile aprobate
+                # ÎNAINTE de scanarea masivă — deci imediat ce o poziție închisă (Panic Sell
+                # în acest heartbeat, TP/SL la reconcilierea următoare) eliberează cash sau
+                # un slot, ordinele salvate se execută automat, în ordinea confidence-ului.
+                # Fără cash (allow_new_trades=False) sărim execuția: fiecare replay ar costa
+                # un apel Groq degeaba, iar intrările rămân oricum în coadă.
+                if _ACTIVATE_QUEUE and not maxed and allow_new_trades:
                     try:
                         _process_queue(account_state, allow_new_trades=allow_new_trades)
                     except Exception as exc:
                         logger.error("[Queue] Procesarea cozii a eșuat: %s", exc, exc_info=True)
 
                     # Coada poate epuiza fondurile: dacă balanța a scăzut sub minim, dezactivăm
-                    # cumpărarea și sărim scanarea masivă (ar produce doar BUY-uri blocate). NU
-                    # dormim 15 min — păstrăm cadența de 60s ca pozițiile să rămână monitorizate
-                    # (exit/SELL se reia la următoarea iterație).
+                    # cumpărarea. NU sărim scanarea: cu coada activă, aprobările AI noi intră
+                    # în wishlist (gate-urile din _execute_trade), iar cadența rămâne 60s.
                     if not _DRY_RUN and account_state.get("pusd_balance", 0.0) < _MIN_BALANCE_PUSD:
                         allow_new_trades = False
                         logger.warning(
                             "[Agent] Fonduri epuizate la procesarea cozii — modul de cumpărare "
-                            "dezactivat; sar scanarea, dar continui monitorizarea pozițiilor.",
+                            "dezactivat; scanarea continuă doar pentru wishlist.",
                         )
-                        _interruptible_sleep(_LOOP_INTERVAL)
-                        continue
 
                 # --- Cadența scanării masive (decuplată de heartbeat) ---
                 # Reconcilierea + exit-urile (TP/SL/Panic Sell) + coada au rulat deja la acest

@@ -25,4 +25,11 @@ tests/
 logs/
 Dockerfile
 .dockerignore
+docker-compose.yml
 railway.json
+
+# Stare locală a botului — nu o coace în imagine: trăiește pe volumul /data
+# (bind mount ./data:/data, vezi docker-compose.yml)
+history.json*
+next_in_line.json*
+data/

@@ -1,0 +1,21 @@
+# Rulare locală cu PERSISTENȚĂ: `docker compose up -d --build`.
+#
+# Starea botului trăiește pe mașina GAZDĂ, în ./data (bind mount pe /data):
+#   - ./data/history.json  — istoricul analizelor (cooldown 4h) + ultimele decizii AI
+#                            per poziție + coada de oportunități `next_in_line`;
+#   - ./data/logs/bot.log  — loguri rotative (5MB × 3), pe lângă `docker logs`.
+# Distrugerea / reconstruirea / repornirea containerului NU pierde nimic: la pornire
+# botul recitește history.json de pe volum și reîncarcă în memorie inclusiv coada
+# next_in_line, intactă. (Căile sunt setate prin ENV în Dockerfile: HISTORY_FILE,
+# LOG_FILE, QUEUE_FILE — ultima doar pentru migrarea legacy a cozii.)
+#
+# Secretele NU sunt copiate în imagine (vezi .dockerignore) — vin din .env la runtime.
+services:
+  polymarket-bot:
+    build: .
+    container_name: polymarket-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data

@@ -66,6 +66,10 @@ class Settings:
     # blocat ar îngheța TP/SL-ul și Panic Sell-ul. 120s acoperă lejer și un batch mare pe
     # un model free OpenRouter, dar taie hang-urile de rețea.
     LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
+    # Fișier de log OPȚIONAL (gol = doar consolă, comportamentul istoric). Ex:
+    # /data/logs/bot.log pe volumul Docker (vezi docker-compose.yml) — logurile
+    # supraviețuiesc astfel distrugerii/reconstruirii containerului. Rotativ (5MB × 3).
+    LOG_FILE: str = os.getenv("LOG_FILE", "")
 
 settings = Settings()
 
@@ -83,3 +87,31 @@ logging.basicConfig(
     level=_resolve_log_level(settings.LOG_LEVEL),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+
+def _attach_file_handler(path: str) -> None:
+    """Handler de fișier ROTATIV opțional (LOG_FILE): scrie logurile și pe disc — ex. pe
+    volumul Docker /data, ca istoricul de loguri să supraviețuiască distrugerii/
+    reconstruirii containerului — pe lângă consolă (Railway citește oricum stdout).
+    Best-effort: orice eroare de IO (director pe un filesystem read-only, permisiuni)
+    e doar logată — botul NU moare din cauza logging-ului."""
+    if not path:
+        return
+    try:
+        import logging.handlers
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        logging.getLogger().addHandler(handler)
+        logging.getLogger(__name__).info("[Logging] Loguri scrise și în %s (rotativ, 5MB × 3).", path)
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "[Logging] Nu pot scrie loguri în %s (%s) — continui doar cu consola.", path, exc
+        )
+
+
+_attach_file_handler(settings.LOG_FILE)

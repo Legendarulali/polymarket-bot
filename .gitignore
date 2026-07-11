@@ -51,3 +51,6 @@ next_in_line.json*
 # OS
 .DS_Store
 Thumbs.db
+
+# Volum local Docker (bind mount ./data:/data — history.json + loguri persistente)
+data/
